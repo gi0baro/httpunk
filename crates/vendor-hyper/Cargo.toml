@@ -1,0 +1,30 @@
+# Vendored hyper h1 sans-IO code (role head parse/encode + body Encoder) plus the
+# httpunk bridge facade — see ../../THIRD-PARTY.md. Workspace member crate: owns
+# its crate root (upstream `crate::` paths, no rewrite) and is fmt/clippy-excluded
+# from the main crate via `cargo fmt -p`.
+[package]
+name = "vendor-hyper"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+# Client + server roles, HTTP/1 only. `http1`+`client`+`server` on so the vendored
+# code compiles; the rest are declared (kept off) so check-cfg recognizes the
+# vendored cfg-gates.
+default = ["client", "server", "http1"]
+client = []
+server = []
+http1 = []
+ffi = []
+http2 = []
+tracing = []
+
+[dependencies]
+http = "1.1"
+httparse = "1"
+http-body = "1"
+bytes = "1"
+itoa = "1"
+httpdate = "1"  # cached Date header for the server role (common/date.rs)
+smallvec = { version = "1.12", features = ["const_generics", "const_new"] }

@@ -1,0 +1,72 @@
+[package]
+name = "httpunk"
+version = "0.1.0"
+description = "TBD"
+authors = [
+    "Giovanni Barillari <g@baro.dev>",
+]
+license = "BSD-3-Clause"
+edition = "2024"
+
+keywords = ["http"]
+
+readme = "README.md"
+homepage = "https://github.com/gi0baro/httpunk"
+repository = "https://github.com/gi0baro/httpunk"
+
+include = [
+    "/Cargo.toml",
+    "/pyproject.toml",
+    "/LICENSE",
+    "/README.md",
+    "/src",
+    "/crates",
+    "/httpunk",
+    "/tests",
+    "!__pycache__",
+    "!tests/.pytest_cache",
+    "!*.so",
+]
+
+# The vendored third-party crates live in their own workspace members so each
+# owns its crate root (upstream `crate::` paths resolve with no rewrite → truly
+# byte-identical) and is excluded from the main crate's fmt/clippy. See
+# THIRD-PARTY.md and PLAN.md §4.
+[workspace]
+members = ["crates/vendor-h2", "crates/vendor-hyper"]
+
+[lib]
+name = "_httpunk"
+crate-type = ["cdylib"]
+
+[features]
+# Never enabled. Exists only so the optional crates.io `h2`/`hyper` deps are
+# referenced (no "unused optional dependency"), keeping them in Cargo.lock for
+# advisory scanning while they stay uncompiled. See the dependency comments.
+_audit = ["dep:h2", "dep:hyper"]
+
+[dependencies]
+pyo3 = { version = "=0.29", features = ["extension-module", "generate-import-lib"] }
+# Used by the PyO3 layer (src/py): `http::HeaderMap` (the HeaderMap wrapper) and
+# `bytes` buffers in the codecs.
+bytes = "1"
+http = "1.1"
+# The vendored crates, as workspace members (own their crate roots → byte-identical
+# to upstream, and fmt/clippy-excludable via `cargo fmt -p _httpunk`).
+vendor-h2 = { path = "crates/vendor-h2" }
+vendor-hyper = { path = "crates/vendor-hyper", features = ["client", "server", "http1"] }
+# NOT compiled: the crates.io `h2`/`hyper` — vendored into crates/vendor-*/ (see
+# THIRD-PARTY.md). Optional + gated behind the never-enabled `_audit` feature so
+# the pinned versions land in Cargo.lock for `cargo audit` / Dependabot advisory
+# coverage without pulling them (and tokio) into the build.
+h2 = { version = "=0.4.15", optional = true }
+hyper = { version = "=1.10.1", optional = true, default-features = false, features = ["http1", "client", "server"] }
+
+[profile.release]
+codegen-units = 1
+debug = false
+incremental = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true

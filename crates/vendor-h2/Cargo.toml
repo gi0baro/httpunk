@@ -1,0 +1,19 @@
+# Vendored hyperium/h2 (frame + hpack + sync proto pieces), byte-identical to
+# upstream — see ../../THIRD-PARTY.md. A workspace member crate so it owns its
+# own crate root (upstream `crate::` paths resolve natively, no rewrite) and is
+# excluded from the main crate's fmt/clippy via `cargo fmt -p`.
+[package]
+name = "vendor-h2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+# h2's vendored code has `#[cfg(feature = "unstable")]` gates; declared, left off.
+unstable = []
+
+[dependencies]
+bytes = "1"
+http = "1.1"
+fnv = "1.0.5"
+tracing = { version = "0.1.35", default-features = false, features = ["std"] }
