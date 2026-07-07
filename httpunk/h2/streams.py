@@ -90,7 +90,10 @@ class StreamManager:
         # Serializes the check-and-decrement of the shared send windows so two
         # streams can't both observe capacity and over-commit the connection
         # window (which the peer would treat as a connection FLOW_CONTROL_ERROR).
-        self._send_window_lock = conn.backend.lock()
+        # A `threading.Lock` (like `_slot_lock`): the critical section is a tiny
+        # non-blocking check-and-decrement, held never across an await, so it needs
+        # real cross-worker-thread mutual exclusion, not a cooperative async lock.
+        self._send_window_lock = threading.Lock()
 
         # MAX_CONCURRENT_STREAMS gating (h2 counts.rs): an authoritative count of
         # streams we've opened, checked against the peer's limit at each open.
@@ -226,7 +229,7 @@ class StreamManager:
                 raise self._conn.error
             if st.state.is_closed():
                 raise StreamResetError(st.id, int(H2Reason.CANCEL))
-            async with self._send_window_lock:
+            with self._send_window_lock:
                 window = self._send_window(st)
                 if window > 0:
                     n = min(window, want, self._peer.max_frame_size)
@@ -267,16 +270,18 @@ class StreamManager:
             self._conn_recv.inc_window(conn_unclaimed)
             await self._conn.send_frame(self._conn.codec.serialize_window_update(0, conn_unclaimed))
 
-    async def reset_stream(self, st, error_code):
-        """Abort a stream we initiated (cancel / local error): send RST_STREAM,
-        transition the state, and reclaim the connection-level window consumed by
-        buffered-but-unconsumed data (so the connection recovers).
+    async def reset_stream(self, st, error_code, initiator="user"):
+        """Abort a stream we initiated: send RST_STREAM, transition the state, and
+        reclaim the connection-level window consumed by buffered-but-unconsumed
+        data (so the connection recovers). `initiator` labels the reset's origin
+        (h2 `Initiator`): "user" for a caller cancel, "library" for a reset we
+        force after detecting a peer protocol violation (`reset_on_error`).
 
         h2: proto/streams/streams.rs `send_reset` / share.rs `SendStream::send_reset`.
         """
         if st.state.is_closed():
             return
-        st.state.set_reset(st.id, error_code, "user")
+        st.state.set_reset(st.id, error_code, initiator)
         await self._conn.send_frame(self._conn.codec.serialize_rst_stream(st.id, error_code))
         st.headers_evt.set()  # unblock a caller still awaiting the response head
         st.body_send.send(None)  # unblock any body reader
@@ -343,7 +348,9 @@ class StreamManager:
             if self._local_error_resets > _LOCAL_MAX_ERROR_RESETS:
                 raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too many stream resets")
             st.error = StreamResetError(stream_id, reason)
-            await self.reset_stream(st, reason)
+            # Library-initiated (we detected the peer's violation), not a user
+            # cancel — the correct h2 `Initiator` for an error reset.
+            await self.reset_stream(st, reason, initiator="library")
         else:
             # A stream we've already forgotten (STREAM_CLOSED). No local object to
             # tear down; still tell the peer the stream is closed.
@@ -663,6 +670,7 @@ class StreamManager:
         st.error = StreamResetError(frame.stream_id, frame.error_code)
         st.headers_evt.set()
         st.body_send.send(None)
+        st.window_evt.set()  # wake a body sender parked on flow control (it re-checks st.error)
         # Reclaim the connection window consumed by this stream's unread data
         # (h2 recv.rs `release_closed_capacity` on `transition_after`).
         await self._reclaim_stream_capacity(st)

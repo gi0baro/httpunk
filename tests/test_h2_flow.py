@@ -10,6 +10,7 @@ from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 from tonio.colored.sync import Lock
 
+from httpunk import H2Reason, StreamResetError
 from httpunk._httpunk import (
     H2Codec,
     H2FrameData as Data,
@@ -241,3 +242,42 @@ async def test_request_body_echo():
 
     assert bytes_result["body"] == b"a fixed body"
     assert iter_result["body"] == b"hello streamed body"
+
+
+@pytest.mark.tonio
+async def test_reset_wakes_flow_blocked_sender():
+    """A peer RST_STREAM must wake a request-body sender parked on flow control,
+    surfacing StreamResetError instead of hanging — h2 wakes the send side on
+    reset. Regression for the client `recv_reset` wakeup (a hang would trip the
+    6s deadline). The peer advertises a tiny window, so the client sends its
+    window-worth and parks, then the peer RSTs instead of sending WINDOW_UPDATE."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+
+    async def peer():
+        stream = await listener.accept()
+        codec = H2Codec("server")
+        await stream.send_all(codec.serialize_settings(initial_window_size=5))
+        raw = b""
+        while len(raw) < len(PREFACE):
+            raw += await stream.receive_some(65536)
+        data, rst_sent = raw[len(PREFACE) :], False
+        while True:
+            for f in codec.receive(data):
+                if isinstance(f, Settings) and not f.ack:
+                    await stream.send_all(codec.serialize_settings_ack())
+                elif isinstance(f, Data) and not rst_sent:
+                    # The client has sent its 5-byte window and is now parked
+                    # waiting for a WINDOW_UPDATE we never send — RST instead.
+                    await stream.send_all(codec.serialize_rst_stream(f.stream_id, int(H2Reason.CANCEL)))
+                    rst_sent = True
+            data = await stream.receive_some(65536)
+            if not data:
+                break
+
+    async with scope() as s:
+        s.spawn(peer())
+        async with open_h2(host, port) as conn:
+            with pytest.raises(StreamResetError):
+                await conn.request("POST", "/x", body=bytes(50))  # 50 > 5-byte window
+        s.cancel()
