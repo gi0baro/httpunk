@@ -16,10 +16,12 @@ from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2Codec,
     H2FrameGoAway as GoAway,
+    H2FrameHeaders as Headers,
     H2FrameSettings as Settings,
 )
 from httpunk.h2 import H2Server
 from httpunk.h2.connection import PREFACE
+from httpunk.http import HeaderMap
 
 
 async def _listener():
@@ -201,6 +203,60 @@ async def test_server_goaway_on_idle_stream_data():
         assert ga.error_code == H2Reason.PROTOCOL_ERROR
         transport.close()
         s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_swallows_late_headers_on_reset_stream():
+    """A HEADERS frame on a stream the server just locally-reset is swallowed (h2
+    reset-stream store), not a connection PROTOCOL_ERROR — so the connection
+    survives and still serves later requests (Tier-1 drift #4: the server now
+    consults the reset store before the decreased-id check)."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server, scope() as handlers:
+                async for req in server:
+
+                    async def handle(r):
+                        with contextlib.suppress(Exception):
+                            await r.read()
+                            await r.respond(200)
+
+                    handlers.spawn(handle(req))
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        # stream 1: declare content-length 5 but send 10 bytes -> the server RSTs stream 1.
+        await transport.send_all(
+            codec.serialize_request_headers(1, "POST", "http://x/a", HeaderMap([("content-length", "5")]))
+        )
+        await transport.send_all(codec.serialize_data(1, b"0123456789", end_stream=False))
+        # A late HEADERS on the now-reset stream 1 (the client hadn't seen the RST):
+        # must be swallowed, not treated as a decreased-id connection error.
+        await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/a", end_stream=True))
+        # A fresh request on stream 3 must still be served (connection alive).
+        await transport.send_all(codec.serialize_request_headers(3, "GET", "http://x/b", end_stream=True))
+
+        status, goaway = None, None
+        while status is None and goaway is None:
+            data = await transport.receive_some(65536)
+            if not data:
+                break
+            for f in codec.receive(data):
+                if isinstance(f, Settings) and not f.ack:
+                    await transport.send_all(codec.serialize_settings_ack())
+                elif isinstance(f, Headers) and f.stream_id == 3:
+                    status = f.status
+                elif isinstance(f, GoAway):
+                    goaway = f
+        transport.close()
+        s.cancel()
+
+    assert goaway is None, "connection torn down instead of swallowing the late HEADERS"
+    assert status == 200
 
 
 @pytest.mark.tonio

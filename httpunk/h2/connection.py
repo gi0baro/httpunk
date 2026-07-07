@@ -1,10 +1,17 @@
 """HTTP/2 protocol driver — h2: proto/connection.rs.
 
 The thin connection core: owns the transport + shared codec, runs the read-pump,
-dispatches inbound frames to the `StreamManager`, drives the SETTINGS handshake
-(`settings.py`), and answers PING / handles GOAWAY. All per-stream logic and
-flow control live in the `StreamManager` (streams.py); the public request API
-lives in `client.py`.
+dispatches inbound frames to the stream manager, drives the SETTINGS handshake
+(`settings.py`), and answers PING / handles GOAWAY. All per-stream logic and flow
+control live in the stream manager (streams.py); the public request API lives in
+`client.py`.
+
+`H2ConnectionBase` is the **role-agnostic** driver, mirroring h2's single
+`proto::Connection` (the codec is symmetric). The client `Connection` and the
+server `ServerConnection` (server.py) subclass it; the role differences are three
+hooks: the connection preface (`_before_frames` — the client *sends* it, the
+server *consumes* it), the GOAWAY last-stream-id (`_goaway_last_stream_id`), and
+the client-only readiness signal (`_signal_ready`).
 
 Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15 (see
 src/h2/UPSTREAM_VERSION). This is an *adaptation*: h2 drives everything from one
@@ -27,8 +34,8 @@ from .._httpunk import (
     H2StreamError,
 )
 from ..exceptions import ConnectionClosedError, GoAwayError, H2Error, H2Reason
-from .settings import Action, LocalSettings, Settings
-from .streams import StreamManager, _StreamError
+from .settings import Action
+from .streams import _StreamError
 
 
 _READ_SIZE = 65536
@@ -39,45 +46,49 @@ _READ_SIZE = 65536
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 
-class Connection:
-    """The protocol driver for one transport. Created and driven by the public
-    `client.H2Connection`."""
+class H2ConnectionBase:
+    """The role-agnostic protocol driver for one transport (h2 `proto::Connection`).
+    Subclassed by the client `Connection` and the server `ServerConnection`, which
+    supply the connection state (`self.streams`) + the role hooks."""
 
-    def __init__(self, transport, *, authority=None, backend=None, initial_window_size=None):
+    def __init__(self, transport, *, backend, codec_role, settings):
         # `transport` is a caller-supplied, already-connected byte stream (BYO
-        # transport, like hyper's `client::conn`). `authority` is used to build
-        # the :authority pseudo-header for requests given a bare path.
-        self.authority = authority
+        # transport, like hyper's `client`/`server` conn). Subclasses set
+        # `self.streams` after building their role state.
         self.backend = backend or TonioBackend()
-        self.codec = H2Codec("client")
+        self.codec = H2Codec(codec_role)
         self.error = None
-
         self._scope = self.backend.scope()
         self._send_lock = self.backend.lock()
         self._transport = transport
-        self._initial_window_size = initial_window_size  # our advertised per-stream recv window
-        # Signalled once the peer's initial SETTINGS have been applied, so
-        # requests respect the peer's limits/window from the first one.
-        self._ready_evt = self.backend.event()
-        # SETTINGS sync (proto/settings.rs). We advertise SETTINGS_ENABLE_PUSH=0.
-        self._settings = Settings(LocalSettings(initial_window_size=initial_window_size))
+        self._settings = settings  # SETTINGS sync (proto/settings.rs)
 
-        self.streams = StreamManager(self)
+    # ----- role hooks -----
 
-    async def connect(self):
-        # h2: client.rs `handshake` (L1220) — over the caller-supplied transport,
-        # flush the client preface + our initial SETTINGS, spawn the driver, then
-        # wait for the peer's initial SETTINGS (its connection preface) before
-        # we're ready for requests. (Dialing/TLS/ALPN are the caller's job.)
+    def _before_frames(self, data):
+        """Transform received bytes before framing. Default: identity — the client
+        *sends* the connection preface, so has none to strip. The server overrides
+        to consume the 24-byte client preface, returning None until it's complete."""
+        return data
+
+    def _goaway_last_stream_id(self):
+        """The last-stream-id for our GOAWAY. The client processes no peer-initiated
+        streams -> 0; the server overrides with the last request it processed."""
+        return 0
+
+    def _signal_ready(self):
+        """Client-only: unblock `connect()` once the peer's initial SETTINGS land
+        (or the handshake fails). No-op on the server (no readiness gate)."""
+
+    # ----- lifecycle -----
+
+    async def _begin(self, preface, settings):
+        # Shared handshake start (h2 client.rs/server.rs `handshake`): open the
+        # scope, flush the connection preface (client: 24-byte preface; server:
+        # empty) + our initial SETTINGS, and spawn the read-pump.
         await self._scope.__aenter__()
-        settings = {"enable_push": False}
-        if self._initial_window_size is not None:
-            settings["initial_window_size"] = self._initial_window_size
-        await self.send_frame(PREFACE + self.codec.serialize_settings(**settings))
+        await self.send_frame(preface + self.codec.serialize_settings(**settings))
         self._scope.spawn(self._read_pump())
-        await self._ready_evt.wait()
-        if self.error is not None:
-            raise self.error
 
     async def close(self):
         # Close the transport *first*: the read-pump is almost always parked in
@@ -107,6 +118,9 @@ class Connection:
                 if not data:  # EOF
                     self._fail(ConnectionClosedError("connection closed by peer"))
                     break
+                data = self._before_frames(data)  # server strips the client preface
+                if data is None:
+                    continue  # preface not complete yet
                 for frame in self.codec.receive(data):
                     try:
                         await self._dispatch(frame)
@@ -119,7 +133,7 @@ class Connection:
                         await self.streams.reset_on_error(se.args[0], se.args[1])
         except H2Error as exc:
             # A protocol/flow violation we detected (bad state, HPACK/CONTINUATION,
-            # flow control): notify the peer with GOAWAY, then tear down.
+            # flow control, bad preface): notify the peer with GOAWAY, then tear down.
             await self._send_goaway(exc)
             self._fail(exc)
         except Exception as exc:  # transport error, etc. (cancellation is BaseException)
@@ -127,12 +141,12 @@ class Connection:
 
     async def _send_goaway(self, exc):
         # h2: proto/connection.rs `go_away_now` (L409) / `go_away_now_data` (L415).
-        # Client GOAWAY carries last_stream_id = 0 (we process no peer-initiated
-        # streams — no server push). Reason comes from the error if it has one.
+        # The last-stream-id is role-specific (client: 0, no peer-initiated streams;
+        # server: the last request it processed). Reason comes from the error.
         reason = exc.args[0] if exc.args and isinstance(exc.args[0], int) else int(H2Reason.PROTOCOL_ERROR)
         # Best effort: the connection is going down regardless of whether this lands.
         with contextlib.suppress(Exception):
-            await self.send_frame(self.codec.serialize_go_away(0, reason))
+            await self.send_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), reason))
 
     async def _dispatch(self, frame):
         # h2: the frame match in proto/connection.rs `recv_frame` (L518).
@@ -173,11 +187,11 @@ class Connection:
             peer_frame, is_initial = self._settings.take_remote()
             self.streams.apply_remote_settings(peer_frame)
             if is_initial:
-                self._ready_evt.set()  # connection is now fully established
+                self._signal_ready()  # connection fully established (client unblocks connect())
 
     def _fail(self, exc):
         # h2: proto/connection.rs `handle_poll2_result` (L430) -> the connection
         # error fans out to every stream via streams.rs `Streams::handle_error` (L362).
         self.error = exc
         self.streams.fail_all(exc)
-        self._ready_evt.set()  # unblock connect() if the handshake never completed
+        self._signal_ready()  # unblock connect() if the handshake never completed (client); no-op (server)

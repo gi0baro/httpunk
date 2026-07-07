@@ -11,7 +11,7 @@ from tonio.colored.net import open_tcp_listeners
 
 from httpunk._backend.tonio import TonioBackend
 from httpunk.h1 import H1Server
-from httpunk.h1.server import Connection
+from httpunk.h1.server import ServerConnection
 
 
 async def _listener():
@@ -378,7 +378,7 @@ async def test_server_requires_respond_before_next():
     """Reading the next request before responding to the current one is a usage
     error (hyper serializes structurally) — surfaced, not silently mis-paired."""
     data = b"GET /a HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n\r\n"
-    conn = Connection(_StubTransport(data))
+    conn = ServerConnection(_StubTransport(data))
     await conn.start()
     req = await conn.next_request()
     assert req.target == "/a"
@@ -391,7 +391,7 @@ async def test_server_auto_error_on_malformed_head():
     """A malformed request head triggers hyper's automatic error response
     (`Server::on_error`: a colon-less header line → 400) + close."""
     stub = _StubTransport(b"GET / HTTP/1.1\r\nBad Header Here\r\n\r\n")
-    conn = Connection(stub)
+    conn = ServerConnection(stub)
     await conn.start()
     req = await conn.next_request()
     assert req is None

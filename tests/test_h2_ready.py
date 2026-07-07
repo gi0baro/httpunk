@@ -6,7 +6,7 @@ import pytest
 from tonio.colored import Event, scope, sleep
 
 from httpunk import GoAwayError, H2Reason
-from httpunk.h2.connection import Connection
+from httpunk.h2.client import Connection
 
 
 @pytest.mark.tonio

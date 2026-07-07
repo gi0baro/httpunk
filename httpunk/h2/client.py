@@ -1,21 +1,235 @@
-"""Low-level HTTP/2 connection API — h2: client.rs (`SendRequest` + `handshake`).
+"""Low-level HTTP/2 client — h2: client.rs (`SendRequest` + `handshake`) + the
+client half of `proto::streams`.
 
-`H2Connection` is the per-connection handle, the Python analogue of hyper's
-`client::conn::http2`: it collapses `http2::handshake` + the spawned `Connection`
-driver + `SendRequest` into one async-context-managed object. The core method is
-`send_request(Request) -> Response` (≈ `SendRequest::send_request`); `get`/`request`
-are thin ergonomic wrappers over it. This layer is low-level by design — no pool,
-connector, or high-level client (those live downstream; see PLAN.md §3.3).
+Holds the client's full role stack, mirroring `server.py`: `ClientStreamManager`
+(the initiating-side stream manager — allocates ids, bound by the peer's
+MAX_CONCURRENT_STREAMS), `Connection` (the client protocol driver over the shared
+`H2ConnectionBase`), and `H2Connection` (the public per-connection handle).
+
+`H2Connection` is the Python analogue of hyper's `client::conn::http2`: it
+collapses `http2::handshake` + the spawned `Connection` driver + `SendRequest`
+into one async-context-managed object. The core method is `send_request(Request)
+-> Response` (≈ `SendRequest::send_request`); `get`/`request` are thin wrappers.
+This layer is low-level by design — no pool, connector, or high-level client
+(those live downstream; see PLAN.md §3.3).
 
 Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 """
 
-from ..types import Request, Response
-from .connection import Connection
+import threading
+
+from .._common import BaseClientConnection
+from ..exceptions import H2ProtocolError, H2Reason
+from ..types import Response
+from .connection import PREFACE, H2ConnectionBase
+from .settings import LocalSettings, Settings
 from .share import H2ResponseBody
+from .stream import Stream
+from .streams import StreamManager
 
 
-class H2Connection:
+class ClientStreamManager(StreamManager):
+    """The initiating side: allocates stream ids, gates on the peer's
+    MAX_CONCURRENT_STREAMS, and receives responses. h2 `client::Peer` + the
+    send-stream count in `Counts`."""
+
+    def __init__(self, conn):
+        super().__init__(conn)
+        self._next_id = 1
+        # Serializes stream-id allocation + the initial HEADERS send: HTTP/2
+        # requires new stream ids to be monotonically increasing on the wire,
+        # and tonio runs coroutines across worker threads.
+        self._new_stream_lock = conn.backend.lock()
+        # MAX_CONCURRENT_STREAMS gating (h2 counts.rs): an authoritative count of
+        # streams we've opened, checked against the peer's limit at each open.
+        # `None` limit = unlimited (the peer's default). A count (not a
+        # semaphore) so lowering the limit while streams are active never lets
+        # the effective cap drift back up as those streams finish.
+        self._num_open_streams = 0
+        self._stream_limit = None
+        self._slot_evt = conn.backend.event()
+        # Guards the check-and-increment of `_num_open_streams` against `_stream_limit`
+        # (worker-thread concurrency; a plain `+=`/compare would race). Held only for
+        # the tiny critical section — never across an await.
+        self._slot_lock = threading.Lock()
+
+    # ===== role hooks =====
+
+    def _ensure_not_idle(self, stream_id):
+        # Client-initiated streams are odd; we never enable push (no even ids).
+        # An odd id >= our next id was never opened by us.
+        # h2: proto/streams/streams.rs `ensure_not_idle` (L1714).
+        if stream_id % 2 == 0 or stream_id >= self._next_id:
+            raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"frame on idle stream {stream_id}")
+
+    def _release_slot(self, st):
+        if st.holds_slot:
+            st.holds_slot = False
+            with self._slot_lock:
+                self._num_open_streams -= 1
+            self._slot_evt.set()
+
+    def _apply_peer_stream_limit(self):
+        self._apply_stream_limit(self._peer.max_concurrent_streams)
+
+    def _on_go_away(self, last_stream_id, exc):
+        for st in list(self._streams.values()):
+            if st.id > last_stream_id:
+                self._abort_stream(st, exc)
+        self._slot_evt.set()  # wake open/ready waiters (they re-check _goaway)
+
+    def _on_fail(self):
+        self._slot_evt.set()
+
+    # ===== opening (h2: client.rs send_request -> streams.rs send_request) =====
+
+    async def open_stream(self, method, url, headers, *, end_stream, is_head):
+        """Gate on MAX_CONCURRENT_STREAMS, allocate a stream id, and emit HEADERS
+        atomically (ids must be strictly increasing on the wire). `end_stream`
+        puts END_STREAM on the HEADERS frame for a bodyless request (h2
+        `send_request` with `end_of_stream`), avoiding a trailing empty DATA.
+
+        h2: proto/streams/streams.rs `send_request` (L218); state transition =
+        state.rs `send_open`.
+        """
+        if self._goaway is not None:
+            raise self._goaway
+        await self._acquire_stream_slot()  # blocks on the limit; increments the count
+        if self._conn.error is not None or self._goaway is not None:
+            self._release_count()
+            raise self._conn.error or self._goaway
+        async with self._new_stream_lock:
+            stream_id = self._next_id
+            self._next_id += 2
+            st = Stream(
+                stream_id,
+                self._conn.backend,
+                send_window=self._peer.initial_window_size,
+                recv_window=self._recv_init,
+                is_head=is_head,
+            )
+            st.holds_slot = True
+            self._streams[stream_id] = st
+            st.state.send_open(eos=end_stream)
+            await self._conn.send_frame(
+                self._conn.codec.serialize_request_headers(stream_id, method, url, headers, end_stream=end_stream)
+            )
+        # The connection may have failed / GOAWAY'd between our pre-lock check and
+        # inserting the stream, so `fail_all`/`handle_go_away`'s fan-out could have
+        # missed it. Re-check and abort our own stream (idempotent) so a caller
+        # doesn't wait forever on a response head that will never arrive.
+        if self._conn.error is not None or self._goaway is not None:
+            self._abort_stream(st, self._conn.error or self._goaway)
+            raise self._conn.error or self._goaway
+        return st
+
+    # ===== MAX_CONCURRENT_STREAMS (h2: proto/streams/counts.rs) =====
+
+    def _can_open(self):
+        return self._stream_limit is None or self._num_open_streams < self._stream_limit
+
+    def _try_claim_slot(self):
+        """Atomically claim a MAX_CONCURRENT_STREAMS slot, or arm the wakeup if at
+        the limit. The check-and-increment must be under `_slot_lock`: the backend
+        runs coroutines across worker threads, so an unguarded check+`+= 1` would
+        let two opens both pass the gate and over-subscribe the peer's limit
+        (and `+=` on the count would itself race). Returns True if a slot was
+        claimed."""
+        with self._slot_lock:
+            if self._can_open():
+                self._num_open_streams += 1
+                return True
+            self._slot_evt.clear()  # armed under the lock so a concurrent release can't be missed
+            return False
+
+    async def _acquire_stream_slot(self):
+        """Block until a MAX_CONCURRENT_STREAMS slot is free, then claim it by
+        incrementing the open-stream count (h2 counts.rs `inc_num_send_streams`,
+        gated by `can_inc_num_send_streams`)."""
+        while not self._try_claim_slot():
+            await self._slot_evt.wait()
+
+    def _release_count(self):
+        # Undo an _acquire_stream_slot that didn't result in a live stream.
+        with self._slot_lock:
+            self._num_open_streams -= 1
+        self._slot_evt.set()
+
+    async def wait_until_ready(self):
+        """Wait until a new stream can be opened, then return — the connection is
+        alive (not failed / not GOAWAY'd) and a MAX_CONCURRENT_STREAMS slot is
+        free. Backs `H2Connection.ready` (h2 `SendRequest::ready`).
+
+        Non-reserving: we only observe that a slot is available and return, so a
+        concurrent `open_stream` may still take it first (h2's `poll_ready` is
+        likewise non-reserving — `send_request` re-applies the backpressure).
+        """
+        while True:
+            if self._conn.error is not None:
+                raise self._conn.error
+            if self._goaway is not None:
+                raise self._goaway
+            # Non-reserving: just observe capacity (a racy read is fine — we don't
+            # increment; a concurrent open re-applies the gate under the lock).
+            if self._can_open():
+                return
+            with self._slot_lock:
+                self._slot_evt.clear()
+                if self._can_open():
+                    return
+            await self._slot_evt.wait()
+
+    def _apply_stream_limit(self, new_max):
+        """Set MAX_CONCURRENT_STREAMS. Authoritative: if the new limit is below
+        the current open count, further opens block (in `_acquire_stream_slot`)
+        until enough streams close — the count can't drift past the limit.
+
+        h2: proto/streams/counts.rs — the limit is checked against the exact
+        `num_send_streams` count at each open, not tracked as free permits.
+        """
+        with self._slot_lock:
+            self._stream_limit = new_max
+        self._slot_evt.set()  # wake waiters to re-check against the new limit
+
+
+class Connection(H2ConnectionBase):
+    """The client protocol driver. Created and driven by the public
+    `client.H2Connection`."""
+
+    def __init__(self, transport, *, authority=None, backend=None, initial_window_size=None):
+        # `authority` builds the :authority pseudo-header for a bare-path request.
+        self.authority = authority
+        self._initial_window_size = initial_window_size  # our advertised per-stream recv window
+        # We advertise SETTINGS_ENABLE_PUSH=0 (see connect()).
+        super().__init__(
+            transport,
+            backend=backend,
+            codec_role="client",
+            settings=Settings(LocalSettings(initial_window_size=initial_window_size)),
+        )
+        # Signalled once the peer's initial SETTINGS have been applied, so requests
+        # respect the peer's limits/window from the first one.
+        self._ready_evt = self.backend.event()
+        self.streams = ClientStreamManager(self)
+
+    async def connect(self):
+        # h2: client.rs `handshake` (L1220) — over the caller-supplied transport,
+        # flush the client preface + our initial SETTINGS, spawn the driver, then
+        # wait for the peer's initial SETTINGS (its connection preface) before we're
+        # ready for requests. (Dialing/TLS/ALPN are the caller's job.)
+        settings = {"enable_push": False}
+        if self._initial_window_size is not None:
+            settings["initial_window_size"] = self._initial_window_size
+        await self._begin(PREFACE, settings)
+        await self._ready_evt.wait()
+        if self.error is not None:
+            raise self.error
+
+    def _signal_ready(self):
+        self._ready_evt.set()
+
+
+class H2Connection(BaseClientConnection):
     """An HTTP/2 client connection over a caller-supplied, already-connected
     `transport` (BYO transport, like hyper's `client::conn::http2::handshake(io)`;
     dialing / TLS / ALPN are the caller's or `httpunk.util`'s job). Use as an
@@ -24,21 +238,14 @@ class H2Connection:
 
     `authority` (e.g. ``"example.com:443"``) builds the :authority pseudo-header
     for requests given a bare path; requests with an absolute-URL target carry
-    their own authority.
+    their own authority. `__aenter__`/`__aexit__`/`request`/`get` come from
+    `BaseClientConnection` (identical to `H1Connection`).
     """
 
     def __init__(self, transport, *, authority=None, backend=None, initial_window_size=None):
         self._conn = Connection(
             transport, authority=authority, backend=backend, initial_window_size=initial_window_size
         )
-
-    async def __aenter__(self):
-        await self._conn.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, exc_tb):
-        await self._conn.close()
-        return False
 
     async def ready(self):
         """Wait until the connection can accept a new request — it's alive (not
@@ -93,11 +300,3 @@ class H2Connection:
                 "pass authority=... to H2Connection or use an absolute-URL target"
             )
         return f"http://{self._conn.authority}{target}"
-
-    # ----- ergonomic wrappers (build a Request, call send_request) -----
-
-    async def request(self, method, target, *, headers=None, body=None):
-        return await self.send_request(Request(method, target, headers=headers, body=body))
-
-    async def get(self, target, *, headers=None):
-        return await self.request("GET", target, headers=headers)

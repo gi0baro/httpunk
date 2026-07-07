@@ -25,10 +25,11 @@ Cross-reference: hyper 1.10.1 `proto/h1/{role,conn,dispatch}.rs` (server path) a
 `client/conn`/`server/conn`.
 """
 
-from .._backend.tonio import TonioBackend
+from .._common import BaseServer, read_all
 from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import ConnectionClosedError
 from ..http import HeaderMap
+from .connection import H1ConnectionBase
 from .share import H1Upgraded
 
 
@@ -129,7 +130,7 @@ class ServerRequest:
         self._body_done = True
 
     async def read(self):
-        return b"".join([chunk async for chunk in self.aiter_bytes()])
+        return await read_all(self.aiter_bytes())
 
     async def respond(self, status, *, headers=None, body=None):
         """Send the response head (+ body). `body` is None, `bytes`, or a
@@ -143,47 +144,27 @@ class ServerRequest:
         return f"ServerRequest(method={self.method!r}, target={self.target!r})"
 
 
-class Connection:
-    """Drives one HTTP/1 server connection over a caller-supplied transport
-    (the accepting-side analogue of the client `Connection`)."""
+class ServerConnection(H1ConnectionBase):
+    """The server-side h1 driver: reads a request, hands back a `ServerRequest`,
+    then writes the response; reuses the connection on keep-alive. The accepting
+    analogue of the client `Connection`, over the shared `H1ConnectionBase`."""
 
     def __init__(self, transport, *, backend=None):
-        self.transport = transport
-        self.backend = backend or TonioBackend()
-        self._closed = False
+        super().__init__(transport, backend=backend)
         self._reusable = True  # keep-alive: may we read another request after this one?
         self._codec = None  # current request/response codec
         self._current = None  # current ServerRequest (for body draining)
-        # Set once the connection is handed off as a raw tunnel (101 / CONNECT):
-        # the transport belongs to an `H1Upgraded` the caller owns — don't close it.
-        self._upgraded = False
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
 
-    async def close(self):
-        self._closed = True
-        if self.transport is not None:
-            self.transport.close()
-            self.transport = None  # so a later close (or the non-reuse path) is a no-op
-
     def mark_unusable(self):
         self._reusable = False
 
-    async def write(self, data):
-        await self.transport.send_all(data)
-
-    async def read_body_more(self):
-        return await self.transport.receive_some(_READ_SIZE)
-
     def _detach(self):
-        """Relinquish the transport to a caller-owned `H1Upgraded` tunnel (101 /
-        CONNECT): the driver no longer owns or closes it. Mirrors the h1 client's
-        `_detach` (hyper `on_upgrade`)."""
-        self._upgraded = True
+        # Same as the base, plus mark non-reusable (a tunnel serves no more requests).
+        super()._detach()
         self._reusable = False
-        self._closed = True
-        self.transport = None
 
     async def next_request(self):
         """Read the next request head and return a `ServerRequest`, or None once
@@ -295,8 +276,7 @@ class Connection:
             await self.transport.send_all(codec.serialize_end())
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
             pass
-        if self.transport is not None:
-            self.transport.close()
+        self._close_transport()
 
     async def send_response(self, req, status, headers, body):
         # hyper: role.rs `Server::encode` (L364) writes the status line + headers
@@ -331,13 +311,11 @@ class Connection:
                 chunked=chunked,
             )
             await self.transport.send_all(head)
-            await self._send_body(body)
+            await self._send_body(self._codec, body)
         except BaseException as exc:
             self._reusable = False
             self._closed = True
-            if self.transport is not None:
-                self.transport.close()
-                self.transport = None
+            self._close_transport()
             raise ConnectionClosedError("failed to send response") from exc
         if is_switch:
             # Hand the raw connection (plus any bytes already buffered past the
@@ -348,8 +326,7 @@ class Connection:
         self._reusable = keep_alive
         if not self._reusable:
             self._closed = True
-            self.transport.close()
-            self.transport = None
+            self._close_transport()
 
     @staticmethod
     def _negotiate_connection_header(hdrs, keep_alive, http10, resp_close):
@@ -366,40 +343,12 @@ class Connection:
             hdrs.add("connection", "keep-alive")
         return hdrs
 
-    @staticmethod
-    def _body_framing(body):
-        # None / empty bytes -> no body; non-empty bytes -> Content-Length;
-        # (async) iterable -> chunked. Mirrors the client's `_body_framing`.
-        if body is None:
-            return None, False
-        if isinstance(body, (bytes, bytearray)):
-            return (len(body), False) if len(body) else (None, False)
-        return None, True
 
-    async def _send_body(self, body):
-        if body is None or self._codec.body_is_eof():
-            # No body will be written — a bodyless response (HEAD / 204 / 304), so
-            # `Server::encode` handed back a length(0) encoder. hyper never polls
-            # the body in this case (conn.rs write_head), so skip the iterable
-            # entirely and don't fire its side effects (G37).
-            await self.transport.send_all(self._codec.serialize_end())
-            return
-        if isinstance(body, (bytes, bytearray)):
-            await self.transport.send_all(self._codec.serialize_data(bytes(body)))
-        elif hasattr(body, "__aiter__"):
-            async for chunk in body:
-                await self.transport.send_all(self._codec.serialize_data(bytes(chunk)))
-        elif hasattr(body, "__iter__"):
-            for chunk in body:
-                await self.transport.send_all(self._codec.serialize_data(bytes(chunk)))
-        else:
-            raise TypeError("body must be None, bytes, or an (async) iterable of bytes")
-        await self.transport.send_all(self._codec.serialize_end())
-
-
-class H1Server:
+class H1Server(BaseServer):
     """An HTTP/1 server connection over a caller-supplied, already-accepted
-    `transport` (BYO transport, like hyper's `server::conn::http1`).
+    `transport` (BYO transport, like hyper's `server::conn::http1`). The
+    async-context-manager + accept-iterator come from `BaseServer` (identical to
+    `H2Server`).
 
         async with H1Server(transport) as server:
             async for request in server:
@@ -407,26 +356,4 @@ class H1Server:
     """
 
     def __init__(self, transport, *, backend=None):
-        self._conn = Connection(transport, backend=backend)
-
-    async def __aenter__(self):
-        await self._conn.start()
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, exc_tb):
-        await self._conn.close()
-        return False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        request = await self._conn.next_request()
-        if request is None:
-            raise StopAsyncIteration
-        return request
-
-    async def accept(self):
-        """Return the next incoming `ServerRequest`, or None once the connection
-        can serve no more. (`async for` over the server is the ergonomic form.)"""
-        return await self._conn.next_request()
+        self._conn = ServerConnection(transport, backend=backend)
