@@ -98,7 +98,10 @@ class TonioBackend:
         return _colored.Event()
 
     def semaphore(self, value):
-        return _Semaphore(value)
+        """A counting semaphore with the backend-neutral contract: `await acquire()`
+        (blocks until a permit is free) / `release()` (sync). asyncio.Semaphore has
+        this shape natively; tonio's `acquire()` returns None-or-an-Event, so wrap it."""
+        return _TonioSemaphore(value)
 
     def queue(self):
         """An unbounded queue: `(sender, receiver)`. `sender.send(x)` is sync;
@@ -109,3 +112,21 @@ class TonioBackend:
         """The runtime clock, in seconds. Used to age out the reset-stream store
         (h2 uses `Instant::now`)."""
         return _now()
+
+
+class _TonioSemaphore:
+    """Adapts tonio's `Semaphore` to the backend-neutral async-`acquire`/sync-`release`
+    contract. tonio's `acquire()` is sync and returns None (a permit was free) or an
+    `Event` that fires once a permit is handed to this waiter — so awaiting that event
+    *is* the acquisition (fair handoff, no retry)."""
+
+    def __init__(self, value):
+        self._sem = _Semaphore(value)
+
+    async def acquire(self):
+        event = self._sem.acquire()
+        if event is not None:
+            await event.waiter(None)
+
+    def release(self):
+        self._sem.release()

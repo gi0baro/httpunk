@@ -62,9 +62,7 @@ class Connection(H1ConnectionBase):
         pass  # HTTP/1 has no connection preface / handshake (unlike h2)
 
     async def _acquire(self):
-        event = self._slot.acquire()  # None if free, else an Event to await
-        if event is not None:
-            await event.waiter(None)
+        await self._slot.acquire()  # blocks until the single in-flight slot is free
 
     async def wait_idle(self):
         """Resolve once the connection can accept a request (h1 analogue of
