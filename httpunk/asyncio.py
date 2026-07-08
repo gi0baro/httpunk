@@ -28,7 +28,7 @@ from .h2.server import H2Server
 from .util import auto
 
 
-__all__ = ["AutoServerProtocol", "H1ServerProtocol", "H2ServerProtocol"]
+__all__ = ["AutoServerProtocol", "H1ServerProtocol", "H2ServerProtocol", "ServerConnections"]
 
 
 class _ServerProtocol(_AsyncioStream):
@@ -124,3 +124,59 @@ class AutoServerProtocol(_ServerProtocol):
 
     async def _make_server(self):
         return await auto.serve(self, backend=self._backend)
+
+
+class ServerConnections:
+    """Tracks live server-protocol connections for host-coordinated graceful
+    shutdown. `track(ProtocolCls)` returns a `create_server` factory that registers
+    each connection on open and deregisters it on close; `shutdown()` drains every
+    live connection, force-closing any that don't within an optional timeout.
+
+    Optional convenience — a host with its own connection tracking (e.g. uvicorn)
+    would instead call the protocols' `graceful_shutdown()`/`wait_closed()`/`close()`
+    directly. Usage:
+
+        conns = ServerConnections()
+        server = await loop.create_server(conns.track(MyProtocol), host, port)
+        # ... on shutdown:
+        server.close()                    # stop accepting new connections
+        await conns.shutdown(timeout=30)  # drain in-flight, force-close stragglers
+    """
+
+    def __init__(self):
+        self._live = set()
+
+    def track(self, protocol_cls):
+        """Return a `create_server` factory (a `protocol_cls` subclass) that keeps
+        this registry's live set current — add on `connection_made`, discard when
+        the connection's serve task finishes."""
+        registry = self
+
+        class _Tracked(protocol_cls):
+            def connection_made(self, transport):
+                super().connection_made(transport)  # sets _serve_task
+                registry._live.add(self)
+                self._serve_task.add_done_callback(lambda _t: registry._live.discard(self))
+
+        return _Tracked
+
+    def count(self):
+        """How many connections are currently live."""
+        return len(self._live)
+
+    async def shutdown(self, *, timeout=None):
+        """Signal every live connection to shut down gracefully and await them to
+        drain; past `timeout`, force-close the stragglers (transport close + cancel
+        their serve task) so this always returns."""
+        conns = list(self._live)
+        if not conns:
+            return
+        await asyncio.gather(*(c.graceful_shutdown() for c in conns))
+        waits = [asyncio.ensure_future(c.wait_closed()) for c in conns]
+        _done, pending = await asyncio.wait(waits, timeout=timeout)
+        if pending:
+            for c in conns:
+                c.close()  # unblock IO-bound waits
+                if c._serve_task is not None:
+                    c._serve_task.cancel()  # hard-cancel a stuck handler / accept loop
+            await asyncio.wait(pending)

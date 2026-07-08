@@ -11,7 +11,7 @@ import pytest
 
 from httpunk import H1Connection, H2Connection, H2Error
 from httpunk._backend.asyncio import AsyncioBackend
-from httpunk.asyncio import AutoServerProtocol, H1ServerProtocol, H2ServerProtocol
+from httpunk.asyncio import AutoServerProtocol, H1ServerProtocol, H2ServerProtocol, ServerConnections
 
 
 class _EchoH2(H2ServerProtocol):
@@ -149,3 +149,53 @@ async def test_h1_protocol_graceful_shutdown_releases_idle():
             proto = protocols[0]
             await proto.graceful_shutdown()
             await proto.wait_closed()  # idle read released, connection closed -> resolves
+
+
+# ----- ServerConnections registry (host-facing shutdown convenience) -----
+
+
+@pytest.mark.asyncio
+async def test_server_connections_tracks_and_gracefully_shuts_down():
+    conns = ServerConnections()
+    loop = asyncio.get_running_loop()
+    server = await loop.create_server(conns.track(_EchoH2), "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
+        await conn.__aenter__()
+        assert await (await conn.get("/r")).read() == b"h2:/r:"
+        assert conns.count() == 1  # the live connection is tracked
+        await conns.shutdown(timeout=5)  # graceful; the idle connection drains + closes
+        assert conns.count() == 0  # deregistered when its serve task finished
+        with pytest.raises(H2Error):
+            await conn.get("/again")  # refused after the GOAWAY
+        await conn.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_server_connections_shutdown_force_closes_past_timeout():
+    hang = asyncio.Event()  # never set -> the handler never returns
+
+    class _Hang(H2ServerProtocol):
+        async def handle(self, request):
+            await request.read()
+            await hang.wait()
+
+    conns = ServerConnections()
+    loop = asyncio.get_running_loop()
+    server = await loop.create_server(conns.track(_Hang), "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
+        await conn.__aenter__()
+        pending_req = asyncio.ensure_future(conn.get("/hang"))  # handler will hang
+        await asyncio.sleep(0.02)  # let the request reach the server + the handler start
+        assert conns.count() == 1
+        await conns.shutdown(timeout=0.05)  # won't drain -> force-close; must still return
+        assert conns.count() == 0
+        pending_req.cancel()
+        await conn.__aexit__(None, None, None)
