@@ -1,4 +1,5 @@
 from . import http as http
+from ._backend import Backend as Backend
 from ._httpunk import __version__ as __version__
 from .exceptions import (
     ConnectionClosedError as ConnectionClosedError,

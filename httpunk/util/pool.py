@@ -25,7 +25,7 @@ raises, as with any pool); `retain()` is the eviction hook for stale connections
 import threading
 from urllib.parse import urlsplit
 
-from .._backend.tonio import TonioBackend
+from .. import _backend
 
 
 class Canceled(Exception):  # noqa: N818 - `Canceled` is hyper-util's exact name (singleton.rs)
@@ -42,7 +42,7 @@ class Singleton:
 
     def __init__(self, connector, *, backend=None):
         self._connector = connector
-        self._backend = backend or TonioBackend()
+        self._backend = _backend.resolve(backend)
         self._lock = threading.Lock()  # guards the state machine (no await held)
         self._state = "empty"  # empty | making | made
         self._conn = None
@@ -118,7 +118,7 @@ class Cache:
 
     def __init__(self, connector, *, backend=None):
         self._connector = connector
-        self._backend = backend or TonioBackend()
+        self._backend = _backend.resolve(backend)
         self._lock = threading.Lock()
         self._idle = []
 

@@ -20,7 +20,7 @@ polled `Connection` future; we use a coroutine read-pump.
 
 import contextlib
 
-from .._backend.tonio import TonioBackend
+from .. import _backend
 from .._httpunk import (
     H2Codec,
     H2FrameData as Data,
@@ -55,7 +55,7 @@ class H2ConnectionBase:
         # `transport` is a caller-supplied, already-connected byte stream (BYO
         # transport, like hyper's `client`/`server` conn). Subclasses set
         # `self.streams` after building their role state.
-        self.backend = backend or TonioBackend()
+        self.backend = _backend.resolve(backend)
         self.codec = H2Codec(codec_role)
         self.error = None
         self._scope = self.backend.scope()

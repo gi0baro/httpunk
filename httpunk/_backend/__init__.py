@@ -1,4 +1,46 @@
 """Runtime backends. Only this layer talks to a specific async runtime; the
-protocol driver (httpunk.h2) is backend-agnostic. Phase 1 ships tonio only."""
+drivers (httpunk.h1/h2/util) are backend-agnostic — they take a `backend` and use
+only the seam it exposes.
 
-from .tonio import TonioBackend as TonioBackend
+There is **no default backend**: `tonio` needs free-threaded CPython >= 3.14, while
+`asyncio` is available everywhere (incl. GIL builds), so the caller must choose.
+Selection is explicit — a `Backend` enum member (resolved to an instance lazily, so
+picking `asyncio` never imports tonio) or a backend instance. This module imports no
+backend eagerly; `Backend.<member>.create()` does the import on demand.
+"""
+
+import enum
+
+
+class Backend(enum.Enum):
+    """The available runtime backends. `create()` instantiates one, importing its
+    module lazily so an unavailable backend (e.g. tonio on a GIL build) is only
+    touched when actually selected."""
+
+    tonio = "tonio"
+    asyncio = "asyncio"
+
+    def create(self):
+        if self is Backend.tonio:
+            from .tonio import TonioBackend
+
+            return TonioBackend()
+        from .asyncio import AsyncioBackend
+
+        return AsyncioBackend()
+
+
+def resolve(backend):
+    """Resolve a `backend` argument to a backend instance: a `Backend` member →
+    a fresh instance (lazy import); an instance → itself. `None` raises — there is
+    no default (see the module docstring). Call this **module-qualified**
+    (`_backend.resolve(...)`) so it stays a single monkeypatch point for tests."""
+    if backend is None:
+        raise ValueError(
+            "a backend is required: pass backend=Backend.asyncio or Backend.tonio "
+            "(or a backend instance). There is no default — tonio needs free-threaded "
+            "CPython >= 3.14, while asyncio is available everywhere."
+        )
+    if isinstance(backend, Backend):
+        return backend.create()
+    return backend

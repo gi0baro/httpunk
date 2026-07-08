@@ -11,8 +11,21 @@ import functools
 import pytest
 from tonio.colored.time import timeout as _tonio_timeout
 
+from httpunk import _backend
+
 
 _TONIO_TEST_TIMEOUT = 6.0  # seconds; loopback tests finish in well under 1s
+
+
+# Production has NO default backend — `_backend.resolve(None)` raises. Most tests
+# construct connections without an explicit `backend=`, so patch `resolve` ONCE,
+# session-wide, to default a `None` backend to tonio. (A single module-level patch
+# rather than an autouse fixture — the tonio pytest plugin doesn't play well with
+# per-test fixtures.) The drivers call `resolve` module-qualified, so this reaches
+# them all; the asyncio tests pass an explicit backend, so their `None` branch never
+# fires.
+_real_resolve = _backend.resolve
+_backend.resolve = lambda backend: _real_resolve(_backend.Backend.tonio if backend is None else backend)
 
 
 def pytest_collection_modifyitems(config, items):
