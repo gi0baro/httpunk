@@ -53,12 +53,12 @@ class H1ConnectionBase:
         self._closed = True
         self.transport = None
 
-    async def read_body_more(self):
+    def read_body_more(self):
         """Read more transport bytes for an in-flight body. Empty bytes = EOF."""
-        return await self.transport.receive_some(_READ_SIZE)
+        return self.transport.receive_some(_READ_SIZE)
 
-    async def write(self, data):
-        await self.transport.send_all(data)
+    def write(self, data):
+        return self.transport.send_all(data)
 
     @staticmethod
     def _body_framing(body):

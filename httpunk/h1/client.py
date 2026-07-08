@@ -61,8 +61,8 @@ class Connection(H1ConnectionBase):
     async def connect(self):
         pass  # HTTP/1 has no connection preface / handshake (unlike h2)
 
-    async def _acquire(self):
-        await self._slot.acquire()  # blocks until the single in-flight slot is free
+    def _acquire(self):
+        return self._slot.acquire()  # blocks until the single in-flight slot is free
 
     async def wait_idle(self):
         """Resolve once the connection can accept a request (h1 analogue of
@@ -221,13 +221,13 @@ class H1Connection(BaseClientConnection):
     def __init__(self, transport, *, authority=None, backend=None):
         self._conn = Connection(transport, authority=authority, backend=backend)
 
-    async def ready(self):
+    def ready(self):
         """Wait until the connection can accept a request (h1 has no stream slots;
         this waits for the single in-flight request/response to finish). Mirrors
         h2's `conn.ready`."""
-        await self._conn.wait_idle()
+        return self._conn.wait_idle()
 
-    async def send_request(self, request):
+    def send_request(self, request):
         """Send `request` and return its `Response` once the head arrives.
         Mirrors h2's `send_request` (hyper `SendRequest::send_request`).
 
@@ -237,4 +237,4 @@ class H1Connection(BaseClientConnection):
         authority-form for CONNECT. The caller supplies the ``Host`` header (we
         never auto-add it), exactly like hyper's `client::conn::http1`.
         """
-        return await self._conn.send_request(request.method, request.target, request.headers, request.body)
+        return self._conn.send_request(request.method, request.target, request.headers, request.body)

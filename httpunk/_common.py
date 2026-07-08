@@ -46,11 +46,11 @@ class BaseClientConnection:
         await self._conn.close()
         return False
 
-    async def request(self, method, target, *, headers=None, body=None):
-        return await self.send_request(Request(method, target, headers=headers, body=body))
+    def request(self, method, target, *, headers=None, body=None):
+        return self.send_request(Request(method, target, headers=headers, body=body))
 
-    async def get(self, target, *, headers=None):
-        return await self.request("GET", target, headers=headers)
+    def get(self, target, *, headers=None):
+        return self.request("GET", target, headers=headers)
 
 
 class BaseServer:
@@ -75,16 +75,16 @@ class BaseServer:
             raise StopAsyncIteration
         return request
 
-    async def accept(self):
+    def accept(self):
         """Return the next incoming `ServerRequest`, or None once the connection
         can serve no more. (`async for` over the server is the ergonomic form.)"""
-        return await self._conn.next_request()
+        return self._conn.next_request()
 
-    async def graceful_shutdown(self):
+    def graceful_shutdown(self):
         """Signal a graceful shutdown (non-blocking, like hyper's
         `Connection::graceful_shutdown`): h2 sends GOAWAY and refuses new streams;
         h1 stops reusing the connection and releases an idle read. In-flight work
         finishes as the caller keeps driving the accept loop, which then ends and
         closes. `httpunk.util.GracefulShutdown` coordinates this over many
         connections (§11.3)."""
-        await self._conn.graceful_shutdown()
+        return self._conn.graceful_shutdown()
