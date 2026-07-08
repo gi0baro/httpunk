@@ -1,0 +1,111 @@
+"""Phase 6b: the reusable asyncio server protocols (`httpunk.asyncio.{H1,H2,Auto}
+Protocol`). A host embeds httpunk by `loop.create_server(MyProtocol)` and implements
+`handle(request)`; the protocol runs the real httpunk server driver over itself.
+Here the "host" is the test loop and the client is httpunk's own client on the
+asyncio backend.
+"""
+
+import asyncio
+
+import pytest
+
+from httpunk import H1Connection, H2Connection
+from httpunk._backend.asyncio import AsyncioBackend
+from httpunk.asyncio import AutoProtocol, H1Protocol, H2Protocol
+
+
+class _EchoH2(H2Protocol):
+    async def handle(self, request):
+        body = await request.read()
+        await request.respond(200, body=b"h2:" + request.path.encode() + b":" + body)
+
+
+class _EchoH1(H1Protocol):
+    async def handle(self, request):
+        body = await request.read()
+        await request.respond(200, body=b"h1:" + body)
+
+
+class _EchoAuto(AutoProtocol):
+    async def handle(self, request):
+        await request.read()
+        await request.respond(200, body=b"auto:" + (request.path or request.target).encode())
+
+
+async def _serve(protocol_cls):
+    """`create_server(protocol_cls)` on loopback, capturing the per-connection
+    protocol instances so a test can await their serve task (a host would track
+    these; here we just join for a clean teardown). Returns `(server, host, port,
+    protocols)`."""
+    loop = asyncio.get_running_loop()
+    protocols = []
+
+    def factory():
+        p = protocol_cls()
+        protocols.append(p)
+        return p
+
+    server = await loop.create_server(factory, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+    return server, host, port, protocols
+
+
+@pytest.mark.asyncio
+async def test_h2_protocol_roundtrip():
+    server, host, port, protocols = await _serve(_EchoH2)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            resp = await conn.request("POST", "/x", body=b"hi")
+            assert await resp.read() == b"h2:/x:hi"
+        await protocols[0]._serve_task  # join the connection's serve loop (clean teardown)
+
+
+@pytest.mark.asyncio
+async def test_h2_protocol_handles_multiplexed_concurrently():
+    server, host, port, protocols = await _serve(_EchoH2)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            r1, r2 = await asyncio.gather(conn.get("/a"), conn.get("/b"))
+            b1, b2 = await asyncio.gather(r1.read(), r2.read())
+            assert {b1, b2} == {b"h2:/a:", b"h2:/b:"}
+        await protocols[0]._serve_task
+
+
+@pytest.mark.asyncio
+async def test_h1_protocol_roundtrip():
+    server, host, port, protocols = await _serve(_EchoH1)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H1Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            resp = await conn.request("POST", "/y", headers={"host": host}, body=b"hey")
+            assert await resp.read() == b"h1:hey"
+        await protocols[0]._serve_task
+
+
+@pytest.mark.asyncio
+async def test_auto_protocol_serves_h2_client():
+    server, host, port, protocols = await _serve(_EchoAuto)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            resp = await conn.get("/h2path")
+            assert await resp.read() == b"auto:/h2path"
+        await protocols[0]._serve_task
+
+
+@pytest.mark.asyncio
+async def test_auto_protocol_serves_h1_client():
+    server, host, port, protocols = await _serve(_EchoAuto)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H1Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            resp = await conn.request("GET", "/h1path", headers={"host": host})
+            assert await resp.read() == b"auto:/h1path"
+        await protocols[0]._serve_task
