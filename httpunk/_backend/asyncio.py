@@ -11,7 +11,7 @@ private `_buffer`, we own a custom `asyncio.Protocol` (`_AsyncioStream`) that IS
 seam's stream: it buffers `data_received`, presents `receive_some`/`send_all`/`close`
 /`read_nowait`, and manages its own read/write backpressure. This one class serves
 both mode 1 (httpunk dials via `create_connection`) and — subclassed — Phase 6b's
-reusable server protocols (`H1/H2/AutoProtocol`), so keep it inert + subclassable:
+reusable server protocols (`H1/H2/Auto` `ServerProtocol`), so keep it inert + subclassable:
 a pure byte-mover + stream interface, no h1/h2 or driver logic.
 """
 

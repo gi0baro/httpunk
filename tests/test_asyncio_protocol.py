@@ -9,24 +9,24 @@ import asyncio
 
 import pytest
 
-from httpunk import H1Connection, H2Connection
+from httpunk import H1Connection, H2Connection, H2Error
 from httpunk._backend.asyncio import AsyncioBackend
-from httpunk.asyncio import AutoProtocol, H1Protocol, H2Protocol
+from httpunk.asyncio import AutoServerProtocol, H1ServerProtocol, H2ServerProtocol
 
 
-class _EchoH2(H2Protocol):
+class _EchoH2(H2ServerProtocol):
     async def handle(self, request):
         body = await request.read()
         await request.respond(200, body=b"h2:" + request.path.encode() + b":" + body)
 
 
-class _EchoH1(H1Protocol):
+class _EchoH1(H1ServerProtocol):
     async def handle(self, request):
         body = await request.read()
         await request.respond(200, body=b"h1:" + body)
 
 
-class _EchoAuto(AutoProtocol):
+class _EchoAuto(AutoServerProtocol):
     async def handle(self, request):
         await request.read()
         await request.respond(200, body=b"auto:" + (request.path or request.target).encode())
@@ -109,3 +109,43 @@ async def test_auto_protocol_serves_h1_client():
             resp = await conn.request("GET", "/h1path", headers={"host": host})
             assert await resp.read() == b"auto:/h1path"
         await protocols[0]._serve_task
+
+
+# ----- host-coordinated graceful shutdown -----
+
+
+@pytest.mark.asyncio
+async def test_h2_protocol_graceful_shutdown():
+    # A host tracks its protocols (here, `protocols`), signals graceful shutdown on
+    # each, and awaits wait_closed(). In-flight work finishes; new work is refused.
+    server, host, port, protocols = await _serve(_EchoH2)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
+        await conn.__aenter__()
+        resp = await conn.get("/")
+        assert await resp.read() == b"h2:/:"  # full round-trip; connection open
+
+        proto = protocols[0]
+        await proto.graceful_shutdown()  # GOAWAY + refuse-new
+        await proto.wait_closed()  # drains (idle) + closes -> resolves
+        with pytest.raises(H2Error):  # new work refused after the GOAWAY
+            await conn.get("/again")
+        await conn.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_h1_protocol_graceful_shutdown_releases_idle():
+    # h1 graceful releases the idle head-read (via backend.select) and closes; the
+    # protocol's wait_closed() resolves once the connection has drained.
+    server, host, port, protocols = await _serve(_EchoH1)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H1Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            resp = await conn.request("GET", "/", headers={"host": host})
+            assert await resp.read() == b"h1:"
+            proto = protocols[0]
+            await proto.graceful_shutdown()
+            await proto.wait_closed()  # idle read released, connection closed -> resolves
