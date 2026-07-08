@@ -7,6 +7,7 @@ bugs hide. No harness abstraction — plain asyncio primitives + `backend=`.
 
 import asyncio
 import ssl
+import sys
 
 import pytest
 import trustme
@@ -17,6 +18,11 @@ from httpunk.h1.server import H1Server
 from httpunk.h2.server import H2Server
 from httpunk.util import auto, connect
 from httpunk.util.graceful import GracefulShutdown
+
+
+# These use `asyncio.TaskGroup` (3.11+) in the harness; the full stack on the asyncio
+# backend is also covered by test_asyncio_protocol.py, which runs on 3.10.
+pytestmark = pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.TaskGroup is 3.11+")
 
 
 async def _listen(*, ssl_ctx=None):

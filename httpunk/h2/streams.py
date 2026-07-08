@@ -485,7 +485,7 @@ class StreamManager:
         sz = len(frame.data)
         try:
             st = self._recv_lookup(frame.stream_id)
-        except _StreamError, H2ProtocolError:
+        except (_StreamError, H2ProtocolError):
             # Forgotten (STREAM_CLOSED, connection survives) or idle (connection
             # dies). Either way the peer counted these bytes against the connection
             # window on the wire, so account + reclaim it (h2 `ignore_data`).

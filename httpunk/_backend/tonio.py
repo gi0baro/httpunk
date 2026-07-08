@@ -78,7 +78,7 @@ class TonioBackend:
             return ssl_obj.read(min(max_bytes, pending)) if pending else b""
         try:
             return transport.socket._sock.recv(max_bytes)
-        except BlockingIOError, InterruptedError:
+        except (BlockingIOError, InterruptedError):
             return b""
 
     def close_transport(self, transport):
