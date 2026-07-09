@@ -3,8 +3,8 @@
 Holds the client's full role stack, mirroring `server.py`: `Connection` (the
 client-side driver over the shared `H1ConnectionBase`) and `H1Connection` (the
 public per-connection handle). `H1Connection` exposes the **same** surface as
-`H2Connection` — `send_request(Request) -> Response`, `ready`, and the
-`get`/`request` wrappers — so a caller can treat h1 and h2 connections identically.
+`H2Connection` — `send_request(Request) -> Response`, `ready`, and the `request`
+wrapper — so a caller can treat h1 and h2 connections identically.
 
 Cross-reference: hyper `client::conn::http1` (`SendRequest`/`Connection`) +
 `proto/h1/{conn,dispatch,role}.rs` (the Client path).
@@ -288,7 +288,7 @@ class H1Connection(BaseClientConnection):
     Like hyper's `client::conn::http1`, this is low-level: the request-target is
     sent verbatim and the caller supplies the `Host` header (we never auto-add
     one). `authority` is accepted for API symmetry with `H2Connection` but is not
-    used to rewrite the target. `__aenter__`/`__aexit__`/`request`/`get` come from
+    used to rewrite the target. `__aenter__`/`__aexit__`/`request` come from
     `BaseClientConnection` (identical to `H2Connection`)."""
 
     def __init__(self, transport, *, authority=None, backend=None):

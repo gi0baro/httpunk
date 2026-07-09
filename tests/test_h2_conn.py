@@ -79,7 +79,7 @@ async def test_h2c_get_loopback():
         s.spawn(_serve_one_h2c(listener, status=200, body=b"hello h2"))
 
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/")
+            resp = await conn.request("GET", "/")
             body = await resp.read()
 
         s.cancel()

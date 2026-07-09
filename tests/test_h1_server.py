@@ -95,7 +95,7 @@ async def test_server_get():
     async with scope() as s:
         s.spawn(_echo_server(listener))
         async with open_h1(host, port) as conn:
-            r = await conn.get("/hello", headers={"host": f"{host}:{port}"})
+            r = await conn.request("GET", "/hello", headers={"host": f"{host}:{port}"})
             assert r.status == 200
             assert r.headers["content-type"] == b"text/plain"
             assert r.headers.get("date") is not None  # server auto-adds Date (hyper parity)
@@ -122,8 +122,8 @@ async def test_server_keep_alive_two_requests():
     async with scope() as s:
         s.spawn(_echo_server(listener, seen))
         async with open_h1(host, port) as conn:
-            assert await (await conn.get("/a", headers={"host": f"{host}:{port}"})).read() == b"GET /a -> "
-            assert await (await conn.get("/b", headers={"host": f"{host}:{port}"})).read() == b"GET /b -> "
+            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"GET /a -> "
+            assert await (await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})).read() == b"GET /b -> "
         s.cancel()
     assert seen == ["/a", "/b"]  # both served on the one (reused) connection
 
@@ -147,7 +147,7 @@ async def test_server_chunked_response():
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r = await conn.get("/stream", headers={"host": f"{host}:{port}"})
+            r = await conn.request("GET", "/stream", headers={"host": f"{host}:{port}"})
             assert await r.read() == b"chunk-one chunk-two"
         s.cancel()
 
@@ -166,10 +166,10 @@ async def test_server_bodyless_204_then_reuse():
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r1 = await conn.get("/a", headers={"host": f"{host}:{port}"})
+            r1 = await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})
             assert r1.status == 204
             assert await r1.read() == b""
-            r2 = await conn.get("/b", headers={"host": f"{host}:{port}"})  # connection reused
+            r2 = await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})  # connection reused
             assert r2.status == 204
         s.cancel()
 
@@ -213,7 +213,7 @@ async def test_server_request_headers():
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r = await conn.get("/", headers={"host": f"{host}:{port}", "x-custom": "abc"})
+            r = await conn.request("GET", "/", headers={"host": f"{host}:{port}", "x-custom": "abc"})
             assert r.status == 200
             await r.read()
         s.cancel()
@@ -438,7 +438,7 @@ async def test_server_bodyless_response_does_not_drain_body():
             head = await conn.request("HEAD", "/h", headers={"host": f"{host}:{port}"})
             assert head.status == 200
             assert await head.read() == b""  # HEAD response carries no body
-            nc = await conn.get("/n", headers={"host": f"{host}:{port}"})  # -> 204
+            nc = await conn.request("GET", "/n", headers={"host": f"{host}:{port}"})  # -> 204
             assert nc.status == 204
             assert await nc.read() == b""
         s.cancel()

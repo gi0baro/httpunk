@@ -67,7 +67,7 @@ async def test_get_content_length():
         async with open_h1(host, port) as conn:
             # Low-level h1 conn: the caller supplies Host (like hyper's
             # client::conn::http1; it is not auto-added).
-            r = await conn.get("/thing", headers={"host": f"{host}:{port}"})
+            r = await conn.request("GET", "/thing", headers={"host": f"{host}:{port}"})
             assert r.status == 200
             assert r.headers["content-type"] == b"text/plain"
             assert await r.read() == b"hello"
@@ -88,7 +88,7 @@ async def test_get_chunked():
     async with scope() as s:
         s.spawn(_serve(listener, [resp], requests, done))
         async with open_h1(host, port) as conn:
-            r = await conn.get("/")
+            r = await conn.request("GET", "/")
             assert await r.read() == b"hello world"
         await done.wait()
         s.cancel()
@@ -108,7 +108,7 @@ async def test_chunked_trailers_surfaced():
     async with scope() as s:
         s.spawn(_serve(listener, [resp], requests, done))
         async with open_h1(host, port) as conn:
-            r = await conn.get("/")
+            r = await conn.request("GET", "/")
             assert await r.read() == b"hello"
             assert r.trailers is not None
             assert r.trailers["x-checksum"] == b"abc123"
@@ -125,7 +125,7 @@ async def test_streaming_body_iter():
     async with scope() as s:
         s.spawn(_serve(listener, [resp], requests, done))
         async with open_h1(host, port) as conn:
-            r = await conn.get("/")
+            r = await conn.request("GET", "/")
             chunks = [c async for c in r.aiter_bytes()]
         await done.wait()
         s.cancel()
@@ -147,11 +147,11 @@ async def test_bodyless_response_frees_slot_without_read():
     async with scope() as s:
         s.spawn(_serve(listener, [r1, r2], requests, done))
         async with open_h1(host, port) as conn:
-            resp1 = await conn.get("/a")
+            resp1 = await conn.request("GET", "/a")
             assert resp1.status == 204
             # Deliberately do NOT read resp1 — there is no body. The connection
             # must be reusable immediately, so this second request must not hang.
-            assert await (await conn.get("/b")).read() == b"hi"
+            assert await (await conn.request("GET", "/b")).read() == b"hi"
         await done.wait()
         s.cancel()
 
@@ -169,8 +169,8 @@ async def test_keep_alive_two_requests():
     async with scope() as s:
         s.spawn(_serve(listener, [r1, r2], requests, done))
         async with open_h1(host, port) as conn:
-            assert await (await conn.get("/a")).read() == b"ok"
-            assert await (await conn.get("/b")).read() == b"bye"  # same connection reused
+            assert await (await conn.request("GET", "/a")).read() == b"ok"
+            assert await (await conn.request("GET", "/b")).read() == b"bye"  # same connection reused
         await done.wait()
         s.cancel()
 
@@ -192,10 +192,10 @@ async def test_http10_downgrade_reasserts_keep_alive_by_value_replacing_token():
     async with scope() as s:
         s.spawn(_serve(listener, [r1, r2], requests, done))
         async with open_h1(host, port) as conn:
-            assert await (await conn.get("/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
+            assert await (await conn.request("GET", "/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
             # r2 carries a custom Connection token; the downgrade must still re-assert
             # keep-alive (the old presence-check left it, so the server would close).
-            assert await (await conn.get("/b", headers={"connection": "x-foo"})).read() == b"bye"
+            assert await (await conn.request("GET", "/b", headers={"connection": "x-foo"})).read() == b"bye"
         await done.wait()
         s.cancel()
 
@@ -213,9 +213,9 @@ async def test_connection_close_refuses_reuse():
     async with scope() as s:
         s.spawn(_serve(listener, [resp], requests, done))
         async with open_h1(host, port) as conn:
-            assert await (await conn.get("/")).read() == b"hi"
+            assert await (await conn.request("GET", "/")).read() == b"hi"
             with pytest.raises(H2Error):  # ConnectionClosedError: server said Connection: close
-                await conn.get("/again")
+                await conn.request("GET", "/again")
         await done.wait()
         s.cancel()
 
@@ -238,7 +238,7 @@ async def test_close_delimited_body():
     async with scope() as s:
         s.spawn(server())
         async with open_h1(host, port) as conn:
-            r = await conn.get("/")
+            r = await conn.request("GET", "/")
             assert await r.read() == b"body-until-eof"
         await done.wait()
         s.cancel()
@@ -442,8 +442,8 @@ async def test_http10_keepalive_peer_downgrades_next_request():
     async with scope() as s:
         s.spawn(_serve(listener, [r10, r10], requests, done))
         async with open_h1(host, port) as conn:
-            assert await (await conn.get("/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
-            assert await (await conn.get("/b", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            assert await (await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})).read() == b"ok"
         await done.wait()
         s.cancel()
 
@@ -476,10 +476,10 @@ async def test_unexpected_bytes_past_body_poison_connection():
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r1 = await conn.get("/a", headers={"host": f"{host}:{port}"})
+            r1 = await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})
             assert await r1.read() == b"hi"  # the response is intact
             with pytest.raises(ValueError, match="unexpected"):
-                await conn.get("/b", headers={"host": f"{host}:{port}"})  # connection poisoned
+                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})  # connection poisoned
         await done.wait()
         s.cancel()
 
@@ -508,9 +508,9 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            assert await (await conn.get("/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
             r1_read.set()
             await junk_sent.wait()  # the junk is now sitting in the client's socket buffer
             with pytest.raises(ValueError, match="unexpected"):
-                await conn.get("/b", headers={"host": f"{host}:{port}"})
+                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
         s.cancel()

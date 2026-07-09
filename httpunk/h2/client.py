@@ -9,7 +9,7 @@ MAX_CONCURRENT_STREAMS), `Connection` (the client protocol driver over the share
 `H2Connection` is the Python analogue of hyper's `client::conn::http2`: it
 collapses `http2::handshake` + the spawned `Connection` driver + `SendRequest`
 into one async-context-managed object. The core method is `send_request(Request)
--> Response` (≈ `SendRequest::send_request`); `get`/`request` are thin wrappers.
+-> Response` (≈ `SendRequest::send_request`); `request` is a thin wrapper.
 This layer is low-level by design — no pool, connector, or high-level client
 (those live downstream; see PLAN.md §3.3).
 
@@ -319,7 +319,7 @@ class H2Connection(BaseClientConnection):
 
     `authority` (e.g. ``"example.com:443"``) builds the :authority pseudo-header
     for requests given a bare path; requests with an absolute-URL target carry
-    their own authority. `__aenter__`/`__aexit__`/`request`/`get` come from
+    their own authority. `__aenter__`/`__aexit__`/`request` come from
     `BaseClientConnection` (identical to `H1Connection`).
     """
 

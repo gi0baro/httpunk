@@ -75,7 +75,7 @@ async def test_h2_get_roundtrip():
         tg.create_task(serve())
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
-            resp = await conn.get("/x")
+            resp = await conn.request("GET", "/x")
             assert await resp.read() == b"ok:/x"
 
 
@@ -107,7 +107,7 @@ async def test_h2_multiplexed_requests():
         tg.create_task(serve())
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
-            r1, r2 = await asyncio.gather(conn.get("/a"), conn.get("/b"))  # two concurrent streams
+            r1, r2 = await asyncio.gather(conn.request("GET", "/a"), conn.request("GET", "/b"))  # two concurrent streams
             b1, b2 = await asyncio.gather(r1.read(), r2.read())
             assert {b1, b2} == {b"ok:/a", b"ok:/b"}
 
@@ -130,7 +130,7 @@ async def test_h2_streaming_response_body():
         tg.create_task(serve())
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
-            resp = await conn.get("/s")
+            resp = await conn.request("GET", "/s")
             assert await resp.read() == b"chunk0chunk1chunk2"
 
 
@@ -171,7 +171,7 @@ async def test_tls_alpn_negotiates_h2(ca):
         )
         assert isinstance(conn, H2Connection)  # ALPN chose h2 over TLS
         async with conn:
-            resp = await conn.get("/x")
+            resp = await conn.request("GET", "/x")
             assert await resp.read() == b"tls:/x"
 
 
@@ -239,11 +239,11 @@ async def test_h2_graceful_drains_and_refuses_new():
         transport = await backend.connect_tcp(host, port)
         conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
         await conn.__aenter__()
-        resp = await conn.get("/")
+        resp = await conn.request("GET", "/")
         assert await resp.read() == b"ok"
         assert graceful.count() == 1
         await graceful.shutdown()  # GOAWAY + drain (idle) + close
         assert graceful.count() == 0
         with pytest.raises(H2Error):  # new work refused after shutdown
-            await conn.get("/")
+            await conn.request("GET", "/")
         await conn.__aexit__(None, None, None)

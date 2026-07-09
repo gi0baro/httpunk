@@ -144,7 +144,7 @@ async def test_streaming_large_body():
     async with scope() as s:
         s.spawn(server.serve(responder, s))
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/big")
+            resp = await conn.request("GET", "/big")
             async for chunk in resp.aiter_bytes():
                 chunks.append(chunk)
             status = resp.status
@@ -172,7 +172,7 @@ async def test_multiplexing_two_streams():
             done = [Event(), Event()]
 
             async def fetch(i, path):
-                resp = await conn.get(path)
+                resp = await conn.request("GET", path)
                 results[path] = (resp.status, await resp.read())
                 done[i].set()
 
@@ -213,7 +213,7 @@ async def test_max_concurrent_streams_gating():
             done = [Event(), Event()]
 
             async def fetch(i, path):
-                resp = await conn.get(path)
+                resp = await conn.request("GET", path)
                 results[path] = await resp.read()
                 done[i].set()
 

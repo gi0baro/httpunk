@@ -34,9 +34,13 @@ async def read_all(aiter):
 
 class BaseClientConnection:
     """Shared public client-facade glue (h1/h2): async-context-manager entry/exit
-    + the `request`/`get` wrappers over the protocol-specific `send_request`.
-    Subclasses build `self._conn` (which exposes `connect`/`close`) and implement
-    `send_request` + `ready`."""
+    + the `request` wrapper over the protocol-specific `send_request`. Subclasses
+    build `self._conn` (which exposes `connect`/`close`) and implement
+    `send_request` + `ready`.
+
+    `request(method, target, ...)` is a thin convenience over `send_request(Request)`;
+    it takes the method explicitly (no per-verb helpers like `get()` — httpunk is
+    low-level, and a single arbitrary shortcut would be inconsistent)."""
 
     async def __aenter__(self):
         await self._conn.connect()
@@ -48,9 +52,6 @@ class BaseClientConnection:
 
     def request(self, method, target, *, headers=None, body=None, trailers=None):
         return self.send_request(Request(method, target, headers=headers, body=body, trailers=trailers))
-
-    def get(self, target, *, headers=None):
-        return self.request("GET", target, headers=headers)
 
 
 class BaseServer:

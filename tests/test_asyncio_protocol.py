@@ -69,7 +69,7 @@ async def test_h2_protocol_handles_multiplexed_concurrently():
     async with server:
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
-            r1, r2 = await asyncio.gather(conn.get("/a"), conn.get("/b"))
+            r1, r2 = await asyncio.gather(conn.request("GET", "/a"), conn.request("GET", "/b"))
             b1, b2 = await asyncio.gather(r1.read(), r2.read())
             assert {b1, b2} == {b"h2:/a:", b"h2:/b:"}
         await protocols[0]._serve_task
@@ -94,8 +94,8 @@ async def test_h2_protocol_handler_error_resets_stream_not_connection():
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
             with pytest.raises(H2Error):  # the failed handler reset the stream
-                await conn.get("/boom")
-            assert await (await conn.get("/ok")).read() == b"ok"  # connection survived
+                await conn.request("GET", "/boom")
+            assert await (await conn.request("GET", "/ok")).read() == b"ok"  # connection survived
         await protocols[0]._serve_task
 
 
@@ -118,7 +118,7 @@ async def test_auto_protocol_serves_h2_client():
     async with server:
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
-            resp = await conn.get("/h2path")
+            resp = await conn.request("GET", "/h2path")
             assert await resp.read() == b"auto:/h2path"
         await protocols[0]._serve_task
 
@@ -148,14 +148,14 @@ async def test_h2_protocol_graceful_shutdown():
         transport = await backend.connect_tcp(host, port)
         conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
         await conn.__aenter__()
-        resp = await conn.get("/")
+        resp = await conn.request("GET", "/")
         assert await resp.read() == b"h2:/:"  # full round-trip; connection open
 
         proto = protocols[0]
         await proto.graceful_shutdown()  # GOAWAY + refuse-new
         await proto.wait_closed()  # drains (idle) + closes -> resolves
         with pytest.raises(H2Error):  # new work refused after the GOAWAY
-            await conn.get("/again")
+            await conn.request("GET", "/again")
         await conn.__aexit__(None, None, None)
 
 
@@ -189,12 +189,12 @@ async def test_server_connections_tracks_and_gracefully_shuts_down():
         transport = await backend.connect_tcp(host, port)
         conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
         await conn.__aenter__()
-        assert await (await conn.get("/r")).read() == b"h2:/r:"
+        assert await (await conn.request("GET", "/r")).read() == b"h2:/r:"
         assert conns.count() == 1  # the live connection is tracked
         await conns.shutdown(timeout=5)  # graceful; the idle connection drains + closes
         assert conns.count() == 0  # deregistered when its serve task finished
         with pytest.raises(H2Error):
-            await conn.get("/again")  # refused after the GOAWAY
+            await conn.request("GET", "/again")  # refused after the GOAWAY
         await conn.__aexit__(None, None, None)
 
 
@@ -216,7 +216,7 @@ async def test_server_connections_shutdown_force_closes_past_timeout():
         transport = await backend.connect_tcp(host, port)
         conn = H2Connection(transport, authority=f"{host}:{port}", backend=backend)
         await conn.__aenter__()
-        pending_req = asyncio.ensure_future(conn.get("/hang"))  # handler will hang
+        pending_req = asyncio.ensure_future(conn.request("GET", "/hang"))  # handler will hang
         await asyncio.sleep(0.02)  # let the request reach the server + the handler start
         assert conns.count() == 1
         await conns.shutdown(timeout=0.05)  # won't drain -> force-close; must still return

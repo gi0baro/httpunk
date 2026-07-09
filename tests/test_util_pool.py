@@ -58,7 +58,7 @@ async def test_singleton_coalesces_concurrent_gets_into_one_connection():
             gs.spawn(get(2))
 
         assert got[1] is got[2]  # same shared connection
-        resp = await got[1].get("/")
+        resp = await got[1].request("GET", "/")
         assert await resp.read() == b"ok"
         assert accepts["n"] == 1  # only one connection was ever made
         assert not pool.is_empty()

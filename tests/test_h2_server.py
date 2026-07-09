@@ -51,7 +51,7 @@ async def test_server_get():
     async with scope() as s:
         s.spawn(_echo_server(listener))
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/hello")
+            resp = await conn.request("GET", "/hello")
             assert resp.status == 200
             assert resp.headers["content-type"] == b"text/plain"
             assert await resp.read() == b"GET /hello -> "
@@ -114,7 +114,7 @@ async def test_server_streaming_response_body():
     async with scope() as s:
         s.spawn(serve())
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/big")
+            resp = await conn.request("GET", "/big")
             body = await resp.read()
         s.cancel()
     assert body == b"a" * 50_000 + b"b" * 50_000
@@ -141,7 +141,7 @@ async def test_server_multiplexed_requests():
             done = [Event(), Event()]
 
             async def fetch(i, path):
-                resp = await conn.get(path)
+                resp = await conn.request("GET", path)
                 results[path] = (resp.status, await resp.read())
                 done[i].set()
 

@@ -106,7 +106,7 @@ async def test_rst_stream_raises_stream_reset():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(StreamResetError) as exc:
-                await conn.get("/")
+                await conn.request("GET", "/")
         s.cancel()
 
     assert exc.value.error_code == H2Reason.REFUSED_STREAM
@@ -130,7 +130,7 @@ async def test_goaway_raises_goaway_error():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(GoAwayError) as exc:
-                await conn.get("/")
+                await conn.request("GET", "/")
         s.cancel()
 
     assert exc.value.error_code == H2Reason.ENHANCE_YOUR_CALM
@@ -156,10 +156,10 @@ async def test_goaway_completes_in_flight_and_refuses_new():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/a")  # stream 1 <= last_stream_id: completes normally
+            resp = await conn.request("GET", "/a")  # stream 1 <= last_stream_id: completes normally
             body = await resp.read()
             with pytest.raises(GoAwayError):
-                await conn.get("/b")  # a new stream is refused
+                await conn.request("GET", "/b")  # a new stream is refused
         s.cancel()
 
     assert resp.status == 200
@@ -180,7 +180,7 @@ async def test_connection_closed_raises():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(H2Error):  # ConnectionClosedError (or a reset surfaced as such)
-                await conn.get("/")
+                await conn.request("GET", "/")
         s.cancel()
 
 
@@ -211,7 +211,7 @@ async def test_cancel_sends_rst_stream():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/big")
+            resp = await conn.request("GET", "/big")
             first = None
             async for chunk in resp.aiter_bytes():
                 first = chunk
@@ -255,7 +255,7 @@ async def test_protocol_error_sends_goaway():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(H2FlowControlError):
-                await conn.get("/")
+                await conn.request("GET", "/")
         await done.wait()
         s.cancel()
 
@@ -291,7 +291,7 @@ async def test_malformed_frame_sends_goaway():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(H2ProtocolError):
-                await conn.get("/")
+                await conn.request("GET", "/")
         await done.wait()
         s.cancel()
 
@@ -327,7 +327,7 @@ async def test_frame_on_idle_stream_sends_goaway():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(H2ProtocolError):
-                await conn.get("/")
+                await conn.request("GET", "/")
         await done.wait()
         s.cancel()
 
@@ -374,9 +374,9 @@ async def test_frame_on_closed_stream_resets_it():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            resp1 = await conn.get("/a")
+            resp1 = await conn.request("GET", "/a")
             assert await resp1.read() == b"ok"
-            resp2 = await conn.get("/b")  # connection survived the late frame
+            resp2 = await conn.request("GET", "/b")  # connection survived the late frame
             assert await resp2.read() == b"two"
         await done.wait()
         s.cancel()
@@ -430,11 +430,11 @@ async def test_locally_reset_stream_swallows_late_frames():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            resp1 = await conn.get("/a")
+            resp1 = await conn.request("GET", "/a")
             async for _chunk in resp1.aiter_bytes():
                 break  # read one chunk, then cancel
             await resp1.aclose()  # RST(CANCEL) -> stream enters the reset store
-            resp2 = await conn.get("/b")
+            resp2 = await conn.request("GET", "/b")
             assert await resp2.read() == b"two"
         await done.wait()
         s.cancel()
@@ -477,14 +477,14 @@ async def test_stream_flow_violation_resets_only_that_stream():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port, initial_window_size=100) as conn:
-            assert (await conn.get("/warmup")).status == 200  # applies our SETTINGS window
+            assert (await conn.request("GET", "/warmup")).status == 200  # applies our SETTINGS window
             # The RST may surface at get() or at read() depending on whether the
             # pump has processed the overrun DATA by the time the caller resumes;
             # both are correct, so accept either.
             with pytest.raises(H2Error):  # stream reset (flow control)
-                resp1 = await conn.get("/a")
+                resp1 = await conn.request("GET", "/a")
                 await resp1.read()
-            resp2 = await conn.get("/b")  # connection survived
+            resp2 = await conn.request("GET", "/b")  # connection survived
             assert await resp2.read() == b"ok"
         await done.wait()
         s.cancel()
@@ -536,7 +536,7 @@ async def test_content_length_over_19_digits_rejected():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(H2Error):  # RST_STREAM(PROTOCOL_ERROR): content-length too long
-                resp = await conn.get("/a")
+                resp = await conn.request("GET", "/a")
                 await resp.read()
         s.cancel()
 
@@ -562,7 +562,7 @@ async def test_stream_id_overflow_refuses_new_stream():
         async with open_h2(host, port) as conn:
             conn._conn.streams._next_id = (2**31 - 1) + 2  # exhaust the client id space
             with pytest.raises(H2Error, match="exhausted"):
-                await conn.get("/a")
+                await conn.request("GET", "/a")
         s.cancel()
 
 
@@ -585,7 +585,7 @@ async def test_1xx_with_end_stream_is_reset_not_hung():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             with pytest.raises(H2Error):  # RST_STREAM(PROTOCOL_ERROR): 1xx can't END_STREAM
-                await conn.get("/")
+                await conn.request("GET", "/")
         s.cancel()
 
 
@@ -666,7 +666,7 @@ async def test_goaway_high_last_stream_id_accepted():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/")  # stream 1 <= last_stream_id -> kept running
+            resp = await conn.request("GET", "/")  # stream 1 <= last_stream_id -> kept running
             assert resp.status == 200
             assert await resp.read() == b"ok"
         s.cancel()
@@ -702,7 +702,7 @@ async def test_close_wakes_inflight_waiter():
 
         async def do_get():
             try:
-                resp = await conn.get("/")
+                resp = await conn.request("GET", "/")
                 outcome["resp"] = resp
             except Exception as exc:  # the test asserts on the exception type below
                 outcome["err"] = exc
@@ -737,7 +737,7 @@ async def test_aclose_after_connection_failure_is_clean():
         s.spawn(server())
         conn = H2Connection(await TonioBackend().connect_tcp(host, port), authority=f"{host}:{port}")
         await conn.__aenter__()
-        resp = await conn.get("/")  # head arrives; body left unread
+        resp = await conn.request("GET", "/")  # head arrives; body left unread
         assert resp.status == 200
         got_resp.set()
         while conn._conn.error is None:  # wait until the pump processed the EOF (fail_all ran)
@@ -776,7 +776,7 @@ async def test_client_replies_goaway_when_idle_after_peer_goaway():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            resp = await conn.get("/")
+            resp = await conn.request("GET", "/")
             assert await resp.read() == b"ok"
             await got_client_goaway.wait()  # the client replied with its own GOAWAY (else hangs)
         s.cancel()

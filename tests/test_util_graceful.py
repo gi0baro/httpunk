@@ -222,7 +222,7 @@ async def test_h2_graceful_drains_open_connection_then_closes():
         conn = H2Connection(client_transport, authority=f"{host}:{port}")
         await conn.__aenter__()
 
-        resp = await conn.get("/")
+        resp = await conn.request("GET", "/")
         assert await resp.read() == b"finished"
         assert graceful.count() == 1  # connection still open, being watched
 
@@ -232,7 +232,7 @@ async def test_h2_graceful_drains_open_connection_then_closes():
         # A new request is refused: either GoAwayError (the client saw our GOAWAY) or
         # ConnectionClosedError (it saw EOF first) — both are H2Error, timing-dependent.
         with pytest.raises(H2Error):
-            await conn.get("/")
+            await conn.request("GET", "/")
         await conn.__aexit__(None, None, None)
 
 
