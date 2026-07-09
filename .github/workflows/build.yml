@@ -1,0 +1,62 @@
+name: build
+
+on: workflow_dispatch
+
+permissions: {}
+
+env:
+  PY_ALL: 3.10 3.11 3.12 3.13 3.14 3.14t 3.15 3.15t pypy3.11
+
+jobs:
+  wheels:
+    name: wheel ${{ matrix.platform || matrix.os }}(${{ matrix.target }}) - ${{ matrix.manylinux || 'auto' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos, windows]
+        target: [x86_64, aarch64]
+        manylinux: [auto]
+        include:
+          - os: ubuntu
+            platform: linux
+            target: i686
+          - os: ubuntu
+            platform: linux
+            target: armv7
+          - os: ubuntu
+            platform: linux
+            target: x86_64
+            manylinux: musllinux_1_1
+          - os: ubuntu
+            platform: linux
+            target: aarch64
+            manylinux: musllinux_1_1
+          - os: ubuntu
+            platform: linux
+            target: armv7
+            manylinux: musllinux_1_1
+        exclude:
+          - os: windows
+            target: aarch64
+
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pyo3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          rust-toolchain: stable
+          command: build
+          args: --release --out dist --interpreter ${{ matrix.interpreter || env.PY_ALL }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          container: ${{ matrix.container }}
+          docker-options: -e CI
+      - name: Upload wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.platform || matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}
+          path: dist
