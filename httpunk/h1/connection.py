@@ -15,6 +15,7 @@ Cross-reference: hyperium/hyper 1.10.1 `src/proto/h1/{conn,dispatch,role}.rs`.
 
 from .. import _backend
 from .._common import aiter_body
+from ..exceptions import ConnectionClosedError
 
 
 _READ_SIZE = 65536
@@ -55,10 +56,20 @@ class H1ConnectionBase:
 
     def read_body_more(self):
         """Read more transport bytes for an in-flight body. Empty bytes = EOF."""
-        return self.transport.receive_some(_READ_SIZE)
+        # A concurrent close() may have nulled the transport (its close-first teardown).
+        # Capture it once and raise a clean connection error rather than an
+        # AttributeError on `None.receive_some` (F59). The local capture also closes the
+        # check-then-null race under free-threading.
+        transport = self.transport
+        if transport is None:
+            raise ConnectionClosedError("connection closed")
+        return transport.receive_some(_READ_SIZE)
 
     def write(self, data):
-        return self.transport.send_all(data)
+        transport = self.transport
+        if transport is None:
+            raise ConnectionClosedError("connection closed")
+        return transport.send_all(data)
 
     @staticmethod
     def _body_framing(body):

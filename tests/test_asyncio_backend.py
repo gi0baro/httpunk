@@ -104,6 +104,127 @@ async def test_select_returns_winner_and_cancels_loser():
 
 
 @pytest.mark.asyncio
+async def test_send_all_raises_after_connection_lost():
+    # A write to a dead socket must FAIL — asyncio silently discards writes after
+    # connection_lost, but tonio (like a raw socket) raises, and drivers detect a
+    # dead peer that way (F32). Surface the real error, or EPIPE on a clean FIN.
+    s = _AsyncioStream()
+    s.connection_made(_FakeTransport())
+    s.connection_lost(ConnectionResetError("peer reset"))
+    with pytest.raises(ConnectionResetError):
+        await s.send_all(b"data")
+
+    clean = _AsyncioStream()
+    clean.connection_made(_FakeTransport())
+    clean.connection_lost(None)  # a clean peer close carries no error
+    with pytest.raises(BrokenPipeError):
+        await clean.send_all(b"data")
+
+
+class _FakeCloseTransport:
+    """Records abort() vs close() and reports whether it is a TLS transport."""
+
+    def __init__(self, *, ssl):
+        self._ssl = ssl
+        self.aborted = False
+        self.closed = False
+
+    def get_extra_info(self, name):
+        return object() if (name == "ssl_object" and self._ssl) else None
+
+    def abort(self):
+        self.aborted = True
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_close_aborts_tls_transport_but_closes_plain():
+    # TLS closes abortively (no close_notify) to match tonio's raw-socket close (F33a);
+    # plain TCP still gets a graceful FIN via close().
+    tls = _AsyncioStream()
+    tls.connection_made(_FakeCloseTransport(ssl=True))
+    tls.close()
+    assert tls._transport.aborted and not tls._transport.closed
+
+    plain = _AsyncioStream()
+    plain.connection_made(_FakeCloseTransport(ssl=False))
+    plain.close()
+    assert plain._transport.closed and not plain._transport.aborted
+
+
+@pytest.mark.asyncio
+async def test_second_concurrent_receive_some_raises():
+    # The single-reader contract: a second receive_some while one is parked must fail
+    # loudly rather than clobber the first's waiter and hang it forever (F55).
+    s = _AsyncioStream()
+    s.connection_made(None)
+    first = asyncio.ensure_future(s.receive_some())  # parks: buffer empty, no EOF
+    await asyncio.sleep(0)  # let it register its read waiter
+    with pytest.raises(RuntimeError, match="single-reader"):
+        await s.receive_some()  # a concurrent second reader
+    first.cancel()
+
+
+@pytest.mark.asyncio
+async def test_select_prefers_argument_order_when_both_ready():
+    # Among racers ready in the same wakeup the winner is the FIRST argument, matching
+    # tonio's spawn-in-order select (asyncio.wait's `done` set is unordered) — F33c.
+    backend = AsyncioBackend()
+
+    async def a():
+        return "a"
+
+    async def b():
+        return "b"
+
+    for _ in range(20):
+        assert await backend.select(a(), b()) == "a"
+
+
+@pytest.mark.asyncio
+async def test_select_discards_losing_exception():
+    # A loser that raises (here, on cancellation) must NOT surface out of select —
+    # only the winner's outcome propagates (F33c). The old drain only caught
+    # CancelledError, so a loser's other exception leaked.
+    backend = AsyncioBackend()
+
+    async def winner():
+        return "win"
+
+    async def loser():
+        try:
+            await asyncio.sleep(10)
+        finally:
+            raise RuntimeError("loser boom")
+
+    assert await backend.select(winner(), loser()) == "win"
+
+
+@pytest.mark.asyncio
+async def test_select_cancels_racers_when_itself_cancelled():
+    # If select is cancelled its racers are cancelled too — no orphans (F33c).
+    backend = AsyncioBackend()
+    cancelled = []
+
+    async def racer(tag):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(tag)
+            raise
+
+    sel = asyncio.ensure_future(backend.select(racer("x"), racer("y")))
+    for _ in range(3):
+        await asyncio.sleep(0)  # let both racers park in sleep()
+    sel.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sel
+    assert set(cancelled) == {"x", "y"}
+
+
+@pytest.mark.asyncio
 async def test_scope_spawn_cancel_and_join():
     backend = AsyncioBackend()
     ran = []

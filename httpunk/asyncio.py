@@ -21,6 +21,7 @@ the client's opening bytes.
 """
 
 import asyncio
+import contextlib
 
 from ._backend.asyncio import AsyncioBackend, _AsyncioStream
 from .h1.server import H1Server
@@ -57,7 +58,14 @@ class _ServerProtocol(_AsyncioStream):
         raise NotImplementedError
 
     async def _serve(self):
-        self._server = await self._make_server()
+        try:
+            self._server = await self._make_server()
+        except auto.SniffCancelledError:
+            # A graceful shutdown interrupted the preface sniff of a still-silent
+            # connection (AutoServerProtocol) — there is nothing to serve, so close
+            # promptly instead of lingering until the host's force-close timeout (F36).
+            self.close()
+            return
         await self._maybe_apply_graceful()  # a shutdown requested before the server existed
         async with self._server as server:
             if isinstance(server, H2Server):
@@ -66,7 +74,7 @@ class _ServerProtocol(_AsyncioStream):
                 async with self._backend.scope() as handlers:
                     try:
                         async for request in server:
-                            handlers.spawn(self.handle(request))
+                            handlers.spawn(self._run_h2_handler(request))
                     except BaseException:
                         # Connection error or force-close (serve task cancelled):
                         # cancel in-flight handlers explicitly so a stuck one can't
@@ -80,6 +88,19 @@ class _ServerProtocol(_AsyncioStream):
                 # yield the next until this one is answered) — handle serially.
                 async for request in server:
                     await self.handle(request)
+
+    async def _run_h2_handler(self, request):
+        # h2 handlers run concurrently in a join-only scope, which would otherwise
+        # SWALLOW a handler exception silently — leaving the client's stream hanging
+        # forever with no response (F34). Reset that one stream so the peer sees a
+        # failure; the connection and its other streams keep running (h2 isolates a
+        # service error to the stream, hyper `SendResponse` drop). A host that wants to
+        # log handler errors should catch them inside its own `handle()`.
+        try:
+            await self.handle(request)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await request.reset()
 
     async def handle(self, request):
         """Override: produce the response for `request` via `request.respond(...)`.
@@ -131,8 +152,19 @@ class H2ServerProtocol(_ServerProtocol):
 class AutoServerProtocol(_ServerProtocol):
     """Serve each connection as HTTP/1 or HTTP/2, sniffed from the client preface."""
 
+    def __init__(self):
+        super().__init__()
+        self._sniff_cancel = self._backend.event()  # fires to abort an in-progress sniff (F36)
+
     async def _make_server(self):
-        return await auto.serve(self, backend=self._backend)
+        return await auto.serve(self, backend=self._backend, cancel=self._sniff_cancel)
+
+    async def graceful_shutdown(self):
+        # Interrupt an in-progress preface sniff so a graceful shutdown of a
+        # still-silent client doesn't linger (≈ hyper-util `ReadVersion::cancel`, F36).
+        # Harmless once the server is built (nothing is waiting on the signal).
+        self._sniff_cancel.set()
+        await super().graceful_shutdown()
 
 
 class ServerConnections:
@@ -180,7 +212,10 @@ class ServerConnections:
         conns = list(self._live)
         if not conns:
             return
-        await asyncio.gather(*(c.graceful_shutdown() for c in conns))
+        # return_exceptions so ONE connection whose graceful_shutdown() raises can't
+        # abort the whole shutdown — every other connection must still be drained and
+        # the force-close path below must still run (F54).
+        await asyncio.gather(*(c.graceful_shutdown() for c in conns), return_exceptions=True)
         waits = [asyncio.ensure_future(c.wait_closed()) for c in conns]
         _done, pending = await asyncio.wait(waits, timeout=timeout)
         if pending:

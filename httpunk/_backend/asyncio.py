@@ -16,6 +16,7 @@ a pure byte-mover + stream interface, no h1/h2 or driver logic.
 """
 
 import asyncio
+import errno as _errno
 import ssl as _ssl
 import time as _time
 
@@ -38,6 +39,7 @@ class _AsyncioStream(asyncio.Protocol):
         self._reading_paused = False
         self._writing_paused = False
         self._drain_waiter = None  # Future parked in send_all under write backpressure
+        self._conn_lost = False  # the socket died (connection_lost) — writes must now fail
 
     # ----- asyncio.Protocol callbacks (fed from the socket / host loop) -----
 
@@ -54,11 +56,18 @@ class _AsyncioStream(asyncio.Protocol):
     def eof_received(self):
         self._eof = True
         self._wake_reader()
-        return True  # keep the write half open (HTTP half-close: still send the response)
+        # Keep the write half open — HTTP half-close: the peer closed its write side
+        # (our read sees EOF) but we still send the response. NOTE (F33b): asyncio
+        # honours this over plain TCP, but its SSL layer force-closes the transport on
+        # an unexpected EOF (no close_notify) regardless of this return — so a TLS
+        # half-close won't keep writing here the way tonio's does. That's an asyncio
+        # SSL-runtime limitation, not something this layer can paper over faithfully.
+        return True
 
     def connection_lost(self, exc):
         self._error = exc
         self._eof = True
+        self._conn_lost = True  # writes to a dead socket must now raise (F32)
         self._wake_reader()
         self._writing_paused = False
         if self._drain_waiter is not None and not self._drain_waiter.done():
@@ -87,6 +96,12 @@ class _AsyncioStream(asyncio.Protocol):
             if self._error is not None:
                 raise self._error
             return b""
+        if self._read_waiter is not None:
+            # Single-reader contract: a second concurrent receive_some would overwrite
+            # the first's waiter, and the first caller would then park forever. The
+            # drivers read one-at-a-time, so this is a bug — fail loudly rather than
+            # hang silently (F55).
+            raise RuntimeError("concurrent receive_some on one stream (single-reader contract)")
         self._read_waiter = self._loop.create_future()
         try:
             await self._read_waiter
@@ -99,6 +114,12 @@ class _AsyncioStream(asyncio.Protocol):
         return b""
 
     async def send_all(self, data):
+        # A write to a dead socket must fail (F32): asyncio's transport silently
+        # DISCARDS writes after connection_lost, but tonio (like a raw socket) raises
+        # EPIPE/ECONNRESET — drivers detect a dead peer via that failure. Surface the
+        # real error, or EPIPE if the close carried none (a clean peer FIN).
+        if self._conn_lost:
+            raise self._error or BrokenPipeError(_errno.EPIPE, "connection lost")
         self._transport.write(data)
         if self._writing_paused:  # transport buffer over high-water — wait for resume (drain)
             if self._drain_waiter is None:
@@ -106,7 +127,15 @@ class _AsyncioStream(asyncio.Protocol):
             await self._drain_waiter
 
     def close(self):
-        if self._transport is not None:
+        if self._transport is None:
+            return
+        # Over TLS, abort() (no close_notify) rather than close() — an abortive close
+        # matching tonio's raw-socket close and hyper's hard close on a dropped
+        # connection (F33a); the async, caller-owned H1Upgraded.aclose path does the
+        # full close_notify dance instead. Plain TCP close() already sends a FIN.
+        if self._transport.get_extra_info("ssl_object") is not None:
+            self._transport.abort()
+        else:
             self._transport.close()
 
     def read_nowait(self, max_bytes=65536):
@@ -223,17 +252,35 @@ class AsyncioBackend:
         transport.close()
 
     async def select(self, *coros):
-        """Race `coros`; return the first result, cancelling the losers."""
+        """Race `coros`; return the first-ready one's result, cancelling the losers.
+        Matches tonio's `select` (`_ctl.select`: spawn all in argument order, keep the
+        first stored outcome, then `scope.cancel()` the rest):
+
+        - only the WINNER's outcome propagates — a loser's result or exception is
+          discarded (tonio never fetches a loser's stored value);
+        - the winner is the first coro in ARGUMENT ORDER among any ready in the same
+          wakeup (asyncio.wait's `done` set is unordered — pick deterministically);
+        - if `select` itself is cancelled, every racer is cancelled too (tonio's scope
+          aborts its children on teardown) — no coro is orphaned.
+        """
         tasks = [asyncio.ensure_future(c) for c in coros]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        winner = next(task for task in tasks if task in done)
+        losers = [task for task in tasks if task is not winner]
+        for task in losers:
             task.cancel()
-        for task in pending:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        return next(iter(done)).result()
+        # Drain losers so their outcome is discarded (never surfaced here) and no
+        # "exception never retrieved" fires; return_exceptions swallows their
+        # error/cancellation. Losers that also finished this tick are drained too.
+        if losers:
+            await asyncio.gather(*losers, return_exceptions=True)
+        return winner.result()
 
     def queue(self):
         """An unbounded queue as `(sender, receiver)`: `sender.send(x)` is sync;
@@ -249,3 +296,4 @@ class AsyncioBackend:
     semaphore = asyncio.Semaphore
     scope = _AsyncioScope
     monotonic = staticmethod(_time.monotonic)
+    sleep = staticmethod(asyncio.sleep)  # async sleep(seconds), for deadline races (`select`)

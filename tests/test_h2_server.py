@@ -286,6 +286,40 @@ async def test_server_advertises_hyper_settings_profile():
 
 
 @pytest.mark.tonio
+async def test_forgotten_stream_frames_swallowed_after_first_rst():
+    """A frame on a forgotten (closed) stream draws ONE RST_STREAM(STREAM_CLOSED); the
+    id then enters the reset store, so further frames on it are silently swallowed
+    rather than each drawing another RST (F17 — the reset-amplification defence)."""
+    listener, host, port = await _listener()
+    async with scope() as s:
+        s.spawn(_serve_forever(listener))  # 200 (bodyless) per request
+        transport, codec = await _raw_handshake(host, port)
+        # Complete stream 1 so the server closes + forgets it.
+        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/a", HeaderMap(), end_stream=True))
+        assert (await _read_frame(transport, codec, Headers)).stream_id == 1  # the 200 response
+        # Two late DATA frames on the now-forgotten stream 1, then a fresh request (stream
+        # 3) as a read barrier so we know both late frames were processed.
+        await transport.send_all(codec.serialize_data(1, b"late1", end_stream=False))
+        await transport.send_all(codec.serialize_data(1, b"late2", end_stream=False))
+        await transport.send_all(codec.serialize_request_headers(3, "GET", "http://x/b", HeaderMap(), end_stream=True))
+        rsts = 0
+        done = False
+        while not done:
+            data = await transport.receive_some(65536)
+            assert data, "connection closed unexpectedly"
+            for f in codec.receive(data):
+                if isinstance(f, Settings) and not f.ack:
+                    await transport.send_all(codec.serialize_settings_ack())
+                elif isinstance(f, RstStream) and f.stream_id == 1:
+                    rsts += 1
+                elif isinstance(f, Headers) and f.stream_id == 3:  # barrier: stream 3 served
+                    done = True
+        assert rsts == 1  # the 2nd late frame was swallowed, not answered with another RST
+        transport.close()
+        s.cancel()
+
+
+@pytest.mark.tonio
 async def test_server_goaway_on_remote_reset_flood():
     """Rapid Reset (CVE-2023-44487): a flood of HEADERS+RST_STREAM on streams the app
     never accepts. Reset pending-accept streams stop counting as concurrent, so

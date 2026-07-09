@@ -39,6 +39,7 @@ _STREAM_WINDOW = 2 * 1024 * 1024
 _CONN_WINDOW = 5 * 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
+_MAX_STREAM_ID = 2**31 - 1  # h2 StreamId::MAX — the last id `next_id()` will hand out
 
 
 class ClientStreamManager(StreamManager):
@@ -113,6 +114,14 @@ class ClientStreamManager(StreamManager):
             raise self._conn.error or self._goaway
         async with self._new_stream_lock:
             stream_id = self._next_id
+            if stream_id > _MAX_STREAM_ID:
+                # Client stream ids are exhausted (past 2^31-1). h2's `StreamId::next_id`
+                # returns `StreamIdOverflow` and hyper surfaces it as a user error — the
+                # connection stays alive, this request just can't get an id (F43).
+                self._release_count()
+                raise H2ProtocolError(
+                    int(H2Reason.REFUSED_STREAM), "stream ID space exhausted (OverflowedStreamId)"
+                )
             self._next_id += 2
             st = Stream(
                 stream_id,
@@ -335,6 +344,13 @@ class H2Connection(BaseClientConnection):
         """
         return self._conn.streams.wait_until_ready()
 
+    @property
+    def closed(self):
+        """True once the connection can serve no more requests — the driver failed or
+        the peer sent GOAWAY. A synchronous liveness check so a pool can evict a dead
+        shared connection (util.Singleton self-heal)."""
+        return self._conn.error is not None or self._conn.streams._goaway is not None
+
     async def send_request(self, request):
         """Send `request` and return its `Response` once the head arrives.
 
@@ -342,9 +358,14 @@ class H2Connection(BaseClientConnection):
         HEADERS, stream the body, then await the response head.
         """
         # A bodyless request carries END_STREAM on HEADERS (h2 `send_request`
-        # with `end_of_stream`), not a trailing empty DATA frame. A HEAD request
-        # response never has a body regardless of content-length.
-        end_stream = request.body is None
+        # with `end_of_stream`), not a trailing empty DATA frame. A statically-empty
+        # body (`b""`) is bodyless too — hyper's `Full`/`Empty` report `is_end_stream()`
+        # for a zero-length body, so it also rides END_STREAM on HEADERS rather than a
+        # separate empty DATA frame (F39). A HEAD request response never has a body
+        # regardless of content-length.
+        end_stream = request.body is None or (
+            isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0
+        )
         is_head = request.method.upper() == "HEAD"
         stream = await self._conn.streams.open_stream(
             request.method,

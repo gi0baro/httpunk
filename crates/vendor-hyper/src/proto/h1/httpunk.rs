@@ -399,6 +399,15 @@ impl BodyDecoder {
                         self.done = true; // end of body
                         Ok(None)
                     } else {
+                        // A length body reaches EOF on the very frame that consumes
+                        // its last byte (remaining == 0). Mirror hyper's
+                        // `poll_read_body`, which checks `decoder.is_eof()` right after
+                        // the data frame and transitions to `KeepAlive` — rather than
+                        // waiting for a follow-up empty decode. Without this,
+                        // `is_complete()` lags one `decode()` behind, so a single-poll
+                        // drain of a fully-buffered length body sees the data but not
+                        // completion and needlessly closes the connection.
+                        self.done = self.decoder.is_eof();
                         Ok(Some(data))
                     }
                 } else {

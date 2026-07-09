@@ -22,6 +22,7 @@ requests on it. Liveness is checked at *use* time (a request on a dead connectio
 raises, as with any pool); `retain()` is the eviction hook for stale connections.
 """
 
+import contextlib
 import threading
 from urllib.parse import urlsplit
 
@@ -53,9 +54,16 @@ class Singleton:
         """The shared connection, connecting once. Concurrent callers during the
         connect wait for it; if that connect fails, the driver raises the real error
         and the waiters get `Canceled`."""
+        stale = None
         with self._lock:
             if self._state == "made":
-                return self._conn
+                if not self._conn.closed:
+                    return self._conn
+                # The shared connection died (driver failed / GOAWAY). Ditch it and
+                # reconnect — mirroring hyper-util `Singled::poll_ready` resetting a closed
+                # service to Empty (F35); otherwise every `get()` would hand back the
+                # corpse. We become the making-driver below and close the dead one first.
+                stale, self._conn, self._state = self._conn, None, "empty"
             if self._state == "empty":
                 self._state = "making"
                 self._ready = self._backend.event()
@@ -63,6 +71,10 @@ class Singleton:
                 ready, driver = self._ready, True
             else:  # making — wait for the driver
                 ready, driver = self._ready, False
+
+        if stale is not None:
+            with contextlib.suppress(Exception):
+                await stale.__aexit__(None, None, None)  # close the dead connection
 
         if driver:
             try:
@@ -133,6 +145,17 @@ class Cache:
             conn = self._idle.pop() if self._idle else None
         if conn is not None:
             return conn
+        # Deliberate simplification vs hyper-util (F50, documented WON'T-FIX): on an
+        # empty pool we connect straight away rather than registering a waiter that
+        # RACES an in-flight connection's return-to-pool (hyper-util `pool::Checkout` +
+        # the `waiters` queue in `put`). A faithful race needs a detached connect that
+        # runs to completion and is pooled if it loses (cancelling it mid-handshake
+        # would leak a half-open socket), plus Client-level connection-establishment
+        # coordination this low-level `Cache` doesn't own. It also barely reduces the
+        # connection count here: HTTP/1 is one-request-per-connection, so N concurrent
+        # checkouts genuinely need N connections. Connecting is always safe and serves
+        # the checkout promptly; the only cost is possibly more idle connections under
+        # bursty contention, which `retain()`/`aclose()` reclaim.
         conn = await self._connector(dst)
         await conn.__aenter__()  # HTTP handshake — the pool owns the lifetime
         return conn
@@ -179,15 +202,32 @@ class _Lease:
 
     async def __aexit__(self, exc_type, exc_value, exc_tb):
         if exc_type is None:
-            self._cache._checkin(self._conn)  # reusable -> back to the idle set
+            self._cache._checkin(self._conn)  # clean exit -> back to the idle set
         else:
-            await self._conn.__aexit__(None, None, None)  # error during use -> close
+            # Deliberate simplification vs hyper-util (F51, documented WON'T-FIX): on ANY
+            # exception during use we close the connection, whereas hyper-util returns it
+            # to the pool when it's still open (`is_open()`). Doing that safely here needs
+            # a SYNCHRONOUS "is this connection idle/reusable right now" check the facades
+            # don't expose (`.closed` only tells dead-or-not; `.ready()` is async): a
+            # caller that raised MID-response left the connection's request slot HELD, and
+            # returning that to the pool would DEADLOCK the next checkout on `send_request`.
+            # Closing on error is the safe, conservative choice; the only cost is not
+            # reusing a connection whose exchange happened to complete before the caller
+            # raised for an unrelated reason.
+            await self._conn.__aexit__(None, None, None)
         return False
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+
 def _default_key(url):
+    # Normalize the port from the scheme when absent, so `http://x` and `http://x:80`
+    # route to the SAME per-destination pool rather than two (F52) — matching how a
+    # connection's destination key is canonicalized.
     parts = urlsplit(url)
-    return (parts.scheme, parts.hostname, parts.port)
+    port = parts.port if parts.port is not None else _DEFAULT_PORTS.get(parts.scheme)
+    return (parts.scheme, parts.hostname, port)
 
 
 class Map:
@@ -218,9 +258,24 @@ class Map:
         with self._lock:
             return not self._pools
 
-    async def aclose(self):
-        """Close every per-destination pool."""
+    async def retain(self, predicate):
+        """Prune stale connections across every per-destination pool — forwards
+        `retain(predicate)` to each inner pool (the eviction hook, consistent with
+        `Singleton`/`Cache`) (F52). Empty inner pools are left in place (rebuilt lazily
+        anyway); use `clear()` to drop the routing table itself."""
+        with self._lock:
+            pools = list(self._pools.values())
+        for pool in pools:
+            await pool.retain(predicate)
+
+    async def clear(self):
+        """Close every per-destination pool and drop the routing table; the `Map`
+        stays usable and rebuilds pools lazily on the next `pool_for` (F52)."""
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
         for pool in pools:
             await pool.aclose()
+
+    async def aclose(self):
+        """Close every per-destination pool (end of life)."""
+        await self.clear()

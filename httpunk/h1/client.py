@@ -103,6 +103,22 @@ class Connection(H1ConnectionBase):
         if self._closed or self.error is not None:
             self._slot.release()
             raise self.error or ConnectionClosedError("connection closed")
+        # hyper's always-polled Connection validates the read buffer is empty before it
+        # will send (require_empty_read -> new_unexpected_message, conn.rs L463-465; its
+        # regression test client_read_bytes_before_writing_request): a server may not
+        # send anything before the client's next request. Lacking a background read task
+        # to notice bytes arriving while idle, poll once here, just before writing — any
+        # bytes waiting are a protocol violation, so poison + fail rather than write a
+        # request that would misparse them as its response (F31, problem b). (An idle
+        # peer *close* still can't be told apart from "no data ready" by a non-blocking
+        # read, so it surfaces only as the write below failing — a known limitation
+        # short of hyper's always-polled connection task.)
+        pending = self.backend.receive_nowait(self.transport, 65536)
+        if pending:
+            self.poison_unexpected(len(pending))
+            self._fail(self.error)  # the stream is corrupt — close, don't reuse
+            self._slot.release()
+            raise self.error
         try:
             codec = H1Codec()
             content_length, chunked = self._body_framing(body)
@@ -111,9 +127,20 @@ class Connection(H1ConnectionBase):
             # to close, so hyper's `fix_keep_alive` injects `Connection: keep-alive`
             # (conn.rs L662-673) and `enforce_version` sets the version (L682-702).
             http10 = self._peer_http10
-            if http10 and (headers is None or "connection" not in headers):
+            if http10:
+                # hyper `fix_keep_alive`: re-assert keep-alive UNLESS the request's
+                # `Connection` header already carries the keep-alive token, and NOT when
+                # it asks to close (an explicit close disables keep-alive, so hyper
+                # leaves it). Value-checked (a token, not mere header presence) and set —
+                # not appended — matching hyper's `insert` so no duplicate token (F58).
                 headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
-                headers.add("connection", "keep-alive")
+                tokens = {
+                    part.strip().lower()
+                    for value in headers.get_all("connection")
+                    for part in bytes(value).split(b",")
+                }
+                if b"keep-alive" not in tokens and b"close" not in tokens:
+                    headers["connection"] = "keep-alive"
             head = codec.serialize_request(
                 method, url, headers, http10=http10, content_length=content_length, chunked=chunked
             )
@@ -258,6 +285,13 @@ class H1Connection(BaseClientConnection):
         this waits for the single in-flight request/response to finish). Mirrors
         h2's `conn.ready`."""
         return self._conn.wait_idle()
+
+    @property
+    def closed(self):
+        """True once the connection can serve no more requests (closed or failed). A
+        synchronous liveness check so a pool can evict a dead connection
+        (util.Singleton self-heal)."""
+        return self._conn._closed or self._conn.error is not None
 
     def send_request(self, request):
         """Send `request` and return its `Response` once the head arrives.

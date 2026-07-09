@@ -75,6 +75,30 @@ async def test_h2_protocol_handles_multiplexed_concurrently():
         await protocols[0]._serve_task
 
 
+class _BoomH2(H2ServerProtocol):
+    async def handle(self, request):
+        await request.read()
+        if request.path == "/boom":
+            raise RuntimeError("handler failed")  # never responds
+        await request.respond(200, body=b"ok")
+
+
+@pytest.mark.asyncio
+async def test_h2_protocol_handler_error_resets_stream_not_connection():
+    """An h2 handler that raises resets ITS stream (the client sees an error) instead of
+    the exception vanishing silently and hanging the client (F34); the connection and
+    its other streams keep running."""
+    server, host, port, protocols = await _serve(_BoomH2)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)
+        async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            with pytest.raises(H2Error):  # the failed handler reset the stream
+                await conn.get("/boom")
+            assert await (await conn.get("/ok")).read() == b"ok"  # connection survived
+        await protocols[0]._serve_task
+
+
 @pytest.mark.asyncio
 async def test_h1_protocol_roundtrip():
     server, host, port, protocols = await _serve(_EchoH1)
@@ -199,3 +223,55 @@ async def test_server_connections_shutdown_force_closes_past_timeout():
         assert conns.count() == 0
         pending_req.cancel()
         await conn.__aexit__(None, None, None)
+
+
+class _FakeProto:
+    """A stand-in protocol for ServerConnections.shutdown: `graceful_shutdown` may
+    raise; `wait_closed`/`close` are inert. Lets us drive the shutdown fan-out
+    without a live connection."""
+
+    def __init__(self, *, boom=False):
+        self._boom = boom
+        self.drained = False
+        self._serve_task = None
+
+    async def graceful_shutdown(self):
+        if self._boom:
+            raise RuntimeError("graceful_shutdown blew up")
+        self.drained = True
+
+    async def wait_closed(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_server_connections_shutdown_survives_one_bad_connection():
+    """One connection whose graceful_shutdown() raises must not abort the whole
+    shutdown — every other connection is still drained and shutdown() returns (F54)."""
+    conns = ServerConnections()
+    good, bad = _FakeProto(), _FakeProto(boom=True)
+    conns._live.update({good, bad})
+    await conns.shutdown(timeout=0.05)  # must NOT propagate bad's exception (returns cleanly)
+    assert good.drained  # the healthy connection was still drained
+
+
+@pytest.mark.asyncio
+async def test_auto_graceful_cancels_silent_preface_sniff():
+    """A graceful shutdown of an AutoServerProtocol whose client connected but sent
+    nothing interrupts the parked preface sniff and finishes promptly, instead of
+    lingering until the host's force-close timeout (F36)."""
+    server, host, port, protocols = await _serve(_EchoAuto)
+    backend = AsyncioBackend()
+    async with server:
+        transport = await backend.connect_tcp(host, port)  # connect, then send NOTHING
+        await asyncio.sleep(0.05)  # let the server accept + park in the preface sniff
+        assert len(protocols) == 1
+        proto = protocols[0]
+        await proto.graceful_shutdown()  # must cancel the parked sniff
+        # With the fix the serve task ends promptly; without it the sniff stays parked
+        # and this wait_for times out (the whole point of F36).
+        await asyncio.wait_for(proto.wait_closed(), timeout=3.0)
+        transport.close()

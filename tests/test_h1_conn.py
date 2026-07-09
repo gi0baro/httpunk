@@ -180,6 +180,31 @@ async def test_keep_alive_two_requests():
 
 
 @pytest.mark.tonio
+async def test_http10_downgrade_reasserts_keep_alive_by_value_replacing_token():
+    """After a peer answers HTTP/1.0, the client downgrades later requests to 1.0 and
+    re-asserts keep-alive by VALUE (not mere header presence), REPLACING a non-keep-alive
+    Connection token rather than leaving the 1.0 request to close — hyper fix_keep_alive (F58)."""
+    listener, host, port = await _listener()
+    requests, done = [], Event()
+    r1 = b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 2\r\n\r\nok"
+    r2 = b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 3\r\n\r\nbye"
+
+    async with scope() as s:
+        s.spawn(_serve(listener, [r1, r2], requests, done))
+        async with open_h1(host, port) as conn:
+            assert await (await conn.get("/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
+            # r2 carries a custom Connection token; the downgrade must still re-assert
+            # keep-alive (the old presence-check left it, so the server would close).
+            assert await (await conn.get("/b", headers={"connection": "x-foo"})).read() == b"bye"
+        await done.wait()
+        s.cancel()
+
+    r2_head = requests[1][0].lower()
+    assert b"connection: keep-alive" in r2_head  # re-asserted by value
+    assert b"x-foo" not in r2_head  # the custom token was replaced, not left / duplicated
+
+
+@pytest.mark.tonio
 async def test_connection_close_refuses_reuse():
     listener, host, port = await _listener()
     requests, done = [], Event()
@@ -456,4 +481,36 @@ async def test_unexpected_bytes_past_body_poison_connection():
             with pytest.raises(ValueError, match="unexpected"):
                 await conn.get("/b", headers={"host": f"{host}:{port}"})  # connection poisoned
         await done.wait()
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_reused_connection_poisoned_by_idle_window_bytes():
+    """Bytes a server sends on an ALREADY-IDLE connection — after the client has fully
+    consumed the previous response, so NOT coalesced into its body buffer — must still
+    poison the connection. The pre-write `receive_nowait` check catches them so the next
+    request fails rather than misparsing them as its response — hyper's require_empty_read
+    the moment before sending (F31, problem b). Without the pre-write check these bytes
+    live only on the socket, past the decoder, and go unnoticed until misparsed."""
+    listener, host, port = await _listener()
+    r1_read, junk_sent = Event(), Event()
+
+    async def serve():
+        stream = await listener.accept()
+        await _read_request(stream)
+        await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+        await r1_read.wait()  # the client has fully consumed r1 — the connection is idle
+        await stream.send_all(b"HTTP/1.1 500 unsolicited\r\n\r\n")  # junk into the idle socket
+        junk_sent.set()
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            assert await (await conn.get("/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            r1_read.set()
+            await junk_sent.wait()  # the junk is now sitting in the client's socket buffer
+            with pytest.raises(ValueError, match="unexpected"):
+                await conn.get("/b", headers={"host": f"{host}:{port}"})
         s.cancel()

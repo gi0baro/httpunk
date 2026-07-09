@@ -95,6 +95,13 @@ class ServerRequest:
         `bytes`, or a (sync/async) iterable of `bytes`. h2: `SendResponse`."""
         return self._manager.send_response(self._stream, status, headers, body)
 
+    def reset(self, error_code=None):
+        """Abort this stream with RST_STREAM instead of a normal response — e.g. when a
+        handler fails. Defaults to INTERNAL_ERROR; a no-op once the response has already
+        been sent. Only this stream is affected (h2 `SendResponse` drop / `send_reset`)."""
+        reason = int(H2Reason.INTERNAL_ERROR) if error_code is None else int(error_code)
+        return self._manager.reset_stream(self._stream, reason)
+
     def __repr__(self):
         return f"ServerRequest(method={self.method!r}, path={self.path!r})"
 
@@ -144,6 +151,12 @@ class ServerStreamManager(StreamManager):
         proto/peer.rs `ensure_can_open` (L76) / streams.rs `ensure_not_idle`."""
         if sid % 2 == 0 or sid > self._last_recv_id:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"frame on idle stream {sid}")
+
+    def _above_goaway(self, sid):
+        # A client stream above the last-stream-id of our (phase-2) GOAWAY was refused;
+        # late frames on it are silently ignored (F42). `_max_stream_id` is 2^31-1 until
+        # we lower it, so this is inert before we actually GOAWAY.
+        return sid > self._max_stream_id
 
     def _recv_headers_target(self, frame):
         # h2: streams.rs `recv_headers` -> recv.rs `open` (L127) on the server

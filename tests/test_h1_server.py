@@ -10,8 +10,10 @@ from tonio.colored import scope
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk._backend.tonio import TonioBackend
+from httpunk.exceptions import ConnectionClosedError
 from httpunk.h1 import H1Server
 from httpunk.h1.server import ServerConnection
+from httpunk.http import HeaderMap
 
 
 async def _listener():
@@ -38,13 +40,20 @@ async def _read_until(transport, marker, limit=65536):
 
 async def _drain_all(transport, limit=65536):
     """Read until the peer closes — for responses that end by closing the
-    connection (HTTP/1.0, `Connection: close`, a 4xx error)."""
+    connection (HTTP/1.0, `Connection: close`, a 4xx error). Tolerates an ABORTIVE
+    close (RST -> ConnectionResetError) as well as a clean EOF: when the server closes
+    a connection whose peer still has unread bytes in the socket (e.g. a slowloris head
+    it timed out on), BSD sockets send RST, not FIN — so the drain must treat that as
+    "closed" too, not a test failure. (hyper closes the same way; it's OS-level.)"""
     buf = b""
-    while True:
-        chunk = await transport.receive_some(limit)
-        if not chunk:
-            break
-        buf += chunk
+    try:
+        while True:
+            chunk = await transport.receive_some(limit)
+            if not chunk:
+                break
+            buf += chunk
+    except (ConnectionResetError, BrokenPipeError):
+        pass  # abortive close == the peer closed
     return buf
 
 
@@ -247,6 +256,27 @@ async def test_server_http10_response_version_and_close():
 
 
 @pytest.mark.tonio
+async def test_server_header_read_timeout_closes_slow_head():
+    """A request head that never completes is closed after `header_read_timeout`
+    (slowloris defence, hyper http1.rs L249): no response, just a close (F30)."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport, header_read_timeout=0.1) as server:
+            async for req in server:
+                await req.respond(200)
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n")  # partial head, never completes
+        data = await _drain_all(transport)  # server times out and closes -> EOF
+        assert data == b""  # no response sent; the connection was just closed
+        s.cancel()
+
+
+@pytest.mark.tonio
 async def test_server_no_100_continue_for_http10():
     """An HTTP/1.0 request never gets an auto 100-continue, even with `Expect:
     100-continue` — hyper gates the interim on version > 1.0 (conn.rs L311). F16."""
@@ -258,6 +288,34 @@ async def test_server_no_100_continue_for_http10():
         data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
         assert b"100 Continue" not in data  # F16: no interim for a 1.0 client
         assert data.startswith(b"HTTP/1.0 200")  # the real response still arrives
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_http10_streamed_body_with_content_length_reuses():
+    """A streamed (iterable) HTTP/1.0 response WITH a Content-Length is length-framed,
+    not close-delimited, so the connection stays reusable and keeps the keep-alive
+    header (F27) — deciding close-delimited from the body shape alone forced a close."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                await req.read()
+                body = (part for part in [req.target.encode()])  # an iterable body
+                await req.respond(200, headers={"content-length": str(len(req.target))}, body=body)
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET /a HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
+        r1 = await _read_until(transport, b"/a")  # head + the 2-byte length-framed body
+        assert r1.startswith(b"HTTP/1.0 200")
+        assert b"connection: keep-alive" in r1.lower()  # reusable, not close-delimited
+        await transport.send_all(b"GET /b HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
+        assert b"/b" in await _read_until(transport, b"/b")  # connection was reused
+        transport.close()
         s.cancel()
 
 
@@ -428,3 +486,43 @@ async def test_server_oversized_head_rejected_with_431():
     assert stub.sent.startswith(b"HTTP/1.1 431")  # Request Header Fields Too Large
     assert b"connection: close" in stub.sent.lower()
     assert stub.closed
+
+
+@pytest.mark.tonio
+async def test_h2_preface_closes_silently_without_response():
+    """An h1 server that receives the HTTP/2 prior-knowledge preface closes silently
+    (a version error) instead of writing a 400 — hyper `on_parse_error`/`has_h2_prefix`
+    (conn.rs L809-812) (F49)."""
+    stub = _StubTransport(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    assert req is None
+    assert stub.sent == b""  # NO response of any kind — silent close
+    assert stub.closed
+
+
+@pytest.mark.tonio
+async def test_body_io_after_close_raises_clean_error():
+    """A body read/write after the connection closed (transport nulled) raises a clean
+    ConnectionClosedError, not an AttributeError on `None.receive_some`/`send_all` (F59)."""
+    conn = ServerConnection(_StubTransport(b""))
+    await conn.close()  # nulls the transport
+    with pytest.raises(ConnectionClosedError):
+        await conn.read_body_more()
+    with pytest.raises(ConnectionClosedError):
+        await conn.write(b"data")
+
+
+def test_negotiate_connection_header_replaces_not_appends():
+    """The wire `Connection` header REPLACES a user-set value (hyper `insert`), never
+    appending a second/contradictory token (F48)."""
+    closing = HeaderMap()
+    closing.add("connection", "keep-alive")  # user asked keep-alive, but we must close
+    out = ServerConnection._negotiate_connection_header(closing, keep_alive=False, http10=False, resp_close=False)
+    assert out.get_all("connection") == [b"close"]  # replaced, not [keep-alive, close]
+
+    keeping = HeaderMap()
+    keeping.add("connection", "x-foo")  # a custom token on a 1.0 keep-alive response
+    out2 = ServerConnection._negotiate_connection_header(keeping, keep_alive=True, http10=True, resp_close=False)
+    assert out2.get_all("connection") == [b"keep-alive"]  # replaced x-foo

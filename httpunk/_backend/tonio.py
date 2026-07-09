@@ -107,3 +107,4 @@ class TonioBackend:
     semaphore = _TonioSemaphore
     queue = staticmethod(_unbounded)
     monotonic = staticmethod(_now)
+    sleep = staticmethod(_colored.sleep)  # async sleep(seconds), for deadline races (`select`)

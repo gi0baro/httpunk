@@ -19,6 +19,15 @@ from ..h2.connection import PREFACE
 from ..h2.server import H2Server
 
 
+_CANCELLED = object()  # sentinel: the sniff's read lost the race to the cancel signal
+
+
+class SniffCancelledError(Exception):
+    """The protocol sniff was interrupted before it could complete — e.g. a graceful
+    shutdown of a connected-but-still-silent client (≈ hyper-util `ReadVersion::cancel`).
+    The caller should close the connection without building a server."""
+
+
 class _PrewoundTransport:
     """A transport wrapper that replays `prewound` bytes (already read off the
     socket while sniffing) before delegating to the real transport — so protocol
@@ -44,7 +53,7 @@ class _PrewoundTransport:
         return getattr(self._transport, name)
 
 
-async def serve(transport, *, backend=None, only=None):
+async def serve(transport, *, backend=None, only=None, cancel=None):
     """Sniff `transport` and return the matching **un-entered** server (`H2Server`
     or `H1Server`) over a prewound transport that replays the sniffed bytes.
 
@@ -52,6 +61,11 @@ async def serve(transport, *, backend=None, only=None):
     `http1_only` / `http2_only`); a forced server reads the raw transport directly
     (nothing was peeked). Returned un-entered like `connect` — the caller drives it
     with `async with server: async for req in server: ...`.
+
+    `cancel` (an event) makes the peek interruptible (≈ hyper-util `ReadVersion::cancel`):
+    if it fires while we're parked reading a silent client's preface, the sniff aborts
+    with `SniffCancelledError` so a graceful shutdown doesn't linger on that connection.
+    Requires `backend` (for the read-vs-cancel race).
     """
     if only == "h2":
         return H2Server(transport, backend=backend)
@@ -64,7 +78,9 @@ async def serve(transport, *, backend=None, only=None):
     # from it (→ definitely h1) or the peer stops sending (EOF).
     buf = b""
     while len(buf) < len(PREFACE):
-        chunk = await transport.receive_some(len(PREFACE) - len(buf))
+        chunk = await _sniff_read(transport, len(PREFACE) - len(buf), backend, cancel)
+        if chunk is _CANCELLED:
+            raise SniffCancelledError
         if not chunk:
             break  # EOF before a full preface -> treat as h1 (a truncated request)
         buf += chunk
@@ -75,3 +91,19 @@ async def serve(transport, *, backend=None, only=None):
     if buf == PREFACE:
         return H2Server(prewound, backend=backend)
     return H1Server(prewound, backend=backend)
+
+
+async def _sniff_read(transport, n, backend, cancel):
+    """One peek read, racing an optional `cancel` signal so a parked read can be
+    interrupted (returns the `_CANCELLED` sentinel if the signal won)."""
+    if cancel is None:
+        return await transport.receive_some(n)
+
+    async def _recv():
+        return await transport.receive_some(n)
+
+    async def _cancelled():
+        await cancel.wait()
+        return _CANCELLED
+
+    return await backend.select(_recv(), _cancelled())

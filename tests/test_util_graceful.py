@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from _client import open_h1  # noqa: F401  (kept for symmetry; loopback uses raw connections)
-from tonio.colored import Event, scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import H1Connection, H2Connection, H2Reason
@@ -71,6 +71,33 @@ async def test_shutdown_with_no_connections_returns_immediately():
     await GracefulShutdown().shutdown()  # must not hang
 
 
+@pytest.mark.tonio
+async def test_watch_registers_count_synchronously():
+    """watch() bumps the count when CALLED — before the driving coroutine is scheduled —
+    so count()/shutdown() can't race a not-yet-run watch (hyper-util watcher(), F53).
+    With the old async-registration the count stayed 0 until the coroutine ran."""
+    graceful = GracefulShutdown()
+    release = Event()
+
+    async def _noop_graceful_shutdown():
+        pass
+
+    server = SimpleNamespace(graceful_shutdown=_noop_graceful_shutdown)
+
+    async def serve(_server):
+        await release.wait()  # keep the watch live until we let it finish
+
+    coro = graceful.watch(server, serve)  # SYNC call — must register the slot NOW
+    assert graceful.count() == 1  # incremented synchronously, before the coro is spawned
+
+    async with scope() as s:
+        s.spawn(coro)
+        await sleep(0)  # let the watch coroutine start and its signal-watcher park
+        await sleep(0)
+        release.set()  # let serve() (and thus the watch) complete
+    assert graceful.count() == 0  # dropped when the watch finished
+
+
 # ----- h2 primitive: two-phase graceful (serve during phase 1, ignore after phase 2) -----
 
 
@@ -106,6 +133,18 @@ async def test_h2_graceful_two_phase_serves_then_ignores():
     assert conn.streams._recv_headers_target(_req_frame(3)) is None  # id > max -> ignored
     assert 3 not in conn.streams._streams
     assert conn.streams._last_processed_id == 1  # an ignored stream must not count
+
+
+@pytest.mark.tonio
+async def test_h2_frame_above_goaway_ignored_not_errored():
+    """A NON-headers frame (DATA/etc., via `_recv_lookup`) on a client stream above the
+    last-stream-id of our GOAWAY is silently IGNORED (returns None -> recv_data drops it
+    with conn-window accounting, h2 `ignore_data`), never an RST(STREAM_CLOSED) or a
+    connection PROTOCOL_ERROR that would abort the graceful drain (F42)."""
+    conn = H2ServerConnection(_IdleTransport(), max_concurrent_streams=100)
+    conn.streams._max_stream_id = 1  # as phase-2 graceful lowers it
+    # Stream 3 (> 1) was refused by our GOAWAY: a late frame on it is ignored, not raised.
+    assert conn.streams._recv_lookup(3) is None
 
 
 @pytest.mark.tonio

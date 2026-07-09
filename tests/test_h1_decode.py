@@ -47,6 +47,27 @@ def test_length_stops_at_declared_length():
     assert body == b"abc" and complete
 
 
+def test_length_complete_after_single_decode_of_last_bytes():
+    # is_complete flips on the very decode() that consumes the last body byte —
+    # mirroring hyper's poll_read_body checking decoder.is_eof() right after the data
+    # frame, NOT one decode() later. A single-poll consumer (the server's cheap body
+    # drain, `_drain_unread_body`) relies on this to reuse a fully-buffered length body.
+    dec = H1BodyDecoder("length", 5)
+    dec.feed(b"hello")
+    assert dec.decode() == b"hello"
+    assert dec.is_complete  # complete immediately, without a follow-up decode()
+
+
+def test_chunked_data_frame_alone_is_not_complete():
+    # One decode() of a chunked DATA frame does NOT complete the body — the
+    # terminating zero-chunk is still unseen. So a single-poll drain of a chunked body
+    # correctly can't cheaply drain it (it closes), matching hyper's one poll_read_body.
+    dec = H1BodyDecoder("chunked")
+    dec.feed(b"5\r\nhello\r\n0\r\n\r\n")  # data chunk + terminator both buffered
+    assert dec.decode() == b"hello"
+    assert not dec.is_complete
+
+
 def test_chunked_simple():
     dec = H1BodyDecoder("chunked")
     dec.feed(b"5\r\nhello\r\n0\r\n\r\n")

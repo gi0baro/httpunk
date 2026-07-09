@@ -99,6 +99,45 @@ async def test_singleton_retain_drops_connection_when_predicate_false():
         s.cancel()
 
 
+class _StubConn:
+    """A minimal pooled-connection stand-in: an entered/closed lifecycle + a
+    settable `closed` liveness flag (what `Singleton.get` checks)."""
+
+    def __init__(self, tag):
+        self.tag = tag
+        self.closed = False
+        self.exited = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.exited = True
+
+
+@pytest.mark.tonio
+async def test_singleton_reconnects_when_shared_connection_dies():
+    """A dead shared connection is auto-evicted and replaced on the next get()
+    (hyper-util `Singled::poll_ready` resets a closed service to Empty) — F35;
+    previously `get()` handed back the corpse forever."""
+    conns = []
+
+    async def connector(_dst):
+        conns.append(_StubConn(len(conns)))
+        return conns[-1]
+
+    pool = Singleton(connector)
+    a = await pool.get()
+    assert a is conns[0]
+    assert await pool.get() is a  # still alive -> the same shared connection
+
+    a.closed = True  # the shared connection dies
+    b = await pool.get()
+    assert b is conns[1] and b is not a  # auto-evicted and reconnected
+    assert a.exited  # the dead connection was closed
+    await pool.aclose()
+
+
 @pytest.mark.tonio
 async def test_cache_reuses_idle_connection():
     listener, host, port = await _listener()
@@ -197,3 +236,66 @@ async def test_map_builds_one_pool_per_key_and_closes_all():
 
     await m.aclose()  # closes every inner pool
     assert m.is_empty()
+
+
+@pytest.mark.tonio
+async def test_map_normalizes_default_port_from_scheme():
+    """A URL with no explicit port routes to the SAME pool as its scheme-default port —
+    http://x and http://x:80 are one destination, not two (F52)."""
+    built = []
+
+    def make_pool(url):
+        built.append(url)
+        return Singleton(lambda _dst: None)
+
+    m = Map(make_pool)
+    p_bare = m.pool_for("http://a.example/x")  # implicit port 80
+    p_80 = m.pool_for("http://a.example:80/y")  # explicit 80 -> same key
+    p_https = m.pool_for("https://a.example/")  # implicit 443
+    p_443 = m.pool_for("https://a.example:443/")  # explicit 443 -> same key
+    assert p_bare is p_80
+    assert p_https is p_443
+    assert p_bare is not p_https  # different scheme + default port
+    assert built == ["http://a.example/x", "https://a.example/"]  # only two pools built
+    await m.aclose()
+
+
+class _StubPool:
+    """Records retain/aclose so a Map test can assert forwarding."""
+
+    def __init__(self):
+        self.retained = _StubPool  # sentinel: retain not called
+        self.closed = False
+
+    async def retain(self, predicate):
+        self.retained = predicate
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.tonio
+async def test_map_retain_forwards_and_clear_resets():
+    """Map.retain forwards to every inner pool; clear() closes them and drops the routing
+    table so the Map rebuilds lazily on the next pool_for (F52)."""
+    pools = []
+
+    def make_pool(_url):
+        pools.append(_StubPool())
+        return pools[-1]
+
+    m = Map(make_pool)
+    m.pool_for("http://a/")
+    m.pool_for("http://b/")
+
+    def pred(_conn):
+        return True
+
+    await m.retain(pred)
+    assert all(p.retained is pred for p in pools)  # forwarded to each inner pool
+
+    await m.clear()
+    assert all(p.closed for p in pools)  # clear() closed them
+    assert m.is_empty()  # and reset the routing table
+    m.pool_for("http://c/")  # still usable — rebuilt lazily
+    assert not m.is_empty()

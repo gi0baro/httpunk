@@ -42,6 +42,12 @@ _CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
 # `Parse::TooLarge` (auto 431 + close) — hyper's `DEFAULT_MAX_BUFFER_SIZE`
 # (io.rs: 8192 + 4096*100). Bounds per-connection memory against a slow/oversized head.
 _MAX_HEAD_SIZE = 8192 + 4096 * 100
+_DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L249)
+_TIMED_OUT = object()  # sentinel: the header read exceeded `header_read_timeout`
+# The HTTP/2 connection preface (client prior-knowledge). An h1 server that sees it
+# closes silently with a version error rather than writing a 400 (hyper `on_parse_error`
+# -> `has_h2_prefix` -> `new_version_h2`, conn.rs L29/L809-812).
+_H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 
 def _connection_has(headers, token):
@@ -157,12 +163,16 @@ class ServerConnection(H1ConnectionBase):
     then writes the response; reuses the connection on keep-alive. The accepting
     analogue of the client `Connection`, over the shared `H1ConnectionBase`."""
 
-    def __init__(self, transport, *, backend=None):
+    def __init__(self, transport, *, backend=None, header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT):
         super().__init__(transport, backend=backend)
         self._reusable = True  # keep-alive: may we read another request after this one?
         self._codec = None  # current request/response codec
         self._current = None  # current ServerRequest (for body draining)
+        self._head_raw = b""  # raw bytes of the in-progress head read (h2-preface check, F49)
         self._shutdown_evt = self.backend.event()  # set by graceful_shutdown()
+        # Max time to read a complete request head before closing (slowloris defence),
+        # hyper's `header_read_timeout` (default 30s, http1.rs L249). `None` disables it.
+        self._header_read_timeout = header_read_timeout
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
@@ -215,11 +225,18 @@ class ServerConnection(H1ConnectionBase):
         try:
             head = await self._read_request_head(codec, leftover)
         except ValueError as exc:
-            # A malformed request head: auto-respond like hyper's `Server::on_error`
-            # (role.rs L466-484), then close.
-            await self._send_error(codec, _error_status(str(exc)))
             self._closed = True
             self._reusable = False
+            if bytes(self._head_raw[: len(_H2_PREFACE)]) == _H2_PREFACE:
+                # An HTTP/2 client hit this h1-only server with the prior-knowledge
+                # preface. hyper closes silently with a version error rather than
+                # writing a 400 (on_parse_error -> has_h2_prefix -> new_version_h2,
+                # conn.rs L809-812) (F49).
+                self._close_transport()
+                return None
+            # Any other malformed request head: auto-respond like hyper's
+            # `Server::on_error` (role.rs L466-484), then close.
+            await self._send_error(codec, _error_status(str(exc)))
             return None
         if head is None:  # clean EOF between requests — client closed
             self._closed = True
@@ -245,23 +262,28 @@ class ServerConnection(H1ConnectionBase):
     def _drain_unread_body(self, req):
         """Discard an unread request body so the next request parses cleanly, but
         only if it's cheap — a 1:1 mirror of hyper `poll_drain_or_close_read`
-        (conn.rs L849-865): decode what's already buffered, do ONE non-blocking
-        read of whatever else is sitting in the socket buffer, and reuse iff that
-        completed the body; otherwise `close_read()` (never stream an arbitrary
-        body off the socket, never send the skipped `100 Continue`). The single
-        non-blocking read is `backend.receive_nowait` — the tonio equivalent of
-        hyper's `poll_read_body` returning `Pending` when nothing is ready.
-        Returns True if drained (connection reusable), False if it closed."""
+        (conn.rs L849-865), which does EXACTLY ONE `poll_read_body` (`let _ =
+        self.poll_read_body(cx)`, then close unless the body reached KeepAlive). Pull a
+        single frame: decode one from the already-buffered bytes, or — only if the
+        buffer held nothing decodable yet (need-more, not end) — do ONE non-blocking
+        socket read and decode that. Reuse iff that single poll completed the body;
+        otherwise `close_read()` (never loop the socket to drain an arbitrary body,
+        never send the skipped `100 Continue`).
+
+        One poll, not a loop, is deliberate and matches hyper exactly: a chunked body
+        with any data frame can't cheaply drain (one `decode()` yields one DATA chunk,
+        the terminating chunk unseen → not complete → close), and a half-buffered length
+        body closes (hyper's length decoder reads from IO only when its buffer is empty,
+        so a partial buffer yields a short frame and gives up — decode.rs Length). The
+        single non-blocking read is `backend.receive_nowait`, the equivalent of hyper's
+        `poll_read_body` seeing `Pending`. Returns True if drained (reusable), else False."""
         dec = req._decoder
         try:
-            while dec.decode() is not None:  # decode already-buffered body bytes
-                pass
-            if not dec.is_complete:
+            if dec.decode() is None and not dec.is_complete:  # buffer had no full frame → need more
                 data = self.backend.receive_nowait(self.transport, _READ_SIZE)
                 if data:  # b"" == nothing ready right now, or EOF -> give up (close)
                     dec.feed(data)
-                    while dec.decode() is not None:
-                        pass
+                    dec.decode()
         except Exception:  # noqa: S110 - a decode failure just means "not drainable → close"
             pass
         if dec.is_complete:
@@ -272,9 +294,36 @@ class ServerConnection(H1ConnectionBase):
         return False
 
     async def _read_request_head(self, codec, initial=b""):
+        # Bound the head read by `header_read_timeout` (slowloris defence, hyper
+        # http1.rs L249): race the read against a deadline; if it wins, close with no
+        # response (hyper closes on a header-read timeout). `select` cancels the losing
+        # branch, cleanly dropping the parked read. `None` disables the timeout.
+        # NIT (design cleanup, deferred): this `sleep` + `select` deadline could become a
+        # normalized `backend.timeout(coro, seconds)` primitive — more direct, no
+        # sentinel / nested select. Kept as-is for now (see TODONOTES).
+        if self._header_read_timeout is None:
+            return await self._read_head_frames(codec, initial)
+
+        async def _deadline():
+            await self.backend.sleep(self._header_read_timeout)
+            return _TIMED_OUT
+
+        result = await self.backend.select(self._read_head_frames(codec, initial), _deadline())
+        if result is _TIMED_OUT:
+            self._closed = True
+            self._reusable = False
+            self._close_transport()
+            return None
+        return result
+
+    async def _read_head_frames(self, codec, initial=b""):
         # Feed any carried-over pipelined bytes before touching the transport, so a
         # request already sitting in the buffer parses without a (blocking) read.
         buffered = 0
+        # Retain the raw head bytes read so far (bounded by the head-size cap below)
+        # so a parse error can be checked against the HTTP/2 preface (F49).
+        raw = bytearray(initial)
+        self._head_raw = raw
         if initial:
             buffered += len(initial)
             head = codec.receive_request_head(initial)
@@ -293,9 +342,17 @@ class ServerConnection(H1ConnectionBase):
             else:
                 data = await self.transport.receive_some(_READ_SIZE)
             if not data:
-                return None  # EOF
+                # EOF. A clean EOF between requests (nothing buffered) is a normal
+                # client close. hyper additionally distinguishes a MID-head EOF
+                # (`buffered > 0`) as `Parse::Eof`/`IncompleteMessage` (an error), but
+                # the wire outcome is identical either way — the connection just closes
+                # with no response — so we surface both as a clean end-of-iteration
+                # rather than raise (F47, observability-only; raising here would change
+                # `next_request`'s clean-close contract for every host loop).
+                return None
             idle = False  # a request's bytes have started arriving — don't interrupt now
             buffered += len(data)
+            raw += data
             head = codec.receive_request_head(data)
             if head is not None:
                 return head
@@ -352,11 +409,18 @@ class ServerConnection(H1ConnectionBase):
         # CONNECT. A 101 the request didn't ask for is NOT a tunnel; it still ends the
         # connection (handled below), it just isn't handed off (F28).
         is_switch = (status == 101 and req.is_upgrade) or (req.method == "CONNECT" and 200 <= status < 300)
-        # An unknown-length HTTP/1.0 body is close-delimited (role.rs L907-910):
-        # the connection must close so the client can detect end-of-body.
-        close_delimited = http10 and chunked
+        # An HTTP/1.0 iterable body is close-delimited ONLY if the app gave no
+        # Content-Length: with an explicit CL the encoder frames it as length(n) (hyper
+        # set_length's `existing_con_len` branch, role.rs), so the client knows where the
+        # body ends and the connection stays reusable. Deciding this from the body shape
+        # alone (iterable ⇒ chunked ⇒ close) wrongly forced a close + dropped the
+        # keep-alive header for a CL-framed streamed 1.0 response (F27).
+        close_delimited = http10 and chunked and (hdrs is None or hdrs.get("content-length") is None)
         # Reuse iff the request is keep-alive, the response doesn't ask to close,
-        # the body isn't close-delimited, and we're not switching protocols.
+        # the body isn't close-delimited, and we're not switching protocols. (An
+        # unread request body is drained-or-closed later, in next_request — matching
+        # hyper, whose drain runs in a poll_read after the response is written, so the
+        # already-sent response keeps its keep-alive header and a failed drain just FINs.)
         resp_close = _connection_has(hdrs, "close")
         keep_alive = req.keep_alive and not resp_close and not close_delimited and not is_switch
         if status == 101 and not is_switch:
@@ -406,14 +470,17 @@ class ServerConnection(H1ConnectionBase):
         # Reimplements hyper `fix_keep_alive`/`enforce_version` (conn.rs L656-702):
         # make the wire `Connection` header agree with the reuse + version decision.
         # `Server::encode` writes whatever header is present but adds none itself.
+        # hyper uses `HeaderMap::insert` (REPLACE), so set — not add — the header:
+        # appending would leave a duplicate/contradictory `Connection` token next to a
+        # user-set value (F48).
         if not keep_alive and not resp_close and not http10:
             # HTTP/1.1 defaults to keep-alive → must announce the close.
             hdrs = hdrs or HeaderMap()
-            hdrs.add("connection", "close")
+            hdrs["connection"] = "close"
         elif keep_alive and http10:
             # HTTP/1.0 defaults to close → must announce the keep-alive.
             hdrs = hdrs or HeaderMap()
-            hdrs.add("connection", "keep-alive")
+            hdrs["connection"] = "keep-alive"
         return hdrs
 
 
@@ -428,5 +495,5 @@ class H1Server(BaseServer):
                 await request.respond(200, body=b"hi")
     """
 
-    def __init__(self, transport, *, backend=None):
-        self._conn = ServerConnection(transport, backend=backend)
+    def __init__(self, transport, *, backend=None, header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT):
+        self._conn = ServerConnection(transport, backend=backend, header_read_timeout=header_read_timeout)

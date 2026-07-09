@@ -47,11 +47,14 @@ def _is_informational(status):
 def _parse_content_length(headers):
     """First content-length value as an int, `None` if absent, or the
     `_INVALID_CONTENT_LENGTH` sentinel if it isn't a bare decimal (h2 uses
-    `frame::parse_u64`, which accepts only ASCII digits)."""
+    `frame::parse_u64`, which accepts only ASCII digits and rejects >19 digits
+    outright as an overflow risk — headers.rs L329)."""
     raw = headers.get("content-length")
     if raw is None:
         return None
-    if not raw or not raw.isdigit():  # bytes.isdigit(): ASCII 0-9 only, non-empty
+    # bytes.isdigit(): ASCII 0-9 only, non-empty. >19 digits can overflow u64, so
+    # `parse_u64` rejects them before even parsing — mirror that (F37).
+    if not raw or len(raw) > 19 or not raw.isdigit():
         return _INVALID_CONTENT_LENGTH
     return int(raw)
 
@@ -212,8 +215,12 @@ class StreamManager:
         if not st.state.is_send_streaming():
             raise self._send_stopped_error(st)
         if len(data) == 0:
-            if end_stream:
-                await self._conn.send_frame(self._conn.codec.serialize_data(st.id, b"", end_stream=True))
+            # A zero-length DATA frame is sent, not elided — h2 queues/flushes it
+            # (prioritize.rs L202-213: "Sending out zero length data frames can be done
+            # to signal end-of-stream"). So an interior empty chunk goes on the wire as
+            # an empty non-END_STREAM DATA frame, matching h2 (F40). Empty payload =>
+            # zero window, so no reservation needed.
+            await self._conn.send_frame(self._conn.codec.serialize_data(st.id, b"", end_stream=end_stream))
             return
         offset = 0
         while offset < len(data):
@@ -375,24 +382,28 @@ class StreamManager:
         provokes too many such resets (h2 local_max_error_reset_streams — the
         Rapid-Reset / malformed-flood defence).
         """
+        # Every library-initiated error reset counts toward the ENHANCE_YOUR_CALM cap —
+        # including the forgotten-stream STREAM_CLOSED path (h2 routes BOTH through
+        # `Actions::send_reset` with Initiator::Library, streams.rs L1647-1676). Exempting
+        # the forgotten path let a peer spray frames at closed ids for unbounded RST
+        # replies; upstream caps at 1024 and, via the reset store below, goes silent for
+        # ~1s per id (F17 — the Rapid-Reset-adjacent amplification defence).
+        self._local_error_resets += 1
+        if self._local_error_resets > _LOCAL_MAX_ERROR_RESETS:
+            raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too many stream resets")
         st = self._streams.get(stream_id)
         if st is not None:
-            # Count only resets of a live stream that failed during processing
-            # (h2 counts in `reset_on_recv_stream_err`, streams.rs L1679).
-            self._local_error_resets += 1
-            if self._local_error_resets > _LOCAL_MAX_ERROR_RESETS:
-                raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too many stream resets")
             st.error = StreamResetError(stream_id, reason)
             # Library-initiated (we detected the peer's violation), not a user
             # cancel — the correct h2 `Initiator` for an error reset.
             await self.reset_stream(st, reason, initiator="library")
         else:
-            # A stream we've already forgotten (STREAM_CLOSED). No local object to
-            # tear down; still tell the peer the stream is closed. NOTE: F17 (also
-            # count this toward the ENHANCE_YOUR_CALM cap + enter it in the reset
-            # store, per h2 `Actions::send_reset` with Initiator::Library) is DEFERRED
-            # — it measurably worsened the tonio test-teardown flake (AUDIT-2026-07-09)
-            # and needs root-causing before landing.
+            # A stream we've already forgotten (STREAM_CLOSED): no local object to tear
+            # down. Enter it in the reset store so further frames on that id are swallowed
+            # (`_recv_lookup`) rather than each drawing another RST, then tell the peer once.
+            self._clear_expired_reset_streams()
+            if len(self._reset_streams) < _RESET_STREAM_MAX:
+                self._reset_streams[stream_id] = self._conn.backend.monotonic()
             with contextlib.suppress(Exception):
                 await self._conn.send_frame(self._conn.codec.serialize_rst_stream(stream_id, reason))
 
@@ -464,6 +475,14 @@ class StreamManager:
         # RFC 7540 §6.9.2: adjust every stream's send window by the delta.
         # h2: proto/streams/send.rs `apply_remote_settings` (L478-560).
         for st in list(self._streams.values()):
+            # Skip a send-closed stream (h2's decrease branch does exactly this: a
+            # stream we've finished sending on has a send window we'll never use, so
+            # adjusting it is pointless — and on an INCREASE it could needlessly overflow
+            # `inc_window` and tear the connection down. We never buffer send data
+            # (inline flow-gating), so send-closed ⇒ nothing pending, matching h2's
+            # `is_send_closed() && buffered_send_data == 0` guard) (F41).
+            if st.state.is_send_closed():
+                continue
             if new >= old:
                 st.send_flow.inc_window(new - old)
                 st.window_evt.set()
@@ -498,10 +517,25 @@ class StreamManager:
             if self._conn.backend.monotonic() - reset_at <= _RESET_STREAM_SECS:
                 return None  # locally reset, still within the reset-expiration window
             del self._reset_streams[stream_id]  # expired -> fall through to STREAM_CLOSED
+        if self._above_goaway(stream_id):
+            # A stream above the last-stream-id of a GOAWAY we've sent: the peer opened
+            # it before seeing our GOAWAY and we refused it. Silently IGNORE late frames
+            # on it (h2 `id > max_stream_id` -> `ignore_data`, streams.rs recv_data)
+            # rather than RST(STREAM_CLOSED) or, worse, a connection PROTOCOL_ERROR from
+            # `_ensure_not_idle` — which would abort an in-progress graceful drain (F42).
+            # DATA still gets connection-window accounting via recv_data's `None` branch.
+            return None
         # A frame on an id we never opened is a connection error; an id we opened
         # and have since forgotten -> STREAM_CLOSED.
         self._ensure_not_idle(stream_id)
         raise _StreamError(stream_id, int(H2Reason.STREAM_CLOSED))
+
+    def _above_goaway(self, stream_id):
+        """True if `stream_id` is above the last-stream-id of a GOAWAY we've sent, so a
+        late frame on it must be silently ignored. Base: never (only the server refuses
+        peer-initiated streams by GOAWAY; the client's own aborted streams are removed
+        and the peer never sends on them)."""
+        return False
 
     def recv_headers(self, frame):
         # h2: proto/streams/streams.rs `recv_headers` (L421) -> recv.rs
@@ -519,9 +553,17 @@ class StreamManager:
     def _recv_response_head(self, st, frame):
         # A response head (or an interim 1xx). recv_open fully applies END_STREAM.
         informational = _is_informational(frame.status)
+        if informational and frame.end_stream:
+            # A 1xx interim response cannot carry END_STREAM: it is not the final
+            # response, so ending the stream on it is malformed (RFC 9113 §8.1). Reset
+            # the stream rather than let recv_open close it and silently return —
+            # which would hang the caller awaiting the real response head (F38).
+            raise _StreamError(st.id, int(H2Reason.PROTOCOL_ERROR))
         st.state.recv_open(eos=frame.end_stream, informational=informational)
         if informational:
-            return  # 1xx skipped (h2 poll_response); interim responses not surfaced
+            # 1xx skipped (h2 poll_response); interim responses are not surfaced — no
+            # poll_informational equivalent yet (a known feature gap, F38).
+            return
         self._apply_content_length(st, frame)  # may raise _StreamError
         st.status = frame.status
         st.headers = frame.headers
@@ -717,6 +759,12 @@ class StreamManager:
         """Error a stream, unblock its waiters, remove it, and free its slot."""
         if st.error is None:
             st.error = exc
+        # Transition the stream to Closed — h2 `recv_eof`: a connection-level failure/EOF
+        # fans out to every stream as Closed(BrokenPipe). Without this the state stays
+        # open, so a later `H2ResponseBody.aclose` on this stream would try to RST_STREAM
+        # on the now-dead transport and error instead of cleanly no-op'ing (F60).
+        # Idempotent (a no-op once already Closed).
+        st.state.recv_eof()
         st.headers_evt.set()
         st.body_send.send(None)
         st.window_evt.set()  # unblock a sender parked on flow control (it re-checks st.error)

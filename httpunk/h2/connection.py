@@ -45,6 +45,10 @@ _READ_SIZE = 65536
 # sends it, not the transport backend.
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
+# h2 `StreamId::MAX` (u32::MAX >> 1). A GOAWAY carrying this as last-stream-id is the
+# phase-1 "graceful, keep going" signal, not a real last-processed id.
+_MAX_STREAM_ID = 2**31 - 1
+
 
 class H2ConnectionBase:
     """The role-agnostic protocol driver for one transport (h2 `proto::Connection`).
@@ -67,6 +71,7 @@ class H2ConnectionBase:
         self._send_lock = self.backend.lock()
         self._transport = transport
         self._settings = settings  # SETTINGS sync (proto/settings.rs)
+        self._goaway_replied = False  # sent our acknowledging GOAWAY after a peer GOAWAY (F23)
 
     # ----- role hooks -----
 
@@ -122,10 +127,40 @@ class H2ConnectionBase:
             self.backend.close_transport(self._transport)
         self._scope.cancel()
         await self._scope.__aexit__(None, None, None)
+        # Guarantee every straggler waiter is woken. The pump normally calls `fail_all`
+        # itself on EOF, but that races the `cancel()` above — if cancellation reaches
+        # the pump before it processes the close-induced EOF, `fail_all` is skipped and a
+        # concurrent waiter (parked on a stream event) hangs forever (F44). The pump has
+        # now been joined, so this runs sequentially: it's a no-op when the pump already
+        # failed everyone (streams are popped as they're aborted), and wakes the
+        # stragglers when it didn't.
+        self.streams.fail_all(self.error or ConnectionClosedError("connection closed"))
 
     async def send_frame(self, data):
         async with self._send_lock:
             await self._transport.send_all(data)
+
+    async def _maybe_goaway_reply(self):
+        """If the peer has GOAWAY'd us with a REAL last-stream-id and no streams remain,
+        send our acknowledging GOAWAY(NO_ERROR, last-processed-id) exactly once and
+        report that the pump should stop (F23). No-op otherwise.
+
+        A phase-1 graceful GOAWAY (`last_stream_id == 2^31-1`) is explicitly NOT a
+        trigger — it means "I'm shutting down, keep your in-flight work going" and is
+        followed by a shutdown PING then the real GOAWAY. Reacting to it by stopping the
+        pump would skip answering that PING and stall the peer's two-phase graceful
+        (h2's `should_close_on_idle` excludes `StreamId::MAX` for the same reason)."""
+        if (
+            self._goaway_replied
+            or self.streams._goaway is None
+            or self.streams._streams
+            or self.streams._goaway_last_id is None
+            or self.streams._goaway_last_id >= _MAX_STREAM_ID
+        ):
+            return False
+        self._goaway_replied = True
+        await self.send_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), int(H2Reason.NO_ERROR)))
+        return True
 
     # ----- inbound -----
 
@@ -156,6 +191,14 @@ class H2ConnectionBase:
                         # resets (F25).
                         if se.args[2] != "remote":
                             await self.streams.reset_on_error(se.args[0], se.args[1])
+                # After a peer GOAWAY, once every in-flight stream has finished, send our
+                # acknowledging GOAWAY(NO_ERROR, last-processed-id) and stop serving —
+                # h2's poll loop does exactly this (`go_away_now(NO_ERROR)` once
+                # `error.is_some()` and `!has_streams()`, connection.rs L287-295), rather
+                # than lingering until the peer closes the socket (F23). The transport's
+                # FIN follows on the caller's `__aexit__` (httpunk's user-driven lifecycle).
+                if await self._maybe_goaway_reply():
+                    break
         except H2Error as exc:
             # A protocol/flow violation we detected (bad state, HPACK/CONTINUATION,
             # flow control, bad preface): notify the peer with GOAWAY, then tear down.

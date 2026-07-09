@@ -4,17 +4,19 @@ those frames."""
 
 import pytest
 from _client import open_h2
-from tonio.colored import Event, scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import (
     GoAwayError,
+    H2Connection,
     H2Error,
     H2FlowControlError,
     H2ProtocolError,
     H2Reason,
     StreamResetError,
 )
+from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2Codec,
     H2FrameData as Data,
@@ -62,6 +64,29 @@ async def _read_until_request(stream, codec, frames):
         chunk = await stream.receive_some(65536)
         if not chunk:
             return sid
+        frames = list(codec.receive(chunk))
+
+
+async def _capture_request(stream, codec, frames):
+    """Collect a request's frames until END_STREAM (ACKing SETTINGS along the way).
+    Returns `(sid, headers_end_stream, [Data frames])` for asserting on wire framing."""
+    sid = headers_es = None
+    data = []
+    while True:
+        for f in frames:
+            if isinstance(f, Settings) and not f.ack:
+                await stream.send_all(codec.serialize_settings_ack())
+            elif isinstance(f, Headers):
+                sid, headers_es = f.stream_id, f.end_stream
+                if f.end_stream:
+                    return sid, headers_es, data
+            elif isinstance(f, Data):
+                data.append(f)
+                if f.end_stream:
+                    return sid, headers_es, data
+        chunk = await stream.receive_some(65536)
+        if not chunk:
+            return sid, headers_es, data
         frames = list(codec.receive(chunk))
 
 
@@ -493,6 +518,136 @@ async def test_head_response_content_length_not_enforced():
 
 
 @pytest.mark.tonio
+async def test_content_length_over_19_digits_rejected():
+    """A content-length with >19 digits risks overflowing u64, so h2's `parse_u64`
+    rejects it outright (headers.rs L329) before parsing. The client resets that stream
+    with PROTOCOL_ERROR rather than accepting an unparseable length (F37)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid = await _read_until_request(stream, codec, frames)
+        await stream.send_all(
+            codec.serialize_response_headers(sid, 200, HeaderMap([("content-length", "1" * 20)]))
+        )
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            with pytest.raises(H2Error):  # RST_STREAM(PROTOCOL_ERROR): content-length too long
+                resp = await conn.get("/a")
+                await resp.read()
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_stream_id_overflow_refuses_new_stream():
+    """Once client stream ids are exhausted (past 2^31-1), a new request is refused —
+    h2 `StreamId::next_id` returns `StreamIdOverflow` — as a user error, while the
+    connection itself stays alive (F43)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+
+    async def server():
+        # Complete the preface, then keep the connection open — the client refuses
+        # before sending, so nothing to answer, but a premature close would surface as
+        # a connection error and mask the overflow refusal we're testing.
+        stream, _codec, _frames = await _accept_handshake(listener)
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            conn._conn.streams._next_id = (2**31 - 1) + 2  # exhaust the client id space
+            with pytest.raises(H2Error, match="exhausted"):
+                await conn.get("/a")
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_1xx_with_end_stream_is_reset_not_hung():
+    """A 1xx interim response carrying END_STREAM is malformed — a 1xx is not the final
+    response, so it can't end the stream (RFC 9113 §8.1). The client resets it
+    (PROTOCOL_ERROR) instead of hanging forever on a final head that never comes (F38)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid = await _read_until_request(stream, codec, frames)
+        await stream.send_all(codec.serialize_response_headers(sid, 100, end_stream=True))
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            with pytest.raises(H2Error):  # RST_STREAM(PROTOCOL_ERROR): 1xx can't END_STREAM
+                await conn.get("/")
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_empty_body_rides_end_stream_on_headers():
+    """A statically-empty body (`b""`) is bodyless: END_STREAM rides the HEADERS frame
+    with NO trailing empty DATA frame — hyper's empty body reports is_end_stream() (F39)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    seen = {}
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid, seen["headers_es"], seen["data"] = await _capture_request(stream, codec, frames)
+        await stream.send_all(codec.serialize_response_headers(sid, 200, end_stream=True))
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            assert (await conn.request("POST", "/", body=b"")).status == 200
+        s.cancel()
+
+    assert seen["headers_es"] is True  # END_STREAM on HEADERS
+    assert seen["data"] == []  # and no DATA frame at all
+
+
+@pytest.mark.tonio
+async def test_zero_length_interior_data_frame_sent_not_elided():
+    """An interior zero-length body chunk goes on the wire as an empty non-END_STREAM
+    DATA frame, not elided — h2 queues zero-length DATA frames (prioritize.rs) (F40)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    seen = {}
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid, _es, seen["data"] = await _capture_request(stream, codec, frames)
+        await stream.send_all(codec.serialize_response_headers(sid, 200, end_stream=True))
+        while await stream.receive_some(65536):
+            pass
+
+    def body():
+        yield b"a"
+        yield b""  # interior zero-length chunk — must still be framed
+        yield b"b"
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            assert (await conn.request("POST", "/", body=body())).status == 200
+        s.cancel()
+
+    payloads = [bytes(f.data) for f in seen["data"]]
+    assert b"" in payloads  # the interior empty chunk was sent, not swallowed
+    assert b"".join(payloads) == b"ab"
+
+
+@pytest.mark.tonio
 async def test_goaway_high_last_stream_id_accepted():
     """A first GOAWAY may carry any last_stream_id (h2 `Send::max_stream_id` starts
     at `StreamId::MAX`) — the standard graceful-shutdown pattern. Streams <= it keep
@@ -516,4 +671,114 @@ async def test_goaway_high_last_stream_id_accepted():
             resp = await conn.get("/")  # stream 1 <= last_stream_id -> kept running
             assert resp.status == 200
             assert await resp.read() == b"ok"
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_close_wakes_inflight_waiter():
+    """Closing a connection with an in-flight request must WAKE that request with an
+    error, never hang it. The pump normally fails all streams on EOF, but close()'s
+    cancel races that; fail_all in close() guarantees the straggler wakes regardless
+    (F44). (A hang would trip the per-test tonio deadline and fail loudly.)"""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    req_received = Event()
+
+    async def server():
+        # Read the request, SIGNAL that it arrived, then NEVER respond and keep the
+        # connection open — so the only thing that can wake the client's parked get()
+        # is the client's own close(). The signal makes the test deterministic: once it
+        # fires, do_get has finished sending HEADERS and is parked on the response.
+        stream, codec, frames = await _accept_handshake(listener)
+        await _read_until_request(stream, codec, frames)
+        req_received.set()
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(server())
+        conn = H2Connection(await TonioBackend().connect_tcp(host, port), authority=f"{host}:{port}")
+        await conn.__aenter__()
+
+        outcome = {}
+
+        async def do_get():
+            try:
+                resp = await conn.get("/")
+                outcome["resp"] = resp
+            except Exception as exc:  # the test asserts on the exception type below
+                outcome["err"] = exc
+
+        async with scope() as inner:
+            inner.spawn(do_get())
+            await req_received.wait()  # do_get has sent HEADERS and is parked on the head
+            await conn.__aexit__(None, None, None)  # close while do_get is parked
+        # inner joined -> do_get finished; it must have been woken with an error
+        assert isinstance(outcome.get("err"), H2Error)
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_aclose_after_connection_failure_is_clean():
+    """When the connection fails while a response body is still open, the stream is
+    transitioned to Closed (recv_eof fans out via fail_all), so aclose()-ing the
+    response is a clean no-op instead of trying to RST_STREAM on the dead transport
+    and erroring (F60)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    got_resp = Event()
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid = await _read_until_request(stream, codec, frames)
+        await stream.send_all(codec.serialize_response_headers(sid, 200))  # head, no END_STREAM
+        await got_resp.wait()  # let the client receive the head first
+        stream.close()  # then abruptly fail the connection with the body still open
+
+    async with scope() as s:
+        s.spawn(server())
+        conn = H2Connection(await TonioBackend().connect_tcp(host, port), authority=f"{host}:{port}")
+        await conn.__aenter__()
+        resp = await conn.get("/")  # head arrives; body left unread
+        assert resp.status == 200
+        got_resp.set()
+        while conn._conn.error is None:  # wait until the pump processed the EOF (fail_all ran)
+            await sleep(0)
+        # The stream is now Closed via recv_eof; aclose must NOT RST the dead transport.
+        await resp.aclose()  # would raise without F60
+        await conn.__aexit__(None, None, None)
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_client_replies_goaway_when_idle_after_peer_goaway():
+    """After the peer GOAWAYs and the in-flight stream finishes, the client sends its
+    OWN acknowledging GOAWAY(NO_ERROR) rather than lingering until the peer closes the
+    socket — h2 go_away_now-on-idle (F23)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    got_client_goaway = Event()
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid = await _read_until_request(stream, codec, frames)
+        # Graceful GOAWAY (last_stream_id = sid, so this stream is honoured), then the
+        # full response so the stream completes and the client goes idle.
+        await stream.send_all(codec.serialize_go_away(sid, H2Reason.NO_ERROR))
+        await stream.send_all(codec.serialize_response_headers(sid, 200))
+        await stream.send_all(codec.serialize_data(sid, b"ok", end_stream=True))
+        while True:  # read until the client's acknowledging GOAWAY reaches us
+            chunk = await stream.receive_some(65536)
+            if not chunk:
+                break
+            if any(isinstance(f, GoAway) for f in codec.receive(chunk)):
+                got_client_goaway.set()
+                break
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            resp = await conn.get("/")
+            assert await resp.read() == b"ok"
+            await got_client_goaway.wait()  # the client replied with its own GOAWAY (else hangs)
         s.cancel()
