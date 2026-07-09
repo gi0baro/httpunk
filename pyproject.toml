@@ -11,13 +11,16 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Free Threading :: 3 - Stable",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Python",
     "Programming Language :: Rust",
-    "Topic :: Scientific/Engineering :: GIS"
 ]
 
 dynamic = [
@@ -28,9 +31,13 @@ dynamic = [
     "version"
 ]
 
-requires-python = ">=3.14"
+requires-python = ">=3.10"
+# tonio is the free-threaded runtime backend; it builds only on free-threaded
+# CPython >= 3.14 (non-Windows). There is no free-threaded PEP 508 marker, so gate on
+# 3.14 + non-Windows as the closest approximation. Off that, httpunk runs on the
+# asyncio backend (`Backend.asyncio`), which needs no extra dependency.
 dependencies = [
-    "tonio>=0.7.1",
+    "tonio>=0.7.1; python_version >= '3.14' and platform_system != 'Windows'",
 ]
 
 [dependency-groups]
@@ -42,6 +49,7 @@ lint = [
 ]
 test = [
     'pytest~=8.3',
+    'pytest-asyncio~=0.24',
     'trustme~=1.1',
 ]
 
@@ -56,6 +64,12 @@ Homepage = "https://github.com/gi0baro/httpunk"
 Funding = "https://github.com/sponsors/gi0baro"
 Source = "https://github.com/gi0baro/httpunk"
 
+[tool.pytest.ini_options]
+# tonio tests use the tonio plugin's `@pytest.mark.tonio`; strict mode keeps
+# pytest-asyncio to only its own `@pytest.mark.asyncio` tests, so the two coexist.
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
 [build-system]
 requires = ["maturin>=1.8.0,<2"]
 build-backend = "maturin"
@@ -66,6 +80,7 @@ bindings = "pyo3"
 
 [tool.ruff]
 line-length = 120
+target-version = "py310"
 
 [tool.ruff.format]
 quote-style = 'double'

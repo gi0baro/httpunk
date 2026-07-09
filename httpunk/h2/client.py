@@ -247,7 +247,7 @@ class H2Connection(BaseClientConnection):
             transport, authority=authority, backend=backend, initial_window_size=initial_window_size
         )
 
-    async def ready(self):
+    def ready(self):
         """Wait until the connection can accept a new request — it's alive (not
         failed, no GOAWAY received) and a MAX_CONCURRENT_STREAMS slot is free —
         then return. Raises if the connection has failed or the peer sent GOAWAY.
@@ -259,7 +259,7 @@ class H2Connection(BaseClientConnection):
         the same backpressure. Calling `ready()` first is therefore optional — it
         just lets a caller pre-flight capacity/liveness without opening a stream.
         """
-        await self._conn.streams.wait_until_ready()
+        return self._conn.streams.wait_until_ready()
 
     async def send_request(self, request):
         """Send `request` and return its `Response` once the head arrives.

@@ -8,7 +8,7 @@ fidelity constraint; the reference is hyper-util's non-legacy behavior/shape.
 
 from urllib.parse import urlsplit
 
-from .._backend.tonio import TonioBackend
+from .. import _backend
 from ..h1.client import H1Connection
 from ..h2.client import H2Connection
 
@@ -32,7 +32,7 @@ async def connect(url, *, backend=None, alpn=_DEFAULT_ALPN, ssl_context=None):
     handshake, `__aenter__` does the HTTP handshake. Composable — this is the seam
     a pool / friendly client builds on (§11.6).
     """
-    backend = backend or TonioBackend()
+    backend = _backend.resolve(backend)
     parts = urlsplit(url)
     scheme = parts.scheme
     if scheme not in _DEFAULT_PORTS:

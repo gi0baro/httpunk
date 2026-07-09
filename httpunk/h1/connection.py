@@ -13,7 +13,7 @@ genuinely shared, and they live here. All byte work is the Rust sans-IO core
 Cross-reference: hyperium/hyper 1.10.1 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
-from .._backend.tonio import TonioBackend
+from .. import _backend
 from .._common import aiter_body
 
 
@@ -27,7 +27,7 @@ class H1ConnectionBase:
 
     def __init__(self, transport, *, backend=None):
         self.transport = transport
-        self.backend = backend or TonioBackend()
+        self.backend = _backend.resolve(backend)
         self._closed = False
         # Set once the connection is handed off as a raw tunnel (101 / CONNECT):
         # the transport belongs to an `H1Upgraded` the caller owns — don't close it.
@@ -53,12 +53,12 @@ class H1ConnectionBase:
         self._closed = True
         self.transport = None
 
-    async def read_body_more(self):
+    def read_body_more(self):
         """Read more transport bytes for an in-flight body. Empty bytes = EOF."""
-        return await self.transport.receive_some(_READ_SIZE)
+        return self.transport.receive_some(_READ_SIZE)
 
-    async def write(self, data):
-        await self.transport.send_all(data)
+    def write(self, data):
+        return self.transport.send_all(data)
 
     @staticmethod
     def _body_framing(body):

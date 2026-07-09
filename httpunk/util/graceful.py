@@ -29,12 +29,12 @@ the public `graceful_shutdown()` is touched — no driver internals.
 
 import threading
 
-from .._backend.tonio import TonioBackend
+from .. import _backend
 
 
 class GracefulShutdown:
     def __init__(self, backend=None):
-        self._backend = backend or TonioBackend()
+        self._backend = _backend.resolve(backend)
         self._signal = self._backend.event()  # the shutdown signal (≈ hyper-util's watch channel)
         self._lock = threading.Lock()  # guards the live-connection count (free-threaded)
         self._live = 0

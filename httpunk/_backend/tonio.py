@@ -15,9 +15,28 @@ from tonio.colored.sync.channel import unbounded as _unbounded
 from tonio.colored.time import time as _now
 
 
+class _TonioSemaphore:
+    """Adapts tonio's `Semaphore` to the backend-neutral async-`acquire`/sync-`release`
+    contract. tonio's `acquire()` is sync and returns None (a permit was free) or an
+    `Event` that fires once a permit is handed to this waiter — so awaiting that event
+    *is* the acquisition (fair handoff, no retry)."""
+
+    __slots__ = ["_sem"]
+
+    def __init__(self, value):
+        self._sem = _Semaphore(value)
+
+    async def acquire(self):
+        event = self._sem.acquire()
+        if event is not None:
+            await event.waiter(None)
+
+    def release(self):
+        self._sem.release()
+
+
 class TonioBackend:
-    async def connect_tcp(self, host, port):
-        return await _open_tcp_stream(host, port)
+    connect_tcp = staticmethod(_open_tcp_stream)
 
     async def connect_tls(self, host, port, *, alpn=None, ssl_context=None):
         """Dial `host:port` over TLS and return `(stream, selected_alpn)` — the
@@ -59,7 +78,7 @@ class TonioBackend:
             return ssl_obj.read(min(max_bytes, pending)) if pending else b""
         try:
             return transport.socket._sock.recv(max_bytes)
-        except BlockingIOError, InterruptedError:
+        except (BlockingIOError, InterruptedError):
             return b""
 
     def close_transport(self, transport):
@@ -81,31 +100,10 @@ class TonioBackend:
         else:
             transport.close()
 
-    async def select(self, *coros):
-        """Race `coros`, returning the first to complete and cancelling the losers.
-        The runtime's first-wins primitive — used by the h1 server to race an idle
-        request-head read against a graceful-shutdown signal (a socket read parked in
-        another task can only be released by cancellation, not by closing it)."""
-        return await _colored.select(*coros)
-
-    def scope(self):
-        return _colored.scope()
-
-    def lock(self):
-        return _Lock()
-
-    def event(self):
-        return _colored.Event()
-
-    def semaphore(self, value):
-        return _Semaphore(value)
-
-    def queue(self):
-        """An unbounded queue: `(sender, receiver)`. `sender.send(x)` is sync;
-        `await receiver.receive()` yields items in order."""
-        return _unbounded()
-
-    def monotonic(self):
-        """The runtime clock, in seconds. Used to age out the reset-stream store
-        (h2 uses `Instant::now`)."""
-        return _now()
+    select = staticmethod(_colored.select)
+    scope = staticmethod(_colored.scope)
+    lock = _Lock
+    event = _colored.Event
+    semaphore = _TonioSemaphore
+    queue = staticmethod(_unbounded)
+    monotonic = staticmethod(_now)

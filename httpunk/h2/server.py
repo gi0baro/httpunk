@@ -75,13 +75,13 @@ class ServerRequest:
         if self._stream.error is not None:
             raise self._stream.error
 
-    async def read(self):
-        return await read_all(self.aiter_bytes())
+    def read(self):
+        return read_all(self.aiter_bytes())
 
-    async def respond(self, status, *, headers=None, body=None):
+    def respond(self, status, *, headers=None, body=None):
         """Send the response: HEADERS (+ body, flow-control-gated). `body` is None,
         `bytes`, or a (sync/async) iterable of `bytes`. h2: `SendResponse`."""
-        await self._manager.send_response(self._stream, status, headers, body)
+        return self._manager.send_response(self._stream, status, headers, body)
 
     def __repr__(self):
         return f"ServerRequest(method={self.method!r}, path={self.path!r})"
@@ -218,8 +218,8 @@ class ServerStreamManager(StreamManager):
             return
         await self.send_body(st, body)  # inherited: END_STREAM on the final DATA, then close
 
-    async def next_request(self):
-        return await self._incoming_recv.receive()
+    def next_request(self):
+        return self._incoming_recv.receive()
 
 
 class ServerConnection(H2ConnectionBase):
@@ -272,10 +272,10 @@ class ServerConnection(H2ConnectionBase):
         # are safe to retry.
         return self.streams._last_processed_id
 
-    async def next_request(self):
+    def next_request(self):
         # Exposed on the driver (like the h1 server) so the `BaseServer` accept
         # iterator is protocol-uniform.
-        return await self.streams.next_request()
+        return self.streams.next_request()
 
     async def graceful_shutdown(self):
         # h2 `Connection::graceful_shutdown` (proto/connection.rs `go_away`): a

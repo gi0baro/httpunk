@@ -130,8 +130,8 @@ class ServerRequest:
         self.trailers = self._decoder.take_trailers()
         self._body_done = True
 
-    async def read(self):
-        return await read_all(self.aiter_bytes())
+    def read(self):
+        return read_all(self.aiter_bytes())
 
     async def respond(self, status, *, headers=None, body=None):
         """Send the response head (+ body). `body` is None, `bytes`, or a
@@ -297,8 +297,8 @@ class ServerConnection(H1ConnectionBase):
         if self._shutdown_evt.is_set():
             return _SHUTDOWN
 
-        async def _recv():
-            return await self.transport.receive_some(n)
+        def _recv():
+            return self.transport.receive_some(n)
 
         async def _await_shutdown():
             await self._shutdown_evt.wait()

@@ -39,8 +39,8 @@ class H1Upgraded:
             return chunk
         return await self._transport.receive_some(max_bytes)
 
-    async def send_all(self, data):
-        await self._transport.send_all(data)
+    def send_all(self, data):
+        return self._transport.send_all(data)
 
     async def aclose(self):
         if not self._closed:

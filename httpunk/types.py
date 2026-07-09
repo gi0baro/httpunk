@@ -72,10 +72,10 @@ class Response:
     async def read(self):
         return b"".join([chunk async for chunk in self._body.aiter_bytes()])
 
-    async def aclose(self):
+    def aclose(self):
         """Release the response. If the body wasn't fully read, cancel it (the
         backend RSTs the stream on h2, or closes the connection on h1). Idempotent."""
-        await self._body.aclose()
+        return self._body.aclose()
 
     async def __aenter__(self):
         return self
