@@ -780,3 +780,30 @@ async def test_client_replies_goaway_when_idle_after_peer_goaway():
             assert await resp.read() == b"ok"
             await got_client_goaway.wait()  # the client replied with its own GOAWAY (else hangs)
         s.cancel()
+
+
+@pytest.mark.tonio
+async def test_end_stream_with_content_length_resets_not_hangs():
+    """A response whose final HEADERS carry END_STREAM AND content-length>0 is malformed
+    (the declared length can't match the zero body bytes). The client resets it
+    (PROTOCOL_ERROR) and send_request raises PROMPTLY, instead of hanging forever on the
+    response head because reset_stream skipped waking the waiter on the closed stream
+    (F18)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        sid = await _read_until_request(stream, codec, frames)
+        await stream.send_all(
+            codec.serialize_response_headers(sid, 200, HeaderMap([("content-length", "5")]), end_stream=True)
+        )
+        while await stream.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            with pytest.raises(H2Error):  # RST_STREAM(PROTOCOL_ERROR), woken promptly
+                await conn.request("GET", "/")
+        s.cancel()

@@ -514,3 +514,33 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
             with pytest.raises(ValueError, match="unexpected"):
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
         s.cancel()
+
+
+@pytest.mark.tonio
+async def test_body_iterable_error_fails_promptly():
+    """A request body iterable that raises mid-upload fails send_request PROMPTLY with
+    that error, instead of the error being swallowed / hanging on the response head
+    until the server times out (F12)."""
+    listener, host, port = await _listener()
+
+    class _BoomError(Exception):
+        pass
+
+    def body():
+        yield b"chunk-1"
+        raise _BoomError("body generator failed mid-upload")
+
+    async def serve():
+        # Read whatever arrives; NEVER respond (the request is incomplete). Without the
+        # fix the client would hang here forever; with it, the client closes on the body
+        # error and this drains to EOF.
+        transport = await listener.accept()
+        while await transport.receive_some(65536):
+            pass
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            with pytest.raises(_BoomError):
+                await conn.request("POST", "/", headers={"host": f"{host}:{port}"}, body=body())
+        s.cancel()

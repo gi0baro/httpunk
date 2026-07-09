@@ -388,6 +388,19 @@ class StreamManager:
         h2: proto/streams/streams.rs `send_reset` / share.rs `SendStream::send_reset`.
         """
         if st.state.is_closed():
+            # The stream already reached Closed before we decided to reset it — e.g. a
+            # response whose final HEADERS carry END_STREAM *and* a bad content-length:
+            # recv_open closes the state, then the content-length check raises here. We
+            # can't send an RST or re-transition a Closed stream, but we MUST still wake
+            # any waiter parked on the head/body/window (it re-reads `st.error`, which
+            # `reset_on_error` set) and reclaim + drop the stream — otherwise
+            # `send_request` hangs forever and the stream + its slot leak (F18). h2 runs
+            # `set_reset` + `notify_recv` BEFORE its own closed check for this reason.
+            st.headers_evt.set()
+            st.body_send.send(None)
+            st.window_evt.set()
+            await self._reclaim_stream_capacity(st)
+            self._close_stream(st)
             return
         st.state.set_reset(st.id, error_code, initiator)
         await self._conn.send_frame(self._conn.codec.serialize_rst_stream(st.id, error_code))

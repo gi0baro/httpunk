@@ -170,13 +170,21 @@ class Connection(H1ConnectionBase):
             # finished the response: joins it if done -> reuse, cancels it if not ->
             # close.
             body_done = self.backend.event()
+            body_failed = self.backend.event()
             write_error = []
             scope = self.backend.scope()
             await scope.__aenter__()
-            scope.spawn(self._write_request(codec, head, body, body_done, write_error, trailers))
+            scope.spawn(self._write_request(codec, head, body, body_done, write_error, body_failed, trailers))
             self._writer_scope, self._writer_done = scope, body_done
             try:
-                resp_head = await self._read_head(codec, write_error)
+                # Race the head read against a body-write failure (F12): normally
+                # `_read_head` wins; a body-iterable/framing error fires `body_failed` so
+                # we don't park on the response head forever. One select per request (not
+                # per head-read) to keep the hot path cheap.
+                resp_head = await self.backend.select(
+                    self._read_head(codec, write_error),
+                    self._await_body_failure(body_failed, write_error),
+                )
             except BaseException:
                 await self._teardown_writer(cancel=True)  # no head -> abandon the write
                 raise
@@ -215,7 +223,7 @@ class Connection(H1ConnectionBase):
             self._slot.release()
             raise
 
-    async def _write_request(self, codec, head, body, body_done, write_error, trailers=None):
+    async def _write_request(self, codec, head, body, body_done, write_error, body_failed, trailers=None):
         # Write the head then the framed body. A write failure (e.g. the server
         # closed the read side after answering early) must not mask a response
         # that did arrive: record it so `_read_head` can still deliver the head,
@@ -225,8 +233,23 @@ class Connection(H1ConnectionBase):
             await self.transport.send_all(head)
             await self._send_body(codec, body, trailers)
             body_done.set()
-        except Exception as exc:  # transport write error, not cancellation
+        except OSError as exc:
+            # A TRANSPORT write failure (broken pipe / reset): the peer may have closed
+            # right after sending an early response (413/redirect) that is still buffered
+            # for `_read_head`, so DEFER — record it and surface it only if no head
+            # arrives (EOF). Do NOT signal `body_failed`, or we'd race away that buffered
+            # response (F11).
             write_error.append(exc)
+        except Exception as exc:
+            # A BODY-ITERABLE / framing error (the caller's body generator raised, or a
+            # length mismatch): the request can't complete and no valid response is
+            # coming, so fail PROMPTLY (hyper fails the dispatcher). Record it and wake
+            # `_read_head` via `body_failed` so it surfaces the error instead of parking
+            # on `receive_some` until the server times out (F12). The transport is closed
+            # by `send_request`'s outer `_fail` once the writer is joined — closing it
+            # here (inside the writer's scope) wedges that join.
+            write_error.append(exc)
+            body_failed.set()
 
     async def _read_head(self, codec, write_error=None):
         # hyper: conn.rs `can_read_head` (L175) + `read_head` -> role.rs
@@ -242,6 +265,16 @@ class Connection(H1ConnectionBase):
             head = codec.receive_head(data)
             if head is not None:
                 return head
+
+    async def _await_body_failure(self, body_failed, write_error):
+        # Raced against `_read_head` (once per request, in send_request): if the request
+        # body write fails with a body-iterable / framing error and no response is
+        # forthcoming, wake `send_request` promptly with that error instead of parking on
+        # the response head until the server times out (F12). A TRANSPORT write error does
+        # NOT fire this (F11 — an early response may be buffered), so the normal path
+        # always lets `_read_head` win the race.
+        await body_failed.wait()
+        raise write_error[0]
 
     def poison_unexpected(self, nbytes):
         """The server sent `nbytes` unsolicited bytes past the response body — an
