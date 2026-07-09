@@ -55,9 +55,11 @@ lint-rust:
 .PHONY: lint
 lint: lint-python lint-rust
 
-.PHONY: vendor-h2
-vendor-h2:
+.PHONY: vendor
+vendor:
 	./scripts/vendor-h2.sh
+	./scripts/vendor-hyper.sh
+	./scripts/vendor-hyper-util.sh
 
 .PHONY: audit
 audit:
