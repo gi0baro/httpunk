@@ -219,6 +219,11 @@ pub struct Data {
     pub end_stream: bool,
     #[pyo3(get)]
     pub data: Py<PyBytes>,
+    /// h2 `frame::Data::flow_controlled_len` — payload + padding + the pad-length
+    /// byte. Flow control counts padding; `data` (the payload) does not, so the
+    /// driver must account windows on this, not `len(data)` (h2 recv.rs L643).
+    #[pyo3(get)]
+    pub flow_controlled_len: usize,
 }
 
 #[pymethods]
@@ -806,6 +811,7 @@ impl Codec {
                     Data {
                         stream_id: u32::from(d.stream_id()),
                         end_stream: d.is_end_stream(),
+                        flow_controlled_len: d.flow_controlled_len(),
                         data: PyBytes::new(py, d.payload().as_ref()).unbind(),
                     },
                 )?

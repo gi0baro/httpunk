@@ -16,6 +16,7 @@ This layer is low-level by design — no pool, connector, or high-level client
 Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 """
 
+import contextlib
 import threading
 
 from .._common import BaseClientConnection
@@ -26,6 +27,18 @@ from .settings import LocalSettings, Settings
 from .share import H2ResponseBody
 from .stream import Stream
 from .streams import StreamManager
+
+
+# hyper's HTTP/2 client profile (hyper `proto/h2/client.rs`): a 2 MB per-stream recv
+# window and a 5 MB connection recv window (vs the 65535 protocol default), 16 KB max
+# frame size, 16 KB max header-list size. We ship the hyper *stack's* tuned profile,
+# not bare-h2's empty-SETTINGS defaults (AUDIT-2026-07-09 F24). The stream window /
+# frame / header-list are advertised in our initial SETTINGS; the connection window is
+# raised by an initial WINDOW_UPDATE(0) (SETTINGS can't carry it).
+_STREAM_WINDOW = 2 * 1024 * 1024
+_CONN_WINDOW = 5 * 1024 * 1024
+_MAX_FRAME_SIZE = 16 * 1024
+_MAX_HEADER_LIST_SIZE = 16 * 1024
 
 
 class ClientStreamManager(StreamManager):
@@ -147,6 +160,15 @@ class ClientStreamManager(StreamManager):
         incrementing the open-stream count (h2 counts.rs `inc_num_send_streams`,
         gated by `can_inc_num_send_streams`)."""
         while not self._try_claim_slot():
+            # A GOAWAY / connection failure that arrives while we're parked at the limit
+            # must fail this request PROMPTLY — h2's recv_go_away fails queued streams
+            # (streams.rs L736) rather than leaving them to wait for a surviving stream
+            # to free a slot, which may never happen (F20). `_on_go_away`/`_on_fail`
+            # set `_slot_evt` to wake us for this re-check.
+            if self._goaway is not None:
+                raise self._goaway
+            if self._conn.error is not None:
+                raise self._conn.error
             await self._slot_evt.wait()
 
     def _release_count(self):
@@ -165,10 +187,16 @@ class ClientStreamManager(StreamManager):
         likewise non-reserving — `send_request` re-applies the backpressure).
         """
         while True:
-            if self._conn.error is not None:
-                raise self._conn.error
+            # Check GOAWAY BEFORE the connection error: after a graceful
+            # GOAWAY(NO_ERROR) the peer closes, so both `_goaway` (GoAwayError) and
+            # `_conn.error` (ConnectionClosedError from EOF) end up set; the GOAWAY is
+            # the meaningful, retry-relevant one, and h2's recv_eof never overwrites the
+            # existing conn_error (streams.rs L879). Also keeps this consistent with
+            # `open_stream`, which checks `_goaway` first (F20).
             if self._goaway is not None:
                 raise self._goaway
+            if self._conn.error is not None:
+                raise self._conn.error
             # Non-reserving: just observe capacity (a racy read is fine — we don't
             # increment; a concurrent open re-applies the gate under the lock).
             if self._can_open():
@@ -196,30 +224,56 @@ class Connection(H2ConnectionBase):
     """The client protocol driver. Created and driven by the public
     `client.H2Connection`."""
 
-    def __init__(self, transport, *, authority=None, backend=None, initial_window_size=None):
-        # `authority` builds the :authority pseudo-header for a bare-path request.
+    def __init__(self, transport, *, authority=None, scheme="http", backend=None, initial_window_size=None):
+        # `authority`/`scheme` build the :authority/:scheme pseudo-headers for a
+        # bare-path request. h2 takes :scheme from the request URI (client.rs
+        # L1627); httpunk's caller supplies it here (`util.connect` passes "https"
+        # for a TLS-dialed connection), defaulting to "http" for cleartext.
         self.authority = authority
-        self._initial_window_size = initial_window_size  # our advertised per-stream recv window
-        # We advertise SETTINGS_ENABLE_PUSH=0 (see connect()).
+        self.scheme = scheme
+        # Our advertised per-stream recv window (SETTINGS_INITIAL_WINDOW_SIZE),
+        # defaulting to hyper's 2 MB unless the caller overrides it.
+        self._initial_window_size = initial_window_size if initial_window_size is not None else _STREAM_WINDOW
+        # We advertise SETTINGS_ENABLE_PUSH=0 + our window/frame/header-list profile
+        # (see connect()); these take effect for receiving once the peer ACKs.
         super().__init__(
             transport,
             backend=backend,
             codec_role="client",
-            settings=Settings(LocalSettings(initial_window_size=initial_window_size)),
+            settings=Settings(
+                LocalSettings(
+                    initial_window_size=self._initial_window_size,
+                    max_frame_size=_MAX_FRAME_SIZE,
+                    max_header_list_size=_MAX_HEADER_LIST_SIZE,
+                )
+            ),
         )
         # Signalled once the peer's initial SETTINGS have been applied, so requests
         # respect the peer's limits/window from the first one.
         self._ready_evt = self.backend.event()
         self.streams = ClientStreamManager(self)
+        self.streams._conn_recv_target = _CONN_WINDOW  # raised via WINDOW_UPDATE(0) in _begin
+        # Grant a larger-than-default per-stream recv window IMMEDIATELY, before the
+        # peer ACKs our SETTINGS: the peer only sends more than the 65535 default once
+        # it has processed our SETTINGS, so accepting up to the advertised window can
+        # never over-accept — whereas waiting for the ACK (`apply_local_settings`)
+        # leaves a window where the peer uses the new size before we grant it → a
+        # spurious stream FLOW_CONTROL_ERROR. A *smaller* window still waits for the
+        # ACK (RFC 7540 §6.9.2) so the peer can't overrun data sent under the default.
+        if self._initial_window_size > self.streams._recv_init:
+            self.streams._recv_init = self._initial_window_size
 
     async def connect(self):
         # h2: client.rs `handshake` (L1220) — over the caller-supplied transport,
         # flush the client preface + our initial SETTINGS, spawn the driver, then
         # wait for the peer's initial SETTINGS (its connection preface) before we're
         # ready for requests. (Dialing/TLS/ALPN are the caller's job.)
-        settings = {"enable_push": False}
-        if self._initial_window_size is not None:
-            settings["initial_window_size"] = self._initial_window_size
+        settings = {
+            "enable_push": False,
+            "initial_window_size": self._initial_window_size,
+            "max_frame_size": _MAX_FRAME_SIZE,
+            "max_header_list_size": _MAX_HEADER_LIST_SIZE,
+        }
         await self._begin(PREFACE, settings)
         await self._ready_evt.wait()
         if self.error is not None:
@@ -227,6 +281,26 @@ class Connection(H2ConnectionBase):
 
     def _signal_ready(self):
         self._ready_evt.set()
+
+    def send_body_background(self, stream, body):
+        """Send the request body concurrently with (not before) the caller awaiting
+        the response head. h2's `SendStream` (body) and `ResponseFuture` (head) are
+        independent: an early response that resets the request body — the
+        413/redirect-during-upload pattern, where the server emits its response then
+        RST_STREAM(NO_ERROR) — must still deliver the received response, not have the
+        body-send error mask it. The write runs in the connection's dedicated write
+        scope (not the read-pump scope, so it doesn't disturb the pump's delicate
+        close teardown) so it can outlive `send_request` (full duplex) and is torn
+        down when the connection closes (h2 client.rs: send_request returns the
+        ResponseFuture immediately)."""
+        self._write_scope.spawn(self._write_body(stream, body))
+
+    async def _write_body(self, stream, body):
+        # The stream may error/reset mid-send (413/redirect + RST_STREAM). That is
+        # recorded on `stream.error` and surfaced when the response body is read; a
+        # background writer has nowhere to propagate to, so suppress it here.
+        with contextlib.suppress(Exception):
+            await self.streams.send_body(stream, body)
 
 
 class H2Connection(BaseClientConnection):
@@ -242,9 +316,9 @@ class H2Connection(BaseClientConnection):
     `BaseClientConnection` (identical to `H1Connection`).
     """
 
-    def __init__(self, transport, *, authority=None, backend=None, initial_window_size=None):
+    def __init__(self, transport, *, authority=None, scheme="http", backend=None, initial_window_size=None):
         self._conn = Connection(
-            transport, authority=authority, backend=backend, initial_window_size=initial_window_size
+            transport, authority=authority, scheme=scheme, backend=backend, initial_window_size=initial_window_size
         )
 
     def ready(self):
@@ -280,7 +354,7 @@ class H2Connection(BaseClientConnection):
             is_head=is_head,
         )
         if not end_stream:
-            await self._conn.streams.send_body(stream, request.body)
+            self._conn.send_body_background(stream, request.body)
 
         await stream.headers_evt.wait()
         # h2's `ResponseFuture` resolves the moment the head arrives (client.rs
@@ -308,4 +382,4 @@ class H2Connection(BaseClientConnection):
                 "request target is a bare path but the connection has no authority; "
                 "pass authority=... to H2Connection or use an absolute-URL target"
             )
-        return f"http://{self._conn.authority}{target}"
+        return f"{self._conn.scheme}://{self._conn.authority}{target}"

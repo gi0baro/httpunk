@@ -17,7 +17,9 @@ from httpunk._httpunk import (
     H2Codec,
     H2FrameGoAway as GoAway,
     H2FrameHeaders as Headers,
+    H2FrameRstStream as RstStream,
     H2FrameSettings as Settings,
+    H2FrameWindowUpdate as WindowUpdate,
 )
 from httpunk.h2 import H2Server
 from httpunk.h2.connection import PREFACE
@@ -65,6 +67,31 @@ async def test_server_post_echo_body():
             resp = await conn.request("POST", "/submit", body=b"payload!")
             assert resp.status == 200
             assert await resp.read() == b"POST /submit -> payload!"
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_client_gets_early_response_despite_body_reset():
+    """A server that responds before reading the request body resets the stream while
+    the client is still uploading (F3: RST_STREAM(NO_ERROR)). The client must still
+    return the received response — the body-send error must not mask it (F6). The body
+    exceeds the flow-control window, so the send is guaranteed in-flight (blocked on a
+    WINDOW_UPDATE) when the RST lands."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server:
+                async for req in server:
+                    await req.respond(200, body=b"early")  # respond WITHOUT reading the body
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("POST", "/x", body=b"x" * (2 * 1024 * 1024))  # > the server's 1 MB window
+            assert resp.status == 200
+            assert await resp.read() == b"early"
         s.cancel()
 
 
@@ -187,6 +214,105 @@ async def _serve_forever(listener):
         async with H2Server(transport) as server:
             async for req in server:
                 await req.respond(200)
+
+
+async def _read_frame(transport, codec, kind):
+    """Read frames (acking the server's SETTINGS) until one of type `kind` arrives,
+    or None on EOF."""
+    while True:
+        data = await transport.receive_some(65536)
+        if not data:
+            return None
+        for f in codec.receive(data):
+            if isinstance(f, Settings) and not f.ack:
+                await transport.send_all(codec.serialize_settings_ack())
+            elif isinstance(f, kind):
+                return f
+
+
+@pytest.mark.tonio
+async def test_server_rsts_unread_request_body_with_no_error():
+    """A server that responds without consuming the request body drops the request:
+    while the client is still sending (recv half open), h2 sends RST_STREAM(NO_ERROR)
+    so it stops (the nginx-compat `maybe_cancel` rule). Regression guard for F3 — the
+    unread upload used to pin the connection window with no RST ever sent."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server:
+                async for req in server:
+                    await req.respond(200)  # respond WITHOUT reading the body
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        # Open stream 1 with a body but never send END_STREAM (client still uploading).
+        await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/a", HeaderMap()))
+        await transport.send_all(codec.serialize_data(1, b"partial upload", end_stream=False))
+        rst = await _read_frame(transport, codec, RstStream)
+        assert rst is not None and rst.stream_id == 1
+        assert rst.error_code == H2Reason.NO_ERROR  # NO_ERROR (nginx-compat), not CANCEL
+        transport.close()
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_advertises_hyper_settings_profile():
+    """The server ships hyper's tuned profile (F24), not bare-h2 defaults: its initial
+    SETTINGS carry MAX_CONCURRENT_STREAMS=200, a 1 MB stream window, 16 KB max frame,
+    16 KB max header list, and NO ENABLE_PUSH; plus an initial WINDOW_UPDATE(0) that
+    raises the connection recv window from 65535 to 1 MB."""
+    listener, host, port = await _listener()
+    async with scope() as s:
+        s.spawn(_serve_forever(listener))
+        transport, codec = await _raw_handshake(host, port)
+        frames = []
+        while not any(isinstance(f, WindowUpdate) for f in frames):  # SETTINGS then WINDOW_UPDATE(0)
+            data = await transport.receive_some(65536)
+            assert data, "connection closed before the server's preface completed"
+            frames += codec.receive(data)
+        settings = next(f for f in frames if isinstance(f, Settings) and not f.ack)
+        assert settings.max_concurrent_streams == 200
+        assert settings.initial_window_size == 1024 * 1024
+        assert settings.max_frame_size == 16 * 1024
+        assert settings.enable_push is None  # the server does not advertise ENABLE_PUSH
+        wu = next(f for f in frames if isinstance(f, WindowUpdate))
+        assert wu.stream_id == 0
+        assert wu.increment == 1024 * 1024 - 65535  # raise the 65535 default conn window to 1 MB
+        transport.close()
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_goaway_on_remote_reset_flood():
+    """Rapid Reset (CVE-2023-44487): a flood of HEADERS+RST_STREAM on streams the app
+    never accepts. Reset pending-accept streams stop counting as concurrent, so
+    MAX_CONCURRENT can't gate the flood; h2 caps them separately (20) and tears the
+    connection down with GOAWAY(ENHANCE_YOUR_CALM). Regression guard for F4."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport):
+                await Event().wait()  # hold the connection open; never accept a request
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        sid = 1
+        with contextlib.suppress(Exception):  # server may GOAWAY + close mid-flood
+            for _ in range(30):  # well past the cap of 20
+                await transport.send_all(codec.serialize_request_headers(sid, "GET", "http://x/p", HeaderMap()))
+                await transport.send_all(codec.serialize_rst_stream(sid, int(H2Reason.CANCEL)))
+                sid += 2
+        ga = await _read_frame(transport, codec, GoAway)
+        assert ga is not None
+        assert ga.error_code == H2Reason.ENHANCE_YOUR_CALM
+        transport.close()
+        s.cancel()
 
 
 @pytest.mark.tonio

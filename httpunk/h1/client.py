@@ -57,9 +57,29 @@ class Connection(H1ConnectionBase):
         self._peer_http10 = False
         # One request/response in flight at a time (h1 has no multiplexing).
         self._slot = self.backend.semaphore(1)
+        # The in-flight request's background body writer (single-in-flight): its
+        # detached scope + an event set when the body was sent in FULL. hyper's
+        # poll_loop writes the body independently of reading the response, so an early
+        # response doesn't truncate the upload; the writer runs past `send_request` and
+        # the reuse decision is deferred to `release_slot`. A fresh scope per request
+        # (a scope can't be re-armed after `cancel()`), so reuse isn't blocked.
+        self._writer_scope = None
+        self._writer_done = None
 
     async def connect(self):
         pass  # HTTP/1 has no connection preface / handshake (unlike h2)
+
+    async def _teardown_writer(self, *, cancel):
+        """Finish with the in-flight body writer: `cancel=True` aborts it (still
+        running — an early response we didn't wait out), then joins; `cancel=False`
+        just joins an already-finished writer (instant). Idempotent."""
+        scope = self._writer_scope
+        if scope is None:
+            return
+        self._writer_scope = self._writer_done = None
+        if cancel:
+            scope.cancel()
+        await scope.__aexit__(None, None, None)
 
     def _acquire(self):
         return self._slot.acquire()  # blocks until the single in-flight slot is free
@@ -97,25 +117,28 @@ class Connection(H1ConnectionBase):
             head = codec.serialize_request(
                 method, url, headers, http10=http10, content_length=content_length, chunked=chunked
             )
-            # hyper's `poll_loop` interleaves reads and writes (dispatch.rs
-            # L172-211): the response head can arrive while the request body is
-            # still being written. Writing the whole body *before* reading (a
-            # server that answers early — 413/401/redirect/expect-reject — and
-            # stops reading the upload) would deadlock against a full send buffer.
-            # So we write head+body in a spawned task and read the head
-            # concurrently; if the response arrives first, we stop writing.
+            # hyper's `poll_loop` drives reads and writes INDEPENDENTLY each turn
+            # (dispatch.rs L172-211): a response head can arrive while the request
+            # body is still being written, and an early response (413/401/redirect)
+            # does NOT truncate the upload — the body keeps writing, and the
+            # connection is reused only if it actually completes. So we write
+            # head+body in a DETACHED background task (a per-request scope that
+            # outlives this call) and read the head concurrently. The writer is NOT
+            # cancelled at head-arrival (that used to truncate the request + burn the
+            # connection, F11); `release_slot` decides its fate when the caller has
+            # finished the response: joins it if done -> reuse, cancels it if not ->
+            # close.
             body_done = self.backend.event()
             write_error = []
-            async with self.backend.scope() as s:
-                s.spawn(self._write_request(codec, head, body, body_done, write_error))
-                try:
-                    resp_head = await self._read_head(codec, write_error)
-                finally:
-                    # Always stop the writer — via `finally` so a `_read_head`
-                    # failure (e.g. a malformed head) doesn't leave the scope
-                    # awaiting a writer still blocked on a full send buffer (the
-                    # scope doesn't cancel children on an exception exit).
-                    s.cancel()
+            scope = self.backend.scope()
+            await scope.__aenter__()
+            scope.spawn(self._write_request(codec, head, body, body_done, write_error))
+            self._writer_scope, self._writer_done = scope, body_done
+            try:
+                resp_head = await self._read_head(codec, write_error)
+            except BaseException:
+                await self._teardown_writer(cancel=True)  # no head -> abandon the write
+                raise
             # Remember the peer's version so the next request on a reused
             # connection can fix itself up (hyper conn.rs L295).
             self._peer_http10 = resp_head.http10
@@ -125,30 +148,28 @@ class Connection(H1ConnectionBase):
                 # the head — the start of the upgraded protocol) to an H1Upgraded
                 # the caller owns; this driver won't touch the transport again
                 # (hyper `on_upgrade` / `Connection::into_parts`).
+                await self._teardown_writer(cancel=True)  # the request-body write is moot
                 upgraded = H1Upgraded(self.transport, codec.take_body())
                 self._detach()
                 self._slot.release()
                 body = H1ResponseBody(self, None, keep_alive=False, upgraded=upgraded)
                 return Response(resp_head.status, resp_head.headers, body)
-            fully_sent = body_done.is_set()
             decoder = H1BodyDecoder(resp_head.body_kind, resp_head.content_length or 0)
             decoder.feed(codec.take_body())  # body bytes already read alongside the head
-            # If the request body wasn't fully sent (early response), the
-            # connection has a truncated request on it and can't be reused,
-            # regardless of the response's keep-alive signal.
-            keep_alive = resp_head.keep_alive and fully_sent
-            # A close-delimited body ends only at EOF: the server closes the
-            # connection to signal the end, so it can never be reused even if the
-            # keep-alive signal said otherwise (hyper reads to EOF + closes the
-            # read side rather than offering a clean reuse, conn.rs L458-489).
-            if resp_head.body_kind == "close":
-                keep_alive = False
-            # The response body owns the slot from here; it releases it when the
-            # body is fully read (or on aclose). A bodyless response frees it
-            # immediately.
-            body = H1ResponseBody(self, decoder, keep_alive=keep_alive)
+            # The response's own keep-alive contribution; `release_slot` ANDs it with
+            # "the request body was fully sent". A close-delimited body ends only at
+            # EOF (the server closes to signal end), so it can never be reused even if
+            # the keep-alive signal said otherwise (hyper conn.rs L458-489).
+            resp_keep_alive = resp_head.keep_alive and resp_head.body_kind != "close"
+            # The response body owns the slot from here; it releases it (and resolves
+            # the writer) when fully read or on aclose. A bodyless response has nothing
+            # to read, so resolve it now (in this async context) instead.
+            body = H1ResponseBody(self, decoder, keep_alive=resp_keep_alive)
+            if body._needs_eager_finish:
+                await body._finish()
             return Response(resp_head.status, resp_head.headers, body)
         except BaseException as exc:
+            await self._teardown_writer(cancel=True)
             self._fail(exc)
             self._slot.release()
             raise
@@ -190,14 +211,25 @@ class Connection(H1ConnectionBase):
         if self.error is None:
             self.error = ValueError(f"received {nbytes} unexpected bytes on an idle HTTP/1 connection")
 
-    def release_slot(self, keep_alive):
-        """Free the in-flight slot once a response is done. Reuse the connection if
-        keep-alive (hyper: `Reading::KeepAlive` -> `Conn` back to `Init`/idle,
-        conn.rs L378); otherwise it's unusable, so close it (`Reading::Closed`)."""
-        if not keep_alive:
+    async def release_slot(self, resp_keep_alive):
+        """Free the in-flight slot once the caller has finished the response. Reuse
+        the connection only if the response allowed keep-alive AND the request body
+        was fully sent — hyper reuses only once both the read and write halves reach
+        `KeepAlive` (conn.rs L370-400). If the writer is still running (the server
+        answered early and the caller didn't wait out the upload), the request is
+        incomplete on the wire, so cancel it and close; otherwise join it (instant)."""
+        fully_sent = self._writer_done is None or self._writer_done.is_set()
+        await self._teardown_writer(cancel=not fully_sent)
+        if not (resp_keep_alive and fully_sent):
             self._closed = True
             self._close_transport()
         self._slot.release()
+
+    async def close(self):
+        # A response body left unread (or an early exit) can leave the background
+        # writer still running; abort + join it before closing the transport.
+        await self._teardown_writer(cancel=True)
+        await super().close()
 
     def _fail(self, exc):
         if self.error is None and not isinstance(exc, ConnectionClosedError):

@@ -18,7 +18,9 @@ from httpunk._httpunk import (
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
 )
+from httpunk.h2.client import Connection
 from httpunk.h2.connection import PREFACE
+from httpunk.h2.stream import Stream
 from httpunk.http import HeaderMap
 
 
@@ -37,7 +39,13 @@ class _Server:
         self._wlock = Lock()  # window state
         self._slock = Lock()  # serialize socket writes
         self._window_evt = Event()
-        self._conn_window = _DEFAULT_WINDOW
+        self._conn_window = _DEFAULT_WINDOW  # raised by the client's initial WINDOW_UPDATE(0)
+        # The per-stream send window we may use toward the client = the client's
+        # advertised SETTINGS_INITIAL_WINDOW_SIZE (applied in `_process`), NOT the bare
+        # protocol default — else we'd under-send when the client advertises a larger
+        # window (e.g. hyper's 2 MB) and deadlock waiting for a WINDOW_UPDATE it has no
+        # reason to send.
+        self._client_initial_window = _DEFAULT_WINDOW
         self._stream_windows = {}
 
     async def serve(self, responder, reqscope):
@@ -63,6 +71,8 @@ class _Server:
     async def _process(self, frames, responder, reqscope):
         for f in frames:
             if isinstance(f, Settings) and not f.ack:
+                if f.initial_window_size is not None:
+                    self._client_initial_window = f.initial_window_size  # streams the client will accept
                 await self._send(self._codec.serialize_settings_ack())
             elif isinstance(f, WindowUpdate):
                 self.window_updates += 1
@@ -71,12 +81,12 @@ class _Server:
                         self._conn_window += f.increment
                     else:
                         self._stream_windows[f.stream_id] = (
-                            self._stream_windows.get(f.stream_id, _DEFAULT_WINDOW) + f.increment
+                            self._stream_windows.get(f.stream_id, self._client_initial_window) + f.increment
                         )
                 self._window_evt.set()
             elif isinstance(f, Headers):
                 self.headers_seen.append(f.stream_id)
-                self._stream_windows.setdefault(f.stream_id, _DEFAULT_WINDOW)
+                self._stream_windows.setdefault(f.stream_id, self._client_initial_window)
                 # A bodyless request carries END_STREAM on HEADERS (no trailing
                 # empty DATA frame), so the request is already complete here.
                 if f.end_stream:
@@ -104,7 +114,12 @@ class _Server:
                     break
                 await self._window_evt.wait()
             async with self._wlock:
-                n = min(self._conn_window, self._stream_windows.get(sid, _DEFAULT_WINDOW), chunk, len(body) - offset)
+                n = min(
+                    self._conn_window,
+                    self._stream_windows.get(sid, self._client_initial_window),
+                    chunk,
+                    len(body) - offset,
+                )
                 self._conn_window -= n
                 self._stream_windows[sid] -= n
             await self._send(self._codec.serialize_data(sid, body[offset : offset + n], end_stream=False))
@@ -112,7 +127,7 @@ class _Server:
         await self._send(self._codec.serialize_data(sid, b"", end_stream=True))
 
     def _available(self, sid):
-        return min(self._conn_window, self._stream_windows.get(sid, _DEFAULT_WINDOW))
+        return min(self._conn_window, self._stream_windows.get(sid, self._client_initial_window))
 
 
 @pytest.mark.tonio
@@ -120,7 +135,7 @@ async def test_streaming_large_body():
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     server = _Server(listener)
-    payload = bytes(200_000)  # > default 65535 window -> requires WINDOW_UPDATEs
+    payload = bytes(3 * 1024 * 1024)  # > the client's 2 MB stream window -> requires WINDOW_UPDATEs
 
     async def responder(srv, sid):
         await srv.send_response(sid, payload)
@@ -281,3 +296,26 @@ async def test_reset_wakes_flow_blocked_sender():
             with pytest.raises(StreamResetError):
                 await conn.request("POST", "/x", body=bytes(50))  # 50 > 5-byte window
         s.cancel()
+
+
+@pytest.mark.tonio
+async def test_reset_does_not_double_release_connection_window():
+    """When a stream is reset, `_reclaim_stream_capacity` returns its in-flight recv
+    data to the CONNECTION window. If the app then consumes the still-buffered bytes,
+    `release_capacity` must NOT credit the connection window a second time (F22).
+    Socket-free: a small amount stays below the WINDOW_UPDATE threshold, so nothing is
+    sent and the effect is visible directly on `_conn_recv.available()`."""
+    conn = Connection(None)  # constructed only; never connected
+    mgr = conn.streams
+    st = Stream(1, conn.backend, send_window=65535, recv_window=65535)
+    mgr._streams[1] = st
+
+    mgr._conn_recv.send_data(100)  # the pump consumed 100 conn-window bytes (recv_data)
+    st.recv_unreleased = 100  # ...delivered to the body queue, not yet read
+
+    await mgr._reclaim_stream_capacity(st)  # a reset returns the 100 to the conn window
+    assert st.recv_reclaimed is True
+    restored = mgr._conn_recv.available()
+
+    await mgr.release_capacity(st, 100)  # app reads the buffered bytes -> must be a no-op
+    assert mgr._conn_recv.available() == restored  # NOT credited twice

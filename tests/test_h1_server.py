@@ -247,6 +247,21 @@ async def test_server_http10_response_version_and_close():
 
 
 @pytest.mark.tonio
+async def test_server_no_100_continue_for_http10():
+    """An HTTP/1.0 request never gets an auto 100-continue, even with `Expect:
+    100-continue` — hyper gates the interim on version > 1.0 (conn.rs L311). F16."""
+    listener, host, port = await _listener()
+    async with scope() as s:
+        s.spawn(_echo_server(listener))
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"POST /x HTTP/1.0\r\nhost: x\r\ncontent-length: 3\r\nexpect: 100-continue\r\n\r\nabc")
+        data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
+        assert b"100 Continue" not in data  # F16: no interim for a 1.0 client
+        assert data.startswith(b"HTTP/1.0 200")  # the real response still arrives
+        s.cancel()
+
+
+@pytest.mark.tonio
 async def test_server_http10_keep_alive_header():
     """HTTP/1.0 + `Connection: keep-alive` → the response must echo `Connection:
     keep-alive` (hyper fix_keep_alive) so the 1.0 client keeps the connection."""
@@ -396,4 +411,20 @@ async def test_server_auto_error_on_malformed_head():
     req = await conn.next_request()
     assert req is None
     assert stub.sent.startswith(b"HTTP/1.1 400")  # automatic Bad Request
+    assert b"connection: close" in stub.sent.lower()  # F29: enforce_version adds it before closing
+    assert stub.closed
+
+
+@pytest.mark.tonio
+async def test_server_oversized_head_rejected_with_431():
+    """A request head that never completes and grows past hyper's max_buf_size is
+    rejected as `Parse::TooLarge` → auto 431 + close, not buffered without bound (F14)."""
+    oversized = b"GET / HTTP/1.1\r\nx: " + b"a" * 500_000  # > _MAX_HEAD_SIZE, no CRLFCRLF
+    stub = _StubTransport(oversized)
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    assert req is None
+    assert stub.sent.startswith(b"HTTP/1.1 431")  # Request Header Fields Too Large
+    assert b"connection: close" in stub.sent.lower()
     assert stub.closed

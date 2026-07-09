@@ -16,10 +16,11 @@ from tonio.colored.net import open_tcp_listeners
 
 from httpunk import H1Connection, H2Connection, H2Reason
 from httpunk._backend.tonio import TonioBackend
+from httpunk._httpunk import H2Codec, H2FrameGoAway, H2FramePing
 from httpunk.exceptions import H2Error
 from httpunk.h1.server import H1Server, ServerConnection as H1ServerConnection
 from httpunk.h2.server import H2Server, ServerConnection as H2ServerConnection
-from httpunk.h2.streams import _StreamError
+from httpunk.http import HeaderMap
 from httpunk.util import GracefulShutdown
 
 
@@ -40,6 +41,18 @@ class _IdleTransport:
         self.closed = True
 
 
+class _CapturingTransport(_IdleTransport):
+    """`_IdleTransport` that also records everything written, so a test can decode the
+    exact frames a primitive emitted."""
+
+    def __init__(self):
+        super().__init__()
+        self.sent = b""
+
+    async def send_all(self, data):
+        self.sent += data
+
+
 async def _listener():
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
@@ -58,18 +71,71 @@ async def test_shutdown_with_no_connections_returns_immediately():
     await GracefulShutdown().shutdown()  # must not hang
 
 
-# ----- h2 primitive: refuse new streams once graceful (non-blocking signal) -----
+# ----- h2 primitive: two-phase graceful (serve during phase 1, ignore after phase 2) -----
+
+
+def _req_frame(stream_id):
+    """A minimal valid request-HEADERS stub for `_recv_headers_target`."""
+    return SimpleNamespace(
+        stream_id=stream_id,
+        method="GET",
+        scheme="https",
+        authority="x",
+        path="/",
+        headers=HeaderMap(),
+        end_stream=True,
+        status=None,
+    )
 
 
 @pytest.mark.tonio
-async def test_h2_refuses_new_streams_once_graceful():
+async def test_h2_graceful_two_phase_serves_then_ignores():
+    """Two-phase graceful shutdown (h2). PHASE 1 (GOAWAY 2^31-1 + shutdown PING) keeps
+    ACCEPTING streams — a request already in flight when we started the shutdown is
+    served, not refused. PHASE 2 (the shutdown PING's ack lowers `_max_stream_id` to the
+    last-processed id) silently IGNORES streams opened above it, never REFUSED."""
     conn = H2ServerConnection(_IdleTransport(), max_concurrent_streams=100)
-    conn.streams._graceful = True  # as graceful_shutdown() sets after the GOAWAY
-    with pytest.raises(_StreamError) as excinfo:
-        conn.streams._recv_headers_target(SimpleNamespace(stream_id=1))
-    assert excinfo.value.stream_id == 1
-    assert excinfo.value.reason == int(H2Reason.REFUSED_STREAM)
-    assert conn.streams._last_processed_id == 0  # a refused stream must not count
+    conn.streams._graceful = True  # phase 1: _max_stream_id is still 2^31-1
+    assert conn.streams._recv_headers_target(_req_frame(1)) is None  # handled...
+    assert 1 in conn.streams._streams  # ...by ACCEPTING (served), not refusing
+    assert conn.streams._last_processed_id == 1
+
+    # phase 2, as `_on_pong` sets it: the final GOAWAY's last-processed id
+    conn.streams._shutdown_final = True
+    conn.streams._max_stream_id = conn.streams._last_processed_id  # 1
+    assert conn.streams._recv_headers_target(_req_frame(3)) is None  # id > max -> ignored
+    assert 3 not in conn.streams._streams
+    assert conn.streams._last_processed_id == 1  # an ignored stream must not count
+
+
+@pytest.mark.tonio
+async def test_h2_graceful_shutdown_emits_two_phase_goaways():
+    """The graceful primitive emits the two-phase frames (F7), decoded straight off the
+    bytes the connection wrote: PHASE 1 = GOAWAY(2^31-1, NO_ERROR) + a (non-ack) shutdown
+    PING; PHASE 2 (on the ping's ack) = GOAWAY(the real last-processed id)."""
+    t = _CapturingTransport()
+    conn = H2ServerConnection(t, max_concurrent_streams=100)
+    peer = H2Codec("client")  # decode what the server wrote
+
+    await conn.graceful_shutdown()  # phase 1
+    phase1 = peer.receive(t.sent)
+    t.sent = b""
+    goaways = [f for f in phase1 if isinstance(f, H2FrameGoAway)]
+    pings = [f for f in phase1 if isinstance(f, H2FramePing)]
+    assert len(goaways) == 1 and goaways[0].last_stream_id == 2**31 - 1
+    assert goaways[0].error_code == int(H2Reason.NO_ERROR)
+    assert len(pings) == 1 and not pings[0].ack  # a non-ack shutdown PING follows
+
+    # Idempotent: a second call emits nothing.
+    await conn.graceful_shutdown()
+    assert t.sent == b""
+
+    # Phase 2: the shutdown ping's ack, after having processed up to stream 5.
+    conn.streams._last_processed_id = 5
+    await conn._on_pong(SimpleNamespace(data=pings[0].data))
+    phase2 = [f for f in peer.receive(t.sent) if isinstance(f, H2FrameGoAway)]
+    assert len(phase2) == 1 and phase2[0].last_stream_id == 5  # the real last-processed id
+    assert conn.streams._shutdown_final is True
 
 
 # ----- h1 primitive: non-blocking signal (stop reuse + arm the idle-read release) -----
@@ -92,10 +158,11 @@ async def test_h1_graceful_is_a_nonblocking_signal():
 @pytest.mark.tonio
 async def test_h2_graceful_drains_open_connection_then_closes():
     # A full request/response completes on the (kept-open) connection; graceful
-    # shutdown then drains that now-idle h2 connection, sends GOAWAY, and closes it,
-    # so a subsequent request is refused. (In-flight *concurrent* completion is
-    # guaranteed structurally — the accept loop only ends once `_streams` is empty,
-    # see `_release_slot` — and refuse-new is covered by the direct unit test above.)
+    # shutdown then drains that now-idle h2 connection (two-phase: GOAWAY(2^31-1) +
+    # shutdown PING, then GOAWAY(last id) on the ack) and closes it, so a subsequent
+    # request fails. (In-flight *concurrent* completion is guaranteed structurally — the
+    # accept loop only ends once `_streams` is empty, see `_release_slot` — and the
+    # two-phase serve/ignore + frame emission are covered by the direct unit tests above.)
     listener, host, port = await _listener()
     graceful = GracefulShutdown()
 

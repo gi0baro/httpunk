@@ -41,7 +41,7 @@ mod trace;
 
 // hyper's `lib.rs` re-exports these at its crate root; reproduce them here so
 // the vendored files' `crate::{...}` paths resolve.
-pub use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version, header};
+pub use http::{header, HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 
 pub use self::error::{Error, Result};
 

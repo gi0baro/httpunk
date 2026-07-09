@@ -64,8 +64,17 @@ class _ServerProtocol(_AsyncioStream):
                 # HTTP/2 multiplexes — handle requests concurrently; the scope joins
                 # in-flight handlers as the connection winds down.
                 async with self._backend.scope() as handlers:
-                    async for request in server:
-                        handlers.spawn(self.handle(request))
+                    try:
+                        async for request in server:
+                            handlers.spawn(self.handle(request))
+                    except BaseException:
+                        # Connection error or force-close (serve task cancelled):
+                        # cancel in-flight handlers explicitly so a stuck one can't
+                        # wedge the scope join. The scope is join-only (matching
+                        # tonio), so this cancel() is what tears them down; a normal
+                        # end-of-stream falls through and joins them instead.
+                        handlers.cancel()
+                        raise
             else:
                 # HTTP/1 serves one request/response at a time (the driver won't
                 # yield the next until this one is answered) — handle serially.

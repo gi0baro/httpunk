@@ -46,7 +46,7 @@ async def connect(url, *, backend=None, alpn=_DEFAULT_ALPN, ssl_context=None):
     if scheme == "https":
         stream, selected = await backend.connect_tls(host, port, alpn=alpn, ssl_context=ssl_context)
         if selected == "h2":
-            return H2Connection(stream, authority=authority, backend=backend)
+            return H2Connection(stream, authority=authority, scheme="https", backend=backend)
         return H1Connection(stream, authority=authority, backend=backend)
 
     stream = await backend.connect_tcp(host, port)

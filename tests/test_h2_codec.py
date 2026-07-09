@@ -197,3 +197,17 @@ def test_large_headers_split_across_continuation():
     assert isinstance(frames[0], _httpunk.H2FrameHeaders)
     assert frames[0].stream_id == 1
     assert ("big", big) in frames[0].headers.items()
+
+
+def test_padded_data_exposes_flow_controlled_len_distinct_from_payload():
+    """A PADDED DATA frame: flow control counts payload + padding + the pad-length
+    byte, but the delivered `data` is only the payload. Regression guard for the
+    window-leak fix — the shim must expose `flow_controlled_len` so the driver
+    accounts windows on it, not on `len(data)` (h2 recv.rs `flow_controlled_len`)."""
+    codec = _httpunk.H2Codec("client")
+    payload = bytes([3]) + b"hello" + b"\x00\x00\x00"  # pad_len=3, data="hello", 3 pad bytes
+    (frame,) = codec.receive(_frame(0x00, 0x08, 1, payload))  # DATA, PADDED flag (0x08)
+    assert isinstance(frame, _httpunk.H2FrameData)
+    assert frame.data == b"hello"  # padding stripped from the delivered payload
+    assert frame.flow_controlled_len == len(payload)  # 9 = 5 (data) + 3 (pad) + 1 (pad-len byte)
+    assert frame.flow_controlled_len > len(frame.data)  # the overhead the driver must reclaim

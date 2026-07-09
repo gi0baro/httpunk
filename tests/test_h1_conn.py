@@ -258,6 +258,45 @@ async def test_early_response_during_upload():
 
 
 @pytest.mark.tonio
+async def test_early_response_does_not_truncate_upload():
+    """A keep-alive server answers before reading the body but keeps draining it: the
+    client must finish writing the request body — hyper's poll_loop does NOT truncate
+    the upload at head-arrival (dispatch.rs L172-211), it keeps writing (F11). The
+    response body is withheld until the whole request has been drained, so the client
+    cannot release the slot (and cancel the writer) until the upload has completed;
+    the old behavior cancelled the writer at head-arrival, so the server's drain would
+    hang forever waiting for bytes that were never sent."""
+    listener, host, port = await _listener()
+    done = Event()
+    body = b"x" * (5 * 1024 * 1024)  # > the socket send buffer, so the writer is mid-send
+    received = {}
+
+    async def server():
+        stream = await listener.accept()
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += await stream.receive_some(65536)
+        await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n")  # early HEAD only
+        drained = len(buf.split(b"\r\n\r\n", 1)[1])
+        while drained < len(body):
+            drained += len(await stream.receive_some(65536))
+        received["n"] = drained
+        await stream.send_all(b"ok")  # only now can the client's r.read() complete
+        stream.close()
+        done.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h1(host, port) as conn:
+            r = await conn.request("POST", "/up", headers={"host": f"{host}:{port}"}, body=body)
+            assert r.status == 200
+            assert await r.read() == b"ok"  # completes only after the full body was drained
+        await done.wait()
+        s.cancel()
+    assert received["n"] == len(body)  # the upload was NOT truncated at head-arrival
+
+
+@pytest.mark.tonio
 async def test_101_upgrade_tunnel():
     """A 101 Switching Protocols hands off the raw transport: the response carries
     an `H1Upgraded` the caller drives directly (hyper `Upgraded`). Bytes the server

@@ -61,8 +61,15 @@ class GracefulShutdown:
                     await server.graceful_shutdown()
 
                 inner.spawn(_trigger())
-                await serve(server)  # the connection future — driven to completion
-                inner.cancel()  # served without a shutdown: stop watching the signal
+                try:
+                    await serve(server)  # the connection future — driven to completion
+                finally:
+                    # Stop watching the signal however serve() ended. MUST be in a
+                    # `finally`: if serve() raises (a broken transport is routine),
+                    # skipping this leaves `_trigger` parked on the signal forever —
+                    # the scope join then hangs (tonio) and `_live` never drops. The
+                    # explicit cancel() is honored identically on both backends.
+                    inner.cancel()
         finally:
             with self._lock:
                 self._live -= 1

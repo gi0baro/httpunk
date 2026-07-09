@@ -158,14 +158,14 @@ class _AsyncioScope:
             task.cancel()
 
     async def __aexit__(self, exc_type, exc_value, exc_tb):
-        # Structured-concurrency teardown (matches tonio): if the body errored or was
-        # cancelled, cancel the still-running children so a stuck one can't wedge the
-        # exit; on a clean exit, just join (let in-flight children finish). Either way
-        # gather-and-swallow — a spawned task routes its own failures elsewhere (the
-        # read-pump via `_fail`), so exceptions here are teardown noise, not results.
-        if exc_type is not None:
-            for task in list(self._tasks):
-                task.cancel()
+        # Join-only teardown, matching tonio's scope exactly: `__aexit__` never
+        # cancels children on its own — a body exception still just JOINS the
+        # in-flight children (tonio's `_exit` aborts them only when the explicit
+        # `cancel()` flag is set). Callers that want children torn down on error
+        # must call `cancel()` themselves (h2 `close()`, h1 client, graceful watch,
+        # the h2 handler nursery in httpunk.asyncio all do). gather-and-swallow —
+        # a spawned task routes its own failures elsewhere, so exceptions surfacing
+        # here are teardown noise, not results.
         if self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
         return False

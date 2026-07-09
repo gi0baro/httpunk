@@ -78,8 +78,11 @@ class H1ResponseBody:
         # An upgrade has already handed the transport to `upgraded`; there is no
         # slot to release and no body to read.
         self._released = upgraded is not None
-        if upgraded is None and decoder.is_complete:  # bodyless (204, HEAD, CL: 0)
-            self._finish()
+        # A bodyless response (204, HEAD, CL: 0) has nothing to read, so its slot can
+        # be freed at once — but freeing it now must also tear down the request-body
+        # writer (`release_slot` is async since it may cancel/join that writer), which
+        # `__init__` can't await. `send_request` (async) drives this eager finish.
+        self._needs_eager_finish = upgraded is None and decoder.is_complete
 
     async def aiter_bytes(self):
         """Yield response body chunks as they arrive (decoded by `H1BodyDecoder`)."""
@@ -99,25 +102,27 @@ class H1ResponseBody:
                 else:
                     self._decoder.mark_eof()  # transport closed; decoder ends or errors
         except BaseException:
-            self._release(keep_alive=False)  # broken body -> connection unusable
+            await self._release(keep_alive=False)  # broken body -> connection unusable
             raise
         # Chunked trailers (if any) are available once the body is fully decoded.
         self.trailers = self._decoder.take_trailers()
-        self._finish()
+        await self._finish()
 
-    def _finish(self):
+    async def _finish(self):
         """The body is fully decoded. hyper's client validates the read buffer is
         empty before reusing the connection (`require_empty_read` ->
         `new_unexpected_message`, conn.rs L463-465): any bytes the server sent
         past the response body are an HTTP/1 protocol violation (a server may not
         send anything before the next request). Poison the connection rather than
         silently dropping them and reusing a corrupted stream (was G35)."""
+        if self._released:
+            return
         leftover = self._decoder.take_buffered()
         if leftover:
             self._driver.poison_unexpected(len(leftover))
-            self._release(keep_alive=False)
+            await self._release(keep_alive=False)
         else:
-            self._release()
+            await self._release()
 
     async def aclose(self):
         """Release the connection. If the body wasn't fully read, the connection
@@ -125,10 +130,10 @@ class H1ResponseBody:
         call more than once. (No-op for an upgraded response — the caller owns the
         tunnel via `Response.upgraded` and closes it there.)"""
         if not self._released:
-            self._release(keep_alive=False)
+            await self._release(keep_alive=False)
 
-    def _release(self, keep_alive=None):
+    async def _release(self, keep_alive=None):
         if self._released:
             return
         self._released = True
-        self._driver.release_slot(self._keep_alive if keep_alive is None else keep_alive)
+        await self._driver.release_slot(self._keep_alive if keep_alive is None else keep_alive)

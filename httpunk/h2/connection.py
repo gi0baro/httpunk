@@ -59,6 +59,11 @@ class H2ConnectionBase:
         self.codec = H2Codec(codec_role)
         self.error = None
         self._scope = self.backend.scope()
+        # A SEPARATE scope for background request-body writers (client full-duplex
+        # send, F6), kept out of the read-pump's `_scope`: writers are torn down
+        # first in `close()`, so the pump's scope stays pump-only and its teardown
+        # timing is unaffected (the pump's parked-recv close race is delicate).
+        self._write_scope = self.backend.scope()
         self._send_lock = self.backend.lock()
         self._transport = transport
         self._settings = settings  # SETTINGS sync (proto/settings.rs)
@@ -80,6 +85,11 @@ class H2ConnectionBase:
         """Client-only: unblock `connect()` once the peer's initial SETTINGS land
         (or the handshake fails). No-op on the server (no readiness gate)."""
 
+    async def _on_pong(self, frame):
+        """Received a PING ack (PONG). Base: ignore (we send no pings by default). The
+        server overrides it to drive phase 2 of graceful shutdown — its shutdown PING's
+        ack triggers the final GOAWAY with the real last-processed stream id."""
+
     # ----- lifecycle -----
 
     async def _begin(self, preface, settings):
@@ -87,7 +97,12 @@ class H2ConnectionBase:
         # scope, flush the connection preface (client: 24-byte preface; server:
         # empty) + our initial SETTINGS, and spawn the read-pump.
         await self._scope.__aenter__()
+        await self._write_scope.__aenter__()
         await self.send_frame(preface + self.codec.serialize_settings(**settings))
+        # Advertise our (larger-than-default) connection recv window right after the
+        # preface, before any peer data (h2 sends this initial WINDOW_UPDATE(0) as
+        # part of connection setup, from `initial_connection_window_size`).
+        await self.streams.raise_connection_window()
         self._scope.spawn(self._read_pump())
 
     async def close(self):
@@ -98,6 +113,11 @@ class H2ConnectionBase:
         # `__aexit__` waiting on a task that never wakes → the intermittent
         # teardown hang). The EOF also unblocks the peer's read loop. `cancel()`
         # then covers the rare case where the pump is parked elsewhere.
+        # Tear down background body writers FIRST (they're abortable — parked on flow
+        # control / send, not a native recv poll), so the pump's scope is pump-only
+        # when we close the transport + join it (keeping that delicate race baseline).
+        self._write_scope.cancel()
+        await self._write_scope.__aexit__(None, None, None)
         if self._transport is not None:
             self.backend.close_transport(self._transport)
         self._scope.cancel()
@@ -128,15 +148,26 @@ class H2ConnectionBase:
                         # Stream-level violation: RST just that stream, keep going.
                         await self.streams.reset_on_error(se.stream_id, se.reason)
                     except H2StreamError as se:
-                        # Stream-level error from the Rust state machine
-                        # (`Error::Reset`): args = (stream_id, reason, initiator).
-                        await self.streams.reset_on_error(se.args[0], se.args[1])
+                        # Stream-level error from the Rust state machine (`Error::Reset`):
+                        # args = (stream_id, reason, initiator). A REMOTE-initiated reset is
+                        # the peer's own RST_STREAM surfacing — h2 returns Ok and sends
+                        # nothing (connection.rs L448-462); echoing it back (and counting it
+                        # toward the ENHANCE_YOUR_CALM cap) is wrong. Only send library/user
+                        # resets (F25).
+                        if se.args[2] != "remote":
+                            await self.streams.reset_on_error(se.args[0], se.args[1])
         except H2Error as exc:
             # A protocol/flow violation we detected (bad state, HPACK/CONTINUATION,
             # flow control, bad preface): notify the peer with GOAWAY, then tear down.
             await self._send_goaway(exc)
             self._fail(exc)
-        except Exception as exc:  # transport error, etc. (cancellation is BaseException)
+        except OSError as exc:
+            # A raw transport error — an abrupt peer RST (ConnectionResetError), a
+            # broken pipe, etc. Surface it as a clean `ConnectionClosedError` (an
+            # H2Error) so callers see the protocol error type, not a bare socket errno
+            # (h2 maps Io errors this way; cf. the explicit EOF branch above).
+            self._fail(ConnectionClosedError(f"connection closed: {exc}"))
+        except Exception as exc:  # any other unexpected error (cancellation is BaseException)
             self._fail(exc)
 
     async def _send_goaway(self, exc):
@@ -159,7 +190,9 @@ class H2ConnectionBase:
         elif isinstance(frame, WindowUpdate):
             self.streams.recv_window_update(frame)
         elif isinstance(frame, Ping):
-            if not frame.ack:
+            if frame.ack:
+                await self._on_pong(frame)  # a PING ack — drives graceful phase 2 on the server
+            else:
                 await self.send_frame(self.codec.serialize_ping_ack(frame.data))
         elif isinstance(frame, GoAway):
             # Graceful: streams <= last_stream_id keep running; new/higher ones

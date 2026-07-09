@@ -40,7 +40,19 @@ from .stream import Stream
 from .streams import _RESET_STREAM_SECS, StreamManager, _StreamError
 
 
-_DEFAULT_MAX_CONCURRENT = 100  # our advertised SETTINGS_MAX_CONCURRENT_STREAMS
+_DEFAULT_MAX_CONCURRENT = 200  # hyper server SETTINGS_MAX_CONCURRENT_STREAMS (proto/h2/server.rs)
+_REMOTE_RESET_MAX = 20  # h2 proto/mod.rs DEFAULT_REMOTE_RESET_STREAM_MAX (Rapid-Reset cap)
+# hyper's HTTP/2 server profile (hyper `proto/h2/server.rs`): a 1 MB per-stream recv
+# window and 1 MB connection recv window (vs the 65535 default), 16 KB max frame size,
+# 16 KB max header-list size. We ship the hyper stack's tuned profile, not bare-h2
+# defaults (AUDIT-2026-07-09 F24). Unlike the old cut, the server does NOT advertise
+# ENABLE_PUSH (no upstream does — it is the client's setting to gate server push).
+_STREAM_WINDOW = 1024 * 1024
+_CONN_WINDOW = 1024 * 1024
+_MAX_FRAME_SIZE = 16 * 1024
+_MAX_HEADER_LIST_SIZE = 16 * 1024
+_MAX_STREAM_ID = 2**31 - 1  # h2 StreamId::MAX — the phase-1 graceful GOAWAY last-stream-id
+_SHUTDOWN_PING = b"SHUTDOWN"  # opaque payload of the graceful-shutdown PING (h2 Ping::SHUTDOWN)
 
 
 class ServerRequest:
@@ -107,9 +119,22 @@ class ServerStreamManager(StreamManager):
         self._our_initial_window_size = initial_window_size
         # Delivery queue of incoming ServerRequests to the accept loop.
         self._incoming_send, self._incoming_recv = conn.backend.queue()
-        # Graceful shutdown: once set, refuse new streams; when the last in-flight
-        # stream closes, end the accept loop (the connection's completion signal).
+        # Graceful shutdown (two-phase, h2). `_graceful` = shutdown started (phase 1).
+        # `_max_stream_id` = the last-stream-id from our most recent GOAWAY: 2^31-1 by
+        # default and through phase 1 (so streams in the ping-RTT window are served, not
+        # refused), lowered to `_last_processed_id` at phase 2, after which frames on
+        # higher streams are silently ignored. `_shutdown_final` marks phase 2 reached —
+        # only then does draining the last stream end the accept loop.
         self._graceful = False
+        self._max_stream_id = _MAX_STREAM_ID
+        self._shutdown_final = False
+        # Rapid-Reset defence (CVE-2023-44487): stream ids queued to the accept loop
+        # but not yet pulled by the app (`_pending_accept`), and the subset of those
+        # the peer has already RST'd (`_remote_reset_pending`). A reset pending-accept
+        # stream stops counting as "concurrent" but still holds a queue slot, so it
+        # gets a separate, smaller cap.
+        self._pending_accept = set()
+        self._remote_reset_pending = set()
 
     # ===== role hooks (h2 server `Peer` / `Dyn`) =====
 
@@ -139,15 +164,16 @@ class ServerStreamManager(StreamManager):
             if self._conn.backend.monotonic() - reset_at <= _RESET_STREAM_SECS:
                 return None  # recently reset -> swallow (else a late trailers tears down the conn)
             del self._reset_streams[sid]
+        # A stream opened after our final (phase-2) graceful GOAWAY is silently
+        # IGNORED, not refused (h2 recv_headers L431: id > max_stream_id is dropped).
+        # Through phase 1 `_max_stream_id` is still 2^31-1, so requests already in
+        # flight when we started the shutdown are served normally rather than refused.
+        if sid > self._max_stream_id:
+            return None
         # A new request: must be a strictly-increasing client-initiated (odd) id.
         if sid % 2 == 0 or sid <= self._last_recv_id:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"invalid new stream id {sid}")
         self._last_recv_id = sid
-        if self._graceful:
-            # Graceful shutdown in progress: refuse streams opened after our GOAWAY
-            # with REFUSED_STREAM (they must NOT count toward last_processed_id) —
-            # h2 refuses streams above the GOAWAY last-stream-id.
-            raise _StreamError(sid, int(H2Reason.REFUSED_STREAM))
         if len(self._streams) >= self._max_concurrent:
             # Over the limit we advertised: refuse just this stream with
             # REFUSED_STREAM (h2 recv.rs `open` L145 -> counts.rs
@@ -176,10 +202,23 @@ class ServerStreamManager(StreamManager):
             headers=frame.headers,
         )
         self._incoming_send.send(req)
+        self._pending_accept.add(sid)  # queued, not yet pulled by the app
         if frame.end_stream:
             # recv_open already closed the recv half; deliver EOF (no request body).
             st.body_send.send(None)
         return None  # the request head is fully handled
+
+    def _note_remote_reset(self, st):
+        # h2 recv.rs L886 (see hyperium/hyper#2877): a peer resetting a stream the app
+        # hasn't accepted yet leaves it in the accept queue consuming memory, but it
+        # no longer counts as a concurrent stream — so MAX_CONCURRENT_STREAMS can't
+        # gate a HEADERS+RST flood. A separate, smaller cap does; exceeding it is a
+        # connection GOAWAY(ENHANCE_YOUR_CALM). Reset-then-accept traffic decrements
+        # the count in `next_request`, so only a genuine flood trips it.
+        if st.id in self._pending_accept:
+            if len(self._remote_reset_pending) >= _REMOTE_RESET_MAX:
+                raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too_many_resets")
+            self._remote_reset_pending.add(st.id)
 
     def _on_fail(self):
         self._incoming_send.send(None)  # end the accept loop
@@ -193,11 +232,12 @@ class ServerStreamManager(StreamManager):
 
     def _release_slot(self, st):
         # The server tracks no MAX_CONCURRENT slot (it gates on len(self._streams)),
-        # but during a graceful shutdown the connection is "done" once the last
-        # in-flight stream closes — end the accept loop so the caller's serve loop
-        # returns and closes the connection (h2 `poll` returns Ready when drained
-        # after GOAWAY).
-        if self._graceful and not self._streams:
+        # but once graceful shutdown has reached PHASE 2 (the real last-id GOAWAY is
+        # out), the connection is "done" as soon as the last in-flight stream closes —
+        # end the accept loop so the caller's serve loop returns and closes (h2 `poll`
+        # returns Ready when drained after the final GOAWAY). Through phase 1 we keep
+        # serving (waiting on the ping RTT), so draining does NOT end the loop yet.
+        if self._shutdown_final and not self._streams:
             self._stop_accepting()
 
     # ===== sending responses (h2 server.rs SendResponse::send_response) =====
@@ -215,11 +255,29 @@ class ServerStreamManager(StreamManager):
         )
         if end_stream:
             self._close_stream(st)  # bodyless response — HEADERS closed the send half
-            return
-        await self.send_body(st, body)  # inherited: END_STREAM on the final DATA, then close
+        else:
+            await self.send_body(st, body)  # inherited: END_STREAM on the final DATA, then close
+        # h2 drops the request's RecvStream/SendStream once the response is sent.
+        # If the app never consumed the request body, that drop (a) RST_STREAM(
+        # NO_ERROR)s while the client is still sending so it stops — the nginx-compat
+        # rule, `maybe_cancel` (streams.rs L1601) — and (b) returns the in-flight
+        # body's connection-window capacity, `release_closed_capacity` (recv.rs L493).
+        # Without this an unread upload (early 401/403/413) pins the connection recv
+        # window and the client is never told to stop.
+        if not st.state.is_closed():  # recv half still open -> client still sending
+            await self.reset_stream(st, int(H2Reason.NO_ERROR))
+        else:  # fully closed but body may sit buffered-unread -> just reclaim its window
+            await self._reclaim_stream_capacity(st)
 
-    def next_request(self):
-        return self._incoming_recv.receive()
+    async def next_request(self):
+        req = await self._incoming_recv.receive()
+        if req is not None:
+            # Accepted: it no longer occupies the accept queue, so drop it from the
+            # Rapid-Reset bookkeeping (h2 `dec_num_remote_reset_streams`). If it was
+            # a reset pending-accept stream, this frees a slot in the cap.
+            self._pending_accept.discard(req._stream.id)
+            self._remote_reset_pending.discard(req._stream.id)
+        return req
 
 
 class ServerConnection(H2ConnectionBase):
@@ -229,26 +287,45 @@ class ServerConnection(H2ConnectionBase):
 
     def __init__(self, transport, *, backend=None, max_concurrent_streams, initial_window_size=None):
         self._max_concurrent_streams = max_concurrent_streams
-        self._initial_window_size = initial_window_size
+        # Our advertised per-stream recv window, defaulting to hyper's 1 MB.
+        self._initial_window_size = initial_window_size if initial_window_size is not None else _STREAM_WINDOW
         self._preface_buf = b""
         self._preface_ok = False
         super().__init__(
             transport,
             backend=backend,
             codec_role="server",
-            settings=Settings(LocalSettings(initial_window_size=initial_window_size)),
+            settings=Settings(
+                LocalSettings(
+                    initial_window_size=self._initial_window_size,
+                    max_frame_size=_MAX_FRAME_SIZE,
+                    max_header_list_size=_MAX_HEADER_LIST_SIZE,
+                )
+            ),
         )
         self.streams = ServerStreamManager(
-            self, max_concurrent_streams=max_concurrent_streams, initial_window_size=initial_window_size
+            self, max_concurrent_streams=max_concurrent_streams, initial_window_size=self._initial_window_size
         )
+        self.streams._conn_recv_target = _CONN_WINDOW  # raised via WINDOW_UPDATE(0) in _begin
+        # Grant a larger-than-default per-stream recv window immediately (see the
+        # client for the rationale): a client that has processed our SETTINGS uploads
+        # up to the advertised window before it ACKs, so we must already accept it.
+        if self._initial_window_size > self.streams._recv_init:
+            self.streams._recv_init = self._initial_window_size
 
     async def start(self):
         # h2: server.rs `handshake` (L365) — the server's connection preface is just
         # its SETTINGS (RFC 7540 §3.5); no readiness wait (it serves requests as they
-        # arrive). The client's 24-byte preface is stripped in `_before_frames`.
-        settings = {"enable_push": False, "max_concurrent_streams": self._max_concurrent_streams}
-        if self._initial_window_size is not None:
-            settings["initial_window_size"] = self._initial_window_size
+        # arrive). The client's 24-byte preface is stripped in `_before_frames`. The
+        # server does NOT advertise ENABLE_PUSH (it gates the *client's* push, which no
+        # upstream sends server-side); it does advertise its window/frame/header-list
+        # profile + MAX_CONCURRENT_STREAMS.
+        settings = {
+            "max_concurrent_streams": self._max_concurrent_streams,
+            "initial_window_size": self._initial_window_size,
+            "max_frame_size": _MAX_FRAME_SIZE,
+            "max_header_list_size": _MAX_HEADER_LIST_SIZE,
+        }
         await self._begin(b"", settings)
 
     def _before_frames(self, data):
@@ -278,17 +355,33 @@ class ServerConnection(H2ConnectionBase):
         return self.streams.next_request()
 
     async def graceful_shutdown(self):
-        # h2 `Connection::graceful_shutdown` (proto/connection.rs `go_away`): a
-        # non-blocking signal — send GOAWAY with NO_ERROR and our last-processed id
-        # so the client opens no new streams, and refuse any it opens anyway
-        # (`_recv_headers_target`). In-flight streams finish normally; once the last
-        # one closes the accept loop ends (`_release_slot`) and the caller's serve
-        # loop closes the connection. Does NOT wait or close here — the caller
-        # drives the connection to completion (mirrors hyper-util's coordinator).
+        # h2 `Connection::graceful_shutdown` (proto/connection.rs L620): a TWO-PHASE,
+        # non-blocking shutdown. PHASE 1 — send GOAWAY(2^31-1, NO_ERROR) ("going away,
+        # last-id not yet decided") + a shutdown PING, but keep accepting AND serving
+        # streams (`_max_stream_id` stays 2^31-1). This is the whole point of the two
+        # phases: a request the client already put on the wire before it saw our GOAWAY
+        # is served, not refused. PHASE 2 fires on the PING's ack (`_on_pong`). Idempotent;
+        # does NOT wait or close (the caller drives the connection to completion, mirroring
+        # hyper-util's coordinator).
+        if self.streams._graceful:
+            return
         self.streams._graceful = True
-        await self.send_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), int(H2Reason.NO_ERROR)))
+        await self.send_frame(self.codec.serialize_go_away(_MAX_STREAM_ID, int(H2Reason.NO_ERROR)))
+        await self.send_frame(self.codec.serialize_ping(_SHUTDOWN_PING))
+
+    async def _on_pong(self, frame):
+        # PHASE 2 of graceful shutdown: the shutdown PING's ack means the client has
+        # processed everything it had sent before our GOAWAY(2^31-1), so the highest
+        # stream we accepted (`_last_processed_id`) is the true last-processed id. Send
+        # the final GOAWAY with it; streams above it are now ignored (`_recv_headers_target`),
+        # and the connection closes once in-flight streams drain (h2 connection.rs L558-560).
+        if frame.data != _SHUTDOWN_PING or not self.streams._graceful or self.streams._shutdown_final:
+            return
+        self.streams._shutdown_final = True
+        self.streams._max_stream_id = self.streams._last_processed_id
+        await self.send_frame(self.codec.serialize_go_away(self.streams._last_processed_id, int(H2Reason.NO_ERROR)))
         if not self.streams._streams:
-            self.streams._stop_accepting()  # nothing in flight -> end the accept loop now
+            self.streams._stop_accepting()  # already drained -> end the accept loop now
 
 
 class H2Server(BaseServer):

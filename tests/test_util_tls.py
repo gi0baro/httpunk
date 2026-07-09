@@ -47,7 +47,14 @@ async def test_https_alpn_negotiates_h2(ca):
     host, port = listener.transport.socket.getsockname()[:2]
 
     async def server_side():
-        await _echo(await auto.serve(await listener.accept()))
+        # Echo the request's :scheme so the client can assert it. F1 regression
+        # guard: a TLS-dialed h2 connection must carry :scheme=https, not the old
+        # hardcoded "http".
+        server = await auto.serve(await listener.accept())
+        async with server:
+            async for req in server:
+                body = await req.read()
+                await req.respond(200, body=f"{req.scheme}:".encode() + body)
 
     async with scope() as s:
         s.spawn(server_side())
@@ -55,7 +62,7 @@ async def test_https_alpn_negotiates_h2(ca):
         assert isinstance(conn, H2Connection)  # ALPN chose h2 -> the "upgrade"
         async with conn:
             resp = await conn.request("POST", "/", body=b"hi")
-            assert await resp.read() == b"tls:hi"
+            assert await resp.read() == b"https:hi"  # :scheme=https, not "http"
 
 
 @pytest.mark.tonio

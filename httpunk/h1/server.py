@@ -38,6 +38,10 @@ _SHUTDOWN = object()  # sentinel: a graceful shutdown released an idle head-read
 # The interim response hyper's server auto-sends for `Expect: 100-continue`
 # (byte-identical to hyper conn.rs L413).
 _CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
+# Max bytes of an incomplete request head we'll buffer before rejecting it as
+# `Parse::TooLarge` (auto 431 + close) — hyper's `DEFAULT_MAX_BUFFER_SIZE`
+# (io.rs: 8192 + 4096*100). Bounds per-connection memory against a slow/oversized head.
+_MAX_HEAD_SIZE = 8192 + 4096 * 100
 
 
 def _connection_has(headers, token):
@@ -105,10 +109,13 @@ class ServerRequest:
         by `H1BodyDecoder`). Sends `100 Continue` first if the client asked for it."""
         if self._decoder.is_complete:
             return
-        if self._expect_continue and not self._continue_sent:
+        if self._expect_continue and not self._continue_sent and not self._responded and not self._http10:
             # The client is waiting for a 1xx before sending the body (RFC 9110
-            # §10.1.1). hyper auto-sends 100 Continue when the body is first polled
-            # (conn.rs L410-413, `Reading::Continue`); we do the same on first read.
+            # §10.1.1). hyper auto-sends 100 Continue when the body is first polled,
+            # but ONLY while `Writing::Init` (before any response) and ONLY for versions
+            # > HTTP/1.0 (conn.rs L409-415, L311). Sending it after `respond()` began
+            # (F15) would be parsed as the next response; sending it to a 1.0 client
+            # (F16) violates the spec hyper deliberately follows.
             self._continue_sent = True
             await self._conn.write(_CONTINUE)
         try:
@@ -267,7 +274,9 @@ class ServerConnection(H1ConnectionBase):
     async def _read_request_head(self, codec, initial=b""):
         # Feed any carried-over pipelined bytes before touching the transport, so a
         # request already sitting in the buffer parses without a (blocking) read.
+        buffered = 0
         if initial:
+            buffered += len(initial)
             head = codec.receive_request_head(initial)
             if head is not None:
                 return head
@@ -286,9 +295,16 @@ class ServerConnection(H1ConnectionBase):
             if not data:
                 return None  # EOF
             idle = False  # a request's bytes have started arriving — don't interrupt now
+            buffered += len(data)
             head = codec.receive_request_head(data)
             if head is not None:
                 return head
+            # Cap the still-incomplete head at hyper's max_buf_size (io.rs L202-205):
+            # once the buffered bytes reach the limit it's `Parse::TooLarge` -> auto 431
+            # + close. Without this a slow/never-terminating head stream is unbounded
+            # memory per connection (F14). `_error_status` maps "TooLarge" -> 431.
+            if buffered >= _MAX_HEAD_SIZE:
+                raise ValueError("message head is too large (Parse::TooLarge)")
 
     async def _read_or_shutdown(self, n):
         # Read the next head byte(s), or `_SHUTDOWN` if `graceful_shutdown()` fires
@@ -310,7 +326,11 @@ class ServerConnection(H1ConnectionBase):
         """Best-effort automatic error response (bodyless, `Connection: close`),
         then close — hyper `Server::on_error` + `write_head`."""
         try:
-            head = codec.serialize_response(status, None, keep_alive=False)
+            # hyper `close_read()`s before `on_error`, so `enforce_version` inserts
+            # `connection: close` on the auto response. The encoder adds no header
+            # itself, so inject it here (F29) rather than emitting a bare error head.
+            hdrs = self._negotiate_connection_header(HeaderMap(), keep_alive=False, http10=False, resp_close=False)
+            head = codec.serialize_response(status, hdrs, keep_alive=False)
             await self.transport.send_all(head)
             await self.transport.send_all(codec.serialize_end())
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
@@ -325,10 +345,13 @@ class ServerConnection(H1ConnectionBase):
         hdrs = headers if headers is None or isinstance(headers, HeaderMap) else HeaderMap(headers)
         content_length, chunked = self._body_framing(body)
         http10 = req._http10
-        # A protocol switch (101) or a 2xx to CONNECT turns the connection into a
-        # raw tunnel (Server::encode L378-384 forces is_last): no reuse, and we
-        # hand the transport to the caller afterwards.
-        is_switch = status == 101 or (req.method == "CONNECT" and 200 <= status < 300)
+        # A protocol switch turns the connection into a raw tunnel (Server::encode
+        # L378-384 forces is_last): no reuse, and we hand the transport to the caller.
+        # It's a switch only when the request actually asked for the upgrade — a 101
+        # whose request had no Upgrade (hyper `wants_upgrade`, role.rs), or a 2xx to a
+        # CONNECT. A 101 the request didn't ask for is NOT a tunnel; it still ends the
+        # connection (handled below), it just isn't handed off (F28).
+        is_switch = (status == 101 and req.is_upgrade) or (req.method == "CONNECT" and 200 <= status < 300)
         # An unknown-length HTTP/1.0 body is close-delimited (role.rs L907-910):
         # the connection must close so the client can detect end-of-body.
         close_delimited = http10 and chunked
@@ -336,6 +359,17 @@ class ServerConnection(H1ConnectionBase):
         # the body isn't close-delimited, and we're not switching protocols.
         resp_close = _connection_has(hdrs, "close")
         keep_alive = req.keep_alive and not resp_close and not close_delimited and not is_switch
+        if status == 101 and not is_switch:
+            keep_alive = False  # a 101 the request didn't ask for still ends the connection (hyper is_last)
+        # Graceful shutdown requested mid-request: this in-flight response must
+        # advertise `Connection: close` and the connection must not be reused —
+        # mirroring hyper's `disable_keep_alive` (KA::Disabled), whose in-flight
+        # response is encoded is_last with `connection: close` inserted by
+        # enforce_version (conn.rs L682-698). Without this, the `_reusable = keep_alive`
+        # below would overwrite the `False` graceful_shutdown() set and keep the
+        # connection alive.
+        if self._shutdown_evt.is_set():
+            keep_alive = False
         if not is_switch:
             # A switch keeps the app's `Connection: upgrade` verbatim; otherwise
             # make the wire header agree with the reuse/version decision.
