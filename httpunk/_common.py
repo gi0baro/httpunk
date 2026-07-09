@@ -46,8 +46,8 @@ class BaseClientConnection:
         await self._conn.close()
         return False
 
-    def request(self, method, target, *, headers=None, body=None):
-        return self.send_request(Request(method, target, headers=headers, body=body))
+    def request(self, method, target, *, headers=None, body=None, trailers=None):
+        return self.send_request(Request(method, target, headers=headers, body=body, trailers=trailers))
 
     def get(self, target, *, headers=None):
         return self.request("GET", target, headers=headers)

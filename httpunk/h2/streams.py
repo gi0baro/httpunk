@@ -163,21 +163,34 @@ class StreamManager:
 
     # ===== opening + sending (h2: streams.rs send_request/send_response, send.rs) =====
 
-    async def send_body(self, st, body):
+    async def send_body(self, st, body, trailers=None):
         """Stream a non-empty/None body, marking END_STREAM on the final DATA
         frame (h2 share.rs `SendStream::send_data` with `end_of_stream` -> send.rs
         `send_data`), then close the send half. A bodyless message never reaches
         here — its END_STREAM rode the HEADERS frame.
+
+        `trailers` (a HeaderMap) are sent as a trailing HEADERS frame carrying
+        END_STREAM AFTER the body, so the final DATA frame does NOT end the stream and
+        an empty body emits no DATA at all — HEADERS + trailers is a valid stream (F45).
         """
         # Normalize bytes / sync-iter / async-iter to a stream of chunks, holding
         # one back so END_STREAM lands on the last frame instead of a separate
-        # empty DATA frame.
+        # empty DATA frame. `body is None` only reaches here alongside trailers (a
+        # bodyless request that still ends on a trailing HEADERS frame) — skip the
+        # chunk loop then, since `aiter_body(None)` is not valid.
         pending = _UNSET
-        async for chunk in aiter_body(body):
-            if pending is not _UNSET:
+        if body is not None:
+            async for chunk in aiter_body(body):
+                if pending is not _UNSET:
+                    await self._send_data(st, pending, end_stream=False)
+                pending = bytes(chunk)
+        if trailers is not None:
+            # END_STREAM rides the trailing HEADERS frame, not the last DATA. Flush a
+            # final non-empty chunk (no ES); skip an empty trailing chunk entirely.
+            if pending is not _UNSET and pending:
                 await self._send_data(st, pending, end_stream=False)
-            pending = bytes(chunk)
-        if pending is _UNSET:
+            await self._send_trailers(st, trailers)
+        elif pending is _UNSET:
             # An iterable that yielded nothing -> a single empty END_STREAM DATA
             # frame. (`b""` yields one empty chunk, so it takes the else branch;
             # either way the wire result is one empty END_STREAM DATA frame.)
@@ -201,6 +214,15 @@ class StreamManager:
         sender (peer reset / connection failure), mirroring h2 `send_data`'s
         Inactive/UnexpectedFrameType errors."""
         return st.error or self._conn.error or StreamResetError(st.id, int(H2Reason.CANCEL))
+
+    async def _send_trailers(self, st, trailers):
+        # A trailing HEADERS frame (END_STREAM) sent after the body (h2 share.rs
+        # `SendStream::send_trailers` -> a trailers frame). Same is-send-streaming guard
+        # as `_send_data`: a peer RST between our last DATA and here transitions the
+        # state, and framing on a non-streaming stream must surface the reset (F45).
+        if not st.state.is_send_streaming():
+            raise self._send_stopped_error(st)
+        await self._conn.send_frame(self._conn.codec.serialize_trailers(st.id, trailers))
 
     async def _send_data(self, st, data, end_stream):
         # h2: proto/streams/send.rs `send_data` (L297) + the flow-control-gated

@@ -83,15 +83,22 @@ class H1ConnectionBase:
             return (len(body), False) if len(body) else (None, False)
         return None, True
 
-    async def _send_body(self, codec, body):
+    async def _send_body(self, codec, body, trailers=None):
         # Frame + write the message body via `codec` (the request codec on the
-        # client, the response codec on the server). A bodyless framing — `body is
-        # None`, or `codec.body_is_eof()` for a HEAD/204/304 response — writes no
-        # body: hyper never polls the body when the encoder is eof (conn.rs
-        # write_head), so the iterable is skipped and its side effects don't fire (G37).
-        if body is None or codec.body_is_eof():
+        # client, the response codec on the server). A bodyless framing —
+        # `codec.body_is_eof()` for a HEAD/204/304 response, or a `body is None`
+        # length/close framing — writes no body: hyper never polls the body when the
+        # encoder is eof (conn.rs write_head), so the iterable is skipped and its side
+        # effects don't fire (G37). `trailers` (a HeaderMap, chunked bodies only)
+        # terminate the body with a trailer block instead of a bare `0\r\n\r\n` (F45);
+        # a request with trailers is always chunked, so it is never `body_is_eof`.
+        if codec.body_is_eof():
             await self.transport.send_all(codec.serialize_end())
             return
-        async for chunk in aiter_body(body):
-            await self.transport.send_all(codec.serialize_data(bytes(chunk)))
-        await self.transport.send_all(codec.serialize_end())
+        if body is not None:
+            async for chunk in aiter_body(body):
+                await self.transport.send_all(codec.serialize_data(bytes(chunk)))
+        if trailers is not None:
+            await self.transport.send_all(codec.serialize_trailers(trailers))
+        else:
+            await self.transport.send_all(codec.serialize_end())

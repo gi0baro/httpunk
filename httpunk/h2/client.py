@@ -119,9 +119,7 @@ class ClientStreamManager(StreamManager):
                 # returns `StreamIdOverflow` and hyper surfaces it as a user error — the
                 # connection stays alive, this request just can't get an id (F43).
                 self._release_count()
-                raise H2ProtocolError(
-                    int(H2Reason.REFUSED_STREAM), "stream ID space exhausted (OverflowedStreamId)"
-                )
+                raise H2ProtocolError(int(H2Reason.REFUSED_STREAM), "stream ID space exhausted (OverflowedStreamId)")
             self._next_id += 2
             st = Stream(
                 stream_id,
@@ -291,7 +289,7 @@ class Connection(H2ConnectionBase):
     def _signal_ready(self):
         self._ready_evt.set()
 
-    def send_body_background(self, stream, body):
+    def send_body_background(self, stream, body, trailers=None):
         """Send the request body concurrently with (not before) the caller awaiting
         the response head. h2's `SendStream` (body) and `ResponseFuture` (head) are
         independent: an early response that resets the request body — the
@@ -302,14 +300,14 @@ class Connection(H2ConnectionBase):
         close teardown) so it can outlive `send_request` (full duplex) and is torn
         down when the connection closes (h2 client.rs: send_request returns the
         ResponseFuture immediately)."""
-        self._write_scope.spawn(self._write_body(stream, body))
+        self._write_scope.spawn(self._write_body(stream, body, trailers))
 
-    async def _write_body(self, stream, body):
+    async def _write_body(self, stream, body, trailers=None):
         # The stream may error/reset mid-send (413/redirect + RST_STREAM). That is
         # recorded on `stream.error` and surfaced when the response body is read; a
         # background writer has nowhere to propagate to, so suppress it here.
         with contextlib.suppress(Exception):
-            await self.streams.send_body(stream, body)
+            await self.streams.send_body(stream, body, trailers)
 
 
 class H2Connection(BaseClientConnection):
@@ -363,9 +361,11 @@ class H2Connection(BaseClientConnection):
         # for a zero-length body, so it also rides END_STREAM on HEADERS rather than a
         # separate empty DATA frame (F39). A HEAD request response never has a body
         # regardless of content-length.
-        end_stream = request.body is None or (
-            isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0
-        )
+        bodyless = request.body is None or (isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0)
+        # Trailers ride a trailing HEADERS frame (with END_STREAM) AFTER the body, so a
+        # request with trailers never ends the stream on the request HEADERS even when
+        # its body is empty/None (F45).
+        end_stream = bodyless and request.trailers is None
         is_head = request.method.upper() == "HEAD"
         stream = await self._conn.streams.open_stream(
             request.method,
@@ -375,7 +375,7 @@ class H2Connection(BaseClientConnection):
             is_head=is_head,
         )
         if not end_stream:
-            self._conn.send_body_background(stream, request.body)
+            self._conn.send_body_background(stream, request.body, request.trailers)
 
         await stream.headers_evt.wait()
         # h2's `ResponseFuture` resolves the moment the head arrives (client.rs

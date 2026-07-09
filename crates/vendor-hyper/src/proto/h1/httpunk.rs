@@ -12,7 +12,7 @@
 use std::task::{Context, Poll, Waker};
 
 use bytes::{Buf, Bytes, BytesMut};
-use http::{HeaderMap, Method, StatusCode, Uri, Version};
+use http::{HeaderMap, HeaderName, Method, StatusCode, Uri, Version};
 
 use super::decode::Decoder;
 use super::io::MemRead;
@@ -104,6 +104,21 @@ impl BodyEncoder {
             Err(_) => Err("request body shorter than declared Content-Length"),
         }
     }
+
+    /// Finish a chunked body with trailing headers: emits the terminating `0\r\n` +
+    /// the trailer block + `\r\n`. Only fields declared via
+    /// `into_chunked_with_trailing_fields` (the `Trailer` header) are sent (hyper's
+    /// `encode_trailers` filters + validates). Falls back to the plain terminator when
+    /// no declared trailer survives (or the body isn't chunked).
+    pub fn end_with_trailers(self, trailers: HeaderMap) -> Result<Vec<u8>, &'static str> {
+        match self.0.encode_trailers::<Bytes>(trailers, false) {
+            Some(mut buf) => {
+                let n = buf.remaining();
+                Ok(buf.copy_to_bytes(n).to_vec())
+            }
+            None => self.end(),
+        }
+    }
 }
 
 fn map_body(d: DecodedLength) -> BodyDecode {
@@ -130,6 +145,7 @@ pub fn encode_request(
     headers: HeaderMap,
     body: Option<Option<u64>>,
     http10: bool,
+    trailer_fields: Vec<HeaderName>,
 ) -> Result<(Vec<u8>, BodyEncoder), String> {
     // The request-target is serialized *as given* (hyper role.rs L1200 writes
     // `msg.head.subject.1` via its `Display`, "not enforced or validated" —
@@ -167,6 +183,14 @@ pub fn encode_request(
     };
     let mut dst = Vec::new();
     let encoder = Client::encode(enc, &mut dst).map_err(|e| format!("{e}"))?;
+    // Declare the chunked trailer fields (from the request's `Trailer` header) so the
+    // body may later emit them via `end_with_trailers`. A no-op unless the body is
+    // chunked (hyper `Encoder::into_chunked_with_trailing_fields`).
+    let encoder = if trailer_fields.is_empty() {
+        encoder
+    } else {
+        encoder.into_chunked_with_trailing_fields(trailer_fields)
+    };
     Ok((dst, BodyEncoder(encoder)))
 }
 

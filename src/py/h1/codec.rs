@@ -9,7 +9,7 @@
 //! body decode (`H1BodyDecoder`) — is all Rust, over the vendored hyper core.
 
 use bytes::BytesMut;
-use http::{Method, Uri};
+use http::{HeaderName, Method, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -70,7 +70,7 @@ impl H1Codec {
     /// `chunked` pick the body framing (mutually exclusive; neither = no body);
     /// the returned bytes are the head, and the body `Encoder` is retained for
     /// `serialize_data`/`serialize_end`.
-    #[pyo3(signature = (method, url, headers=None, *, http10=false, content_length=None, chunked=false))]
+    #[pyo3(signature = (method, url, headers=None, *, http10=false, content_length=None, chunked=false, trailer_fields=Vec::new()))]
     #[allow(clippy::too_many_arguments)] // faithful mirror of hyper's request Encode inputs
     fn serialize_request(
         &self,
@@ -81,6 +81,7 @@ impl H1Codec {
         http10: bool,
         content_length: Option<u64>,
         chunked: bool,
+        trailer_fields: Vec<String>,
     ) -> PyResult<Py<PyBytes>> {
         let m =
             Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
@@ -91,7 +92,14 @@ impl H1Codec {
         } else {
             content_length.map(Some)
         };
-        let (dst, encoder) = encode_request(m.clone(), uri, fields, body, http10)
+        // The declared chunked trailer field names (from the request's `Trailer`
+        // header) — the body may then emit them via `serialize_trailers` (F45).
+        let trailers = trailer_fields
+            .iter()
+            .map(|n| HeaderName::from_bytes(n.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| value_err("invalid trailer field name", e))?;
+        let (dst, encoder) = encode_request(m.clone(), uri, fields, body, http10, trailers)
             .map_err(|e| value_err("failed to encode request", e))?;
         let mut st = self.inner.lock().unwrap();
         st.req_method = Some(m);
@@ -118,6 +126,20 @@ impl H1Codec {
         let mut st = self.inner.lock().unwrap();
         let out = match st.encoder.take() {
             Some(enc) => enc.end().map_err(PyValueError::new_err)?,
+            None => Vec::new(),
+        };
+        Ok(PyBytes::new(py, &out).unbind())
+    }
+
+    /// Finish a chunked body with trailing headers instead of a bare terminator (F45).
+    /// Only the fields declared as trailer fields at `serialize_request` (the `Trailer`
+    /// header) are emitted; the rest are dropped by hyper's `encode_trailers`.
+    fn serialize_trailers(&self, py: Python<'_>, trailers: &HeaderMap) -> PyResult<Py<PyBytes>> {
+        let mut st = self.inner.lock().unwrap();
+        let out = match st.encoder.take() {
+            Some(enc) => enc
+                .end_with_trailers(trailers.snapshot())
+                .map_err(PyValueError::new_err)?,
             None => Vec::new(),
         };
         Ok(PyBytes::new(py, &out).unbind())

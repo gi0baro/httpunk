@@ -432,3 +432,56 @@ async def test_server_goaway_on_rst_stream_zero():
         assert ga.error_code == H2Reason.PROTOCOL_ERROR
         transport.close()
         s.cancel()
+
+
+@pytest.mark.tonio
+async def test_h2_request_trailers_round_trip():
+    """Request trailers (F45): the client sends them as a trailing HEADERS frame
+    (END_STREAM) after the DATA frames; the H2Server decodes them into `req.trailers`."""
+    listener, host, port = await _listener()
+    seen = {}
+
+    async def server():
+        transport = await listener.accept()
+        async with H2Server(transport) as srv:
+            async for req in srv:
+                seen["body"] = await req.read()
+                seen["trailers"] = req.trailers
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("POST", "/", body=b"data", trailers={"x-checksum": "abc"})
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+    assert seen["body"] == b"data"
+    assert seen["trailers"] is not None
+    assert seen["trailers"].get("x-checksum") == b"abc"
+
+
+@pytest.mark.tonio
+async def test_h2_bodyless_request_with_trailers():
+    """A request with trailers but NO body still ends on the trailing HEADERS frame
+    (HEADERS + trailers, no DATA) rather than END_STREAM on the request HEADERS (F45)."""
+    listener, host, port = await _listener()
+    seen = {}
+
+    async def server():
+        transport = await listener.accept()
+        async with H2Server(transport) as srv:
+            async for req in srv:
+                seen["body"] = await req.read()
+                seen["trailers"] = req.trailers
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("POST", "/", trailers={"x-done": "1"})
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+    assert seen["body"] == b""
+    assert seen["trailers"].get("x-done") == b"1"

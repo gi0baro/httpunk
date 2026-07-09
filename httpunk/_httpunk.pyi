@@ -106,9 +106,12 @@ class H1Codec:
         http10: bool = ...,
         content_length: int | None = ...,
         chunked: bool = ...,
+        trailer_fields: list[str] = ...,
     ) -> bytes:
         """Serialize a request head (request line + headers); retains the body
-        encoder for `serialize_data`/`serialize_end`."""
+        encoder for `serialize_data`/`serialize_end`/`serialize_trailers`.
+        `trailer_fields` declares chunked trailer field names (the `Trailer` header)
+        that `serialize_trailers` may then emit."""
 
     def serialize_response(
         self,
@@ -128,6 +131,10 @@ class H1Codec:
 
     def serialize_end(self) -> bytes:
         """Finish the body: the chunked terminator, or empty for content-length."""
+
+    def serialize_trailers(self, trailers: HeaderMap) -> bytes:
+        """Finish a chunked body with a trailer block (the declared `trailer_fields`)
+        instead of a bare terminator; falls back to `serialize_end` if none apply."""
 
     def body_is_eof(self) -> bool:
         """True when the in-flight framing carries no body (bodyless response, or
@@ -325,6 +332,9 @@ class H2Codec:
         headers: HeaderMap | None = ...,
         end_stream: bool = ...,
     ) -> bytes: ...
+    def serialize_trailers(self, stream_id: int, trailers: HeaderMap) -> bytes:
+        """A trailing HEADERS frame (no pseudo-headers, END_STREAM) — request/response
+        trailers after the DATA frames."""
     def serialize_data(self, stream_id: int, data: bytes, end_stream: bool = ...) -> bytes: ...
     def serialize_window_update(self, stream_id: int, increment: int) -> bytes: ...
     def serialize_ping(self, payload: bytes) -> bytes:

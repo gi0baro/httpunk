@@ -579,6 +579,22 @@ impl H2Codec {
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
+    /// A trailing HEADERS frame (no pseudo-headers, END_STREAM set) — request/response
+    /// trailers sent after the DATA frames (h2 `frame::Headers::trailers`) (F45).
+    fn serialize_trailers(
+        &self,
+        py: Python<'_>,
+        stream_id: u32,
+        trailers: &HeaderMap,
+    ) -> PyResult<Py<PyBytes>> {
+        let fields = trailers.snapshot();
+        let hframe = frame::Headers::trailers(frame::StreamId::from(stream_id), fields);
+        let mut c = self.inner.lock().unwrap();
+        let max = c.send_max_frame_size;
+        let dst = encode_headers_frame(&mut c.encoder, hframe, max);
+        Ok(PyBytes::new(py, &dst).unbind())
+    }
+
     #[pyo3(signature = (stream_id, data, end_stream=false))]
     fn serialize_data(
         &self,

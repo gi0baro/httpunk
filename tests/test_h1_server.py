@@ -526,3 +526,59 @@ def test_negotiate_connection_header_replaces_not_appends():
     keeping.add("connection", "x-foo")  # a custom token on a 1.0 keep-alive response
     out2 = ServerConnection._negotiate_connection_header(keeping, keep_alive=True, http10=True, resp_close=False)
     assert out2.get_all("connection") == [b"keep-alive"]  # replaced x-foo
+
+
+@pytest.mark.tonio
+async def test_h1_request_trailers_round_trip():
+    """Request trailers (F45): the client sends them as chunked trailers after the body
+    (forcing chunked framing + a `Trailer` header); the H1Server decodes them into
+    `req.trailers`."""
+    listener, host, port = await _listener()
+    seen = {}
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                seen["body"] = await req.read()
+                seen["trailers"] = req.trailers
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            resp = await conn.request(
+                "POST", "/", headers={"host": f"{host}:{port}"}, body=b"data", trailers={"x-checksum": "abc"}
+            )
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+    assert seen["body"] == b"data"
+    assert seen["trailers"] is not None
+    assert seen["trailers"].get("x-checksum") == b"abc"
+
+
+@pytest.mark.tonio
+async def test_h1_bodyless_request_with_trailers():
+    """A request with trailers but no body still sends a (chunked, empty) body + trailer
+    block rather than a bodyless framing (F45)."""
+    listener, host, port = await _listener()
+    seen = {}
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                seen["body"] = await req.read()
+                seen["trailers"] = req.trailers
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            resp = await conn.request("POST", "/", headers={"host": f"{host}:{port}"}, trailers={"x-done": "1"})
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+    assert seen["body"] == b""
+    assert seen["trailers"].get("x-done") == b"1"

@@ -528,9 +528,7 @@ async def test_content_length_over_19_digits_rejected():
     async def server():
         stream, codec, frames = await _accept_handshake(listener)
         sid = await _read_until_request(stream, codec, frames)
-        await stream.send_all(
-            codec.serialize_response_headers(sid, 200, HeaderMap([("content-length", "1" * 20)]))
-        )
+        await stream.send_all(codec.serialize_response_headers(sid, 200, HeaderMap([("content-length", "1" * 20)])))
         while await stream.receive_some(65536):
             pass
 

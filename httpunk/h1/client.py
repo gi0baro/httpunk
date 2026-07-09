@@ -94,7 +94,7 @@ class Connection(H1ConnectionBase):
         if self._closed:
             raise ConnectionClosedError("connection closed")
 
-    async def send_request(self, method, url, headers, body):
+    async def send_request(self, method, url, headers, body, trailers=None):
         # hyper: client/conn/http1.rs `SendRequest::send_request` (L213) — writes
         # the head+body, reads the response. The caller must have supplied `Host`
         # (L192); we do not add it. `Conn` is busy for the duration (conn.rs L293),
@@ -135,14 +135,28 @@ class Connection(H1ConnectionBase):
                 # not appended — matching hyper's `insert` so no duplicate token (F58).
                 headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
                 tokens = {
-                    part.strip().lower()
-                    for value in headers.get_all("connection")
-                    for part in bytes(value).split(b",")
+                    part.strip().lower() for value in headers.get_all("connection") for part in bytes(value).split(b",")
                 }
                 if b"keep-alive" not in tokens and b"close" not in tokens:
                     headers["connection"] = "keep-alive"
+            # Request trailers (F45) require a chunked body (RFC 9112 §7.1.2): force
+            # chunked framing and declare the fields in the `Trailer` header, which hyper
+            # reads to allow-list what `serialize_trailers` may emit after the body.
+            trailer_fields = []
+            if trailers is not None:
+                headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
+                content_length, chunked = None, True
+                trailer_fields = list(trailers.keys())
+                if "trailer" not in headers:
+                    headers["trailer"] = ", ".join(trailer_fields)
             head = codec.serialize_request(
-                method, url, headers, http10=http10, content_length=content_length, chunked=chunked
+                method,
+                url,
+                headers,
+                http10=http10,
+                content_length=content_length,
+                chunked=chunked,
+                trailer_fields=trailer_fields,
             )
             # hyper's `poll_loop` drives reads and writes INDEPENDENTLY each turn
             # (dispatch.rs L172-211): a response head can arrive while the request
@@ -159,7 +173,7 @@ class Connection(H1ConnectionBase):
             write_error = []
             scope = self.backend.scope()
             await scope.__aenter__()
-            scope.spawn(self._write_request(codec, head, body, body_done, write_error))
+            scope.spawn(self._write_request(codec, head, body, body_done, write_error, trailers))
             self._writer_scope, self._writer_done = scope, body_done
             try:
                 resp_head = await self._read_head(codec, write_error)
@@ -201,7 +215,7 @@ class Connection(H1ConnectionBase):
             self._slot.release()
             raise
 
-    async def _write_request(self, codec, head, body, body_done, write_error):
+    async def _write_request(self, codec, head, body, body_done, write_error, trailers=None):
         # Write the head then the framed body. A write failure (e.g. the server
         # closed the read side after answering early) must not mask a response
         # that did arrive: record it so `_read_head` can still deliver the head,
@@ -209,7 +223,7 @@ class Connection(H1ConnectionBase):
         # (BaseException) propagates so the scope can unwind cleanly.
         try:
             await self.transport.send_all(head)
-            await self._send_body(codec, body)
+            await self._send_body(codec, body, trailers)
             body_done.set()
         except Exception as exc:  # transport write error, not cancellation
             write_error.append(exc)
@@ -303,4 +317,4 @@ class H1Connection(BaseClientConnection):
         authority-form for CONNECT. The caller supplies the ``Host`` header (we
         never auto-add it), exactly like hyper's `client::conn::http1`.
         """
-        return self._conn.send_request(request.method, request.target, request.headers, request.body)
+        return self._conn.send_request(request.method, request.target, request.headers, request.body, request.trailers)

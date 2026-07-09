@@ -18,15 +18,24 @@ class Request:
     a connection resolves a bare path against its own authority. `headers` is
     normalized to a `HeaderMap` (accepts None, a mapping, an iterable of pairs,
     or a `HeaderMap`). `body` is None, `bytes`, or a (sync/async) iterable of `bytes`.
+
+    `trailers` (optional) are header fields sent AFTER the body — chunked trailers on
+    HTTP/1, a trailing HEADERS frame on HTTP/2. Static (a `HeaderMap`/mapping, known
+    before sending); setting them forces a chunked body on HTTP/1 and auto-declares the
+    fields in the `Trailer` request header. Trailers whose value depends on the streamed
+    content are not expressible with this static field.
     """
 
-    __slots__ = ("method", "target", "headers", "body")
+    __slots__ = ("method", "target", "headers", "body", "trailers")
 
-    def __init__(self, method, target, *, headers=None, body=None):
+    def __init__(self, method, target, *, headers=None, body=None, trailers=None):
         self.method = method
         self.target = target
         self.headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
         self.body = body
+        self.trailers = (
+            None if trailers is None else (trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers))
+        )
 
     def __repr__(self):
         return f"Request(method={self.method!r}, target={self.target!r})"
