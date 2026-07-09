@@ -1,0 +1,131 @@
+name: test
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+permissions: {}
+
+jobs:
+  linux:
+    name: linux (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+        - '3.10'
+        - '3.11'
+        - '3.12'
+        - '3.13'
+        - '3.14'
+        - '3.14t'
+        - '3.15'
+        - '3.15t'
+        - pypy3.11
+
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: false
+    - name: Install
+      env:
+        UV_PYTHON: ${{ matrix.python-version }}
+      run: |
+        uv python install "$UV_PYTHON"
+        uv venv .venv
+        uv sync --group all
+        uv run --no-sync maturin develop --uv
+    - name: Test
+      run: |
+        source .venv/bin/activate
+        make test
+
+  macos:
+    name: macos (${{ matrix.python-version }})
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        allocator: [jemalloc]
+        python-version:
+        - '3.10'
+        - '3.11'
+        - '3.12'
+        - '3.13'
+        - '3.14'
+        - '3.14t'
+        - '3.15'
+        - '3.15t'
+
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: false
+    - name: Install
+      env:
+        UV_PYTHON: ${{ matrix.python-version }}
+      run: |
+        uv python install "$UV_PYTHON"
+        uv venv .venv
+        uv sync --group all
+        uv run --no-sync maturin develop --uv
+    - name: Test
+      run: |
+        source .venv/bin/activate
+        make test
+
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+        - '3.10'
+        - '3.11'
+        - '3.12'
+        - '3.13'
+        - '3.14'
+        - '3.15'
+
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: false
+    - name: Install
+      env:
+        UV_PYTHON: ${{ matrix.python-version }}
+      run: |
+        uv python install "$UV_PYTHON"
+        uv venv .venv
+        uv sync --group all
+        uv run --no-sync maturin develop --uv
+    - name: Test
+      run: |
+        uv run --no-sync pytest -v tests
