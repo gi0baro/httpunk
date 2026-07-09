@@ -34,6 +34,7 @@ from .share import H1Upgraded
 
 
 _READ_SIZE = 65536
+_SHUTDOWN = object()  # sentinel: a graceful shutdown released an idle head-read
 # The interim response hyper's server auto-sends for `Expect: 100-continue`
 # (byte-identical to hyper conn.rs L413).
 _CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
@@ -154,9 +155,20 @@ class ServerConnection(H1ConnectionBase):
         self._reusable = True  # keep-alive: may we read another request after this one?
         self._codec = None  # current request/response codec
         self._current = None  # current ServerRequest (for body draining)
+        self._shutdown_evt = self.backend.event()  # set by graceful_shutdown()
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
+
+    async def graceful_shutdown(self):
+        # h1 `Connection::graceful_shutdown` (hyper Dispatcher `disable_keep_alive`):
+        # a non-blocking signal — stop reusing the connection so the accept loop
+        # ends after the current request (`next_request` returns None once
+        # `_reusable` is False), and wake a read parked idly between requests
+        # (`_shutdown_evt`, checked in the head-read). The caller drives the serve
+        # loop to completion and closes; nothing is awaited/closed here.
+        self._reusable = False
+        self._shutdown_evt.set()
 
     def mark_unusable(self):
         self._reusable = False
@@ -259,13 +271,40 @@ class ServerConnection(H1ConnectionBase):
             head = codec.receive_request_head(initial)
             if head is not None:
                 return head
+        idle = not initial  # no bytes of this request seen yet -> a graceful shutdown may end it
         while True:
-            data = await self.transport.receive_some(_READ_SIZE)
+            if idle:
+                # Between requests: race the read against a graceful-shutdown signal
+                # so an idle keep-alive connection completes promptly (tonio can't
+                # wake a parked recv from another task; hyper's poll re-checks
+                # `should_read` and completes instead of reading).
+                data = await self._read_or_shutdown(_READ_SIZE)
+                if data is _SHUTDOWN:
+                    return None
+            else:
+                data = await self.transport.receive_some(_READ_SIZE)
             if not data:
                 return None  # EOF
+            idle = False  # a request's bytes have started arriving — don't interrupt now
             head = codec.receive_request_head(data)
             if head is not None:
                 return head
+
+    async def _read_or_shutdown(self, n):
+        # Read the next head byte(s), or `_SHUTDOWN` if `graceful_shutdown()` fires
+        # first. The backend's `select` cancels the losing branch, so the parked read
+        # is cleanly dropped when shutdown wins.
+        if self._shutdown_evt.is_set():
+            return _SHUTDOWN
+
+        async def _recv():
+            return await self.transport.receive_some(n)
+
+        async def _await_shutdown():
+            await self._shutdown_evt.wait()
+            return _SHUTDOWN
+
+        return await self.backend.select(_recv(), _await_shutdown())
 
     async def _send_error(self, codec, status):
         """Best-effort automatic error response (bodyless, `Connection: close`),

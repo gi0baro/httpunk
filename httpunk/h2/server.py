@@ -107,6 +107,9 @@ class ServerStreamManager(StreamManager):
         self._our_initial_window_size = initial_window_size
         # Delivery queue of incoming ServerRequests to the accept loop.
         self._incoming_send, self._incoming_recv = conn.backend.queue()
+        # Graceful shutdown: once set, refuse new streams; when the last in-flight
+        # stream closes, end the accept loop (the connection's completion signal).
+        self._graceful = False
 
     # ===== role hooks (h2 server `Peer` / `Dyn`) =====
 
@@ -140,6 +143,11 @@ class ServerStreamManager(StreamManager):
         if sid % 2 == 0 or sid <= self._last_recv_id:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"invalid new stream id {sid}")
         self._last_recv_id = sid
+        if self._graceful:
+            # Graceful shutdown in progress: refuse streams opened after our GOAWAY
+            # with REFUSED_STREAM (they must NOT count toward last_processed_id) —
+            # h2 refuses streams above the GOAWAY last-stream-id.
+            raise _StreamError(sid, int(H2Reason.REFUSED_STREAM))
         if len(self._streams) >= self._max_concurrent:
             # Over the limit we advertised: refuse just this stream with
             # REFUSED_STREAM (h2 recv.rs `open` L145 -> counts.rs
@@ -175,6 +183,22 @@ class ServerStreamManager(StreamManager):
 
     def _on_fail(self):
         self._incoming_send.send(None)  # end the accept loop
+
+    def _stop_accepting(self):
+        # End the accept loop after a graceful drain: unlike a peer-driven close
+        # (where the read-pump's EOF path calls `_on_fail`), a server-initiated
+        # shutdown must itself signal "no more requests" so `next_request` returns
+        # None and the caller's `async for` exits.
+        self._incoming_send.send(None)
+
+    def _release_slot(self, st):
+        # The server tracks no MAX_CONCURRENT slot (it gates on len(self._streams)),
+        # but during a graceful shutdown the connection is "done" once the last
+        # in-flight stream closes — end the accept loop so the caller's serve loop
+        # returns and closes the connection (h2 `poll` returns Ready when drained
+        # after GOAWAY).
+        if self._graceful and not self._streams:
+            self._stop_accepting()
 
     # ===== sending responses (h2 server.rs SendResponse::send_response) =====
 
@@ -252,6 +276,19 @@ class ServerConnection(H2ConnectionBase):
         # Exposed on the driver (like the h1 server) so the `BaseServer` accept
         # iterator is protocol-uniform.
         return await self.streams.next_request()
+
+    async def graceful_shutdown(self):
+        # h2 `Connection::graceful_shutdown` (proto/connection.rs `go_away`): a
+        # non-blocking signal — send GOAWAY with NO_ERROR and our last-processed id
+        # so the client opens no new streams, and refuse any it opens anyway
+        # (`_recv_headers_target`). In-flight streams finish normally; once the last
+        # one closes the accept loop ends (`_release_slot`) and the caller's serve
+        # loop closes the connection. Does NOT wait or close here — the caller
+        # drives the connection to completion (mirrors hyper-util's coordinator).
+        self.streams._graceful = True
+        await self.send_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), int(H2Reason.NO_ERROR)))
+        if not self.streams._streams:
+            self.streams._stop_accepting()  # nothing in flight -> end the accept loop now
 
 
 class H2Server(BaseServer):

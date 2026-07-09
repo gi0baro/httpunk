@@ -33,7 +33,7 @@ include = [
 # byte-identical) and is excluded from the main crate's fmt/clippy. See
 # THIRD-PARTY.md and PLAN.md §4.
 [workspace]
-members = ["crates/vendor-h2", "crates/vendor-hyper"]
+members = ["crates/vendor-h2", "crates/vendor-hyper", "crates/vendor-hyper-util"]
 
 [lib]
 name = "_httpunk"
@@ -55,6 +55,8 @@ http = "1.1"
 # to upstream, and fmt/clippy-excludable via `cargo fmt -p _httpunk`).
 vendor-h2 = { path = "crates/vendor-h2" }
 vendor-hyper = { path = "crates/vendor-hyper", features = ["client", "server", "http1"] }
+# Vendored hyper-util proxy matcher (pure sans-IO selection logic; `from_system` off).
+vendor-hyper-util = { path = "crates/vendor-hyper-util" }
 # NOT compiled: the crates.io `h2`/`hyper` — vendored into crates/vendor-*/ (see
 # THIRD-PARTY.md). Optional + gated behind the never-enabled `_audit` feature so
 # the pinned versions land in Cargo.lock for `cargo audit` / Dependabot advisory

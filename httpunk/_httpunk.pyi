@@ -394,6 +394,36 @@ class H2FlowControl:
 # HTTP/2 error codes  (src/py/h2/mod.rs — RFC 7540 §7)
 # ===========================================================================
 
+# ===========================================================================
+# Proxy matcher  (src/py/proxy.rs — vendored hyper-util client::proxy::matcher)
+# ===========================================================================
+
+class ProxyMatcher:
+    """Selects the proxy for a destination URL (vendored hyper-util matcher).
+    Surfaced as `httpunk.util.proxy.Matcher`."""
+
+    @staticmethod
+    def from_env() -> ProxyMatcher: ...
+    @staticmethod
+    def from_parts(
+        *,
+        all: str | None = ...,
+        http: str | None = ...,
+        https: str | None = ...,
+        no: str | None = ...,
+    ) -> ProxyMatcher: ...
+    def intercept(self, url: str) -> ProxyIntercept | None: ...
+
+class ProxyIntercept:
+    """A selected proxy: its URL plus any auth. Surfaced as
+    `httpunk.util.proxy.Intercept`."""
+
+    @property
+    def uri(self) -> str: ...
+    def basic_auth(self) -> str | None: ...
+    def raw_auth(self) -> tuple[str, str] | None: ...
+    def __repr__(self) -> str: ...
+
 class H2Reason(enum.IntEnum):
     NO_ERROR = 0
     PROTOCOL_ERROR = 1

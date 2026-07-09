@@ -99,7 +99,7 @@ class H2ConnectionBase:
         # teardown hang). The EOF also unblocks the peer's read loop. `cancel()`
         # then covers the rare case where the pump is parked elsewhere.
         if self._transport is not None:
-            self._transport.close()
+            self.backend.close_transport(self._transport)
         self._scope.cancel()
         await self._scope.__aexit__(None, None, None)
 

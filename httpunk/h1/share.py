@@ -45,7 +45,13 @@ class H1Upgraded:
     async def aclose(self):
         if not self._closed:
             self._closed = True
-            self._transport.close()
+            # The caller owns this raw tunnel and closes it from an async context, so
+            # — unlike the driver's sync close paths — we can await a `TLSStream`'s
+            # `close()` coroutine (the full `close_notify` dance); a plain socket's
+            # `close()` returns None and needs no await.
+            result = self._transport.close()
+            if result is not None:
+                await result
 
     async def __aenter__(self):
         return self

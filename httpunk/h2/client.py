@@ -19,7 +19,7 @@ Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 import threading
 
 from .._common import BaseClientConnection
-from ..exceptions import H2ProtocolError, H2Reason
+from ..exceptions import ConnectionClosedError, H2ProtocolError, H2Reason
 from ..types import Response
 from .connection import PREFACE, H2ConnectionBase
 from .settings import LocalSettings, Settings
@@ -283,10 +283,19 @@ class H2Connection(BaseClientConnection):
             await self._conn.streams.send_body(stream, request.body)
 
         await stream.headers_evt.wait()
-        if stream.error is not None:
-            raise stream.error
-        if self._conn.error is not None:
-            raise self._conn.error
+        # h2's `ResponseFuture` resolves the moment the head arrives (client.rs
+        # `poll_response` returns on HEADERS). Gate on whether the head arrived
+        # (`stream.status`), NOT on `self._conn.error`: a fully-received response
+        # must still be returned when the connection closes right after (server
+        # answers + GOAWAY + close is a legitimate graceful shutdown) — a subsequent
+        # stream/connection error surfaces when the body is read (`H2ResponseBody`
+        # re-raises `stream.error` after EOF). REGRESSION GUARD: do not re-add a
+        # post-head `if self._conn.error: raise` here — it discards a received
+        # response and diverges from hyper. (Not unit-testable over a loopback: the
+        # bug is a scheduling race where `send_request` re-checks only after the
+        # connection has failed, which a quiet loopback never reproduces.)
+        if stream.status is None:  # woken by a reset/failure, not a real response head
+            raise stream.error or self._conn.error or ConnectionClosedError("connection closed before response")
         return Response(stream.status, stream.headers, H2ResponseBody(stream, self._conn.streams))
 
     def _resolve(self, target):

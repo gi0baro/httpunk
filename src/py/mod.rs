@@ -10,6 +10,7 @@
 mod h1;
 mod h2;
 mod http;
+mod proxy;
 
 use pyo3::prelude::*;
 
@@ -17,5 +18,6 @@ use pyo3::prelude::*;
 pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     http::register(m)?;
     h2::register(m)?;
-    h1::register(m)
+    h1::register(m)?;
+    proxy::register(m)
 }

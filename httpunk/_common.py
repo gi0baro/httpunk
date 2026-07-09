@@ -79,3 +79,12 @@ class BaseServer:
         """Return the next incoming `ServerRequest`, or None once the connection
         can serve no more. (`async for` over the server is the ergonomic form.)"""
         return await self._conn.next_request()
+
+    async def graceful_shutdown(self):
+        """Signal a graceful shutdown (non-blocking, like hyper's
+        `Connection::graceful_shutdown`): h2 sends GOAWAY and refuses new streams;
+        h1 stops reusing the connection and releases an idle read. In-flight work
+        finishes as the caller keeps driving the accept loop, which then ends and
+        closes. `httpunk.util.GracefulShutdown` coordinates this over many
+        connections (§11.3)."""
+        await self._conn.graceful_shutdown()

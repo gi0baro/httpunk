@@ -1,0 +1,22 @@
+# Vendored hyper-util proxy matcher (client::proxy::matcher) — pure, IO-free proxy
+# selection logic exposed to Python via PyO3, see ../../THIRD-PARTY.md. Workspace
+# member crate: owns its crate root (upstream `crate::`/`self::` paths, no rewrite)
+# and is fmt/clippy-excluded from the main crate via `cargo fmt -p`.
+[package]
+name = "vendor-hyper-util"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+# The matcher's core env/builder/intercept path only. `client-proxy-system`
+# (macOS SCDynamicStore / Windows registry `from_system`) is declared but kept OFF
+# so check-cfg recognizes the vendored cfg-gate without pulling platform deps.
+default = []
+client-proxy-system = []
+
+[dependencies]
+http = "1"
+ipnet = "2.9"
+percent-encoding = "2.3"
+base64 = "0.22"

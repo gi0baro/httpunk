@@ -134,7 +134,7 @@ impl H1Codec {
             .unwrap()
             .encoder
             .as_ref()
-            .map_or(true, BodyEncoder::is_eof)
+            .is_none_or(BodyEncoder::is_eof)
     }
 
     /// Feed received bytes; if a full response head is now available, consume it

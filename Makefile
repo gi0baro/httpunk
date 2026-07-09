@@ -44,6 +44,7 @@ lint-rust:
 		-A clippy::no-effect-underscore-binding \
 		-A clippy::similar-names \
 		-A clippy::single-match-else \
+		-A clippy::struct-excessive-bools \
 		-A clippy::struct-field-names \
 		-A clippy::too-many-arguments \
 		-A clippy::too-many-lines \

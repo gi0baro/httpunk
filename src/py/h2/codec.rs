@@ -913,7 +913,7 @@ impl Codec {
             }
             // Unknown/extension frame types are silently ignored (h2
             // framed_read.rs `Kind::Unknown => Ok(None)`, RFC 7540 §4.1).
-            _ => return Ok(None),
+            Kind::Unknown => return Ok(None),
         };
         Ok(Some(obj))
     }

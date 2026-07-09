@@ -38,7 +38,7 @@ class H1ConnectionBase:
         # tunnel (hyper: after `on_upgrade`/`into_parts` the driver no longer owns
         # it). Nulling makes a later close / failure path a no-op.
         if self.transport is not None and not self._upgraded:
-            self.transport.close()
+            self.backend.close_transport(self.transport)
             self.transport = None
 
     async def close(self):
