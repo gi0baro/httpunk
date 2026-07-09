@@ -586,13 +586,13 @@ impl H2Codec {
         py: Python<'_>,
         stream_id: u32,
         trailers: &HeaderMap,
-    ) -> PyResult<Py<PyBytes>> {
+    ) -> Py<PyBytes> {
         let fields = trailers.snapshot();
         let hframe = frame::Headers::trailers(frame::StreamId::from(stream_id), fields);
         let mut c = self.inner.lock().unwrap();
         let max = c.send_max_frame_size;
         let dst = encode_headers_frame(&mut c.encoder, hframe, max);
-        Ok(PyBytes::new(py, &dst).unbind())
+        PyBytes::new(py, &dst).unbind()
     }
 
     #[pyo3(signature = (stream_id, data, end_stream=false))]

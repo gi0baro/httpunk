@@ -107,7 +107,9 @@ async def test_h2_multiplexed_requests():
         tg.create_task(serve())
         transport = await backend.connect_tcp(host, port)
         async with H2Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
-            r1, r2 = await asyncio.gather(conn.request("GET", "/a"), conn.request("GET", "/b"))  # two concurrent streams
+            r1, r2 = await asyncio.gather(
+                conn.request("GET", "/a"), conn.request("GET", "/b")
+            )  # two concurrent streams
             b1, b2 = await asyncio.gather(r1.read(), r2.read())
             assert {b1, b2} == {b"ok:/a", b"ok:/b"}
 
