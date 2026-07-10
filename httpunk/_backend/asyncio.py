@@ -162,6 +162,12 @@ class _AsyncioStream(asyncio.Protocol):
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
 
+    def interrupt_read(self):
+        """Wake a parked `receive_some` so it returns b"" — lets a graceful shutdown release
+        an idle keep-alive read WITHOUT racing a coroutine (asyncio can wake a parked read from
+        another task; tonio can't, which is why it uses a select-based race instead)."""
+        self._wake_reader()
+
 
 class _AsyncioScope:
     """A nursery over `asyncio` tasks, matching tonio's scope surface: `spawn`,
@@ -297,3 +303,18 @@ class AsyncioBackend:
     scope = _AsyncioScope
     monotonic = staticmethod(_time.monotonic)
     sleep = staticmethod(asyncio.sleep)  # async sleep(seconds), for deadline races (`select`)
+
+    # Every backend implements `timeout` (above), so the h1 server always uses it for the
+    # head-read deadline. This extra capability is asyncio-only: `_AsyncioStream.interrupt_read`
+    # can wake a parked idle read from another task, so the h1 server can skip the per-read
+    # shutdown `select`. tonio can't (no such method) → it keeps the select there.
+    native_read_interrupt = True
+
+    async def timeout(self, coro, seconds):
+        """Run `coro` bounded by `seconds`; return `(result, True)` on completion, or
+        `(None, False)` on timeout (the coro is cancelled). One task + one timer, far cheaper
+        than racing a `sleep()` coroutine via `select`."""
+        try:
+            return await asyncio.wait_for(coro, seconds), True
+        except (TimeoutError, asyncio.TimeoutError):
+            return None, False

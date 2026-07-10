@@ -12,7 +12,7 @@ from tonio.colored.net import open_tcp_stream as _open_tcp_stream
 from tonio.colored.net.tls import open_tls_over_tcp_stream as _open_tls_over_tcp_stream
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
 from tonio.colored.sync.channel import unbounded as _unbounded
-from tonio.colored.time import time as _now
+from tonio.colored.time import time as _now, timeout as _timeout
 
 
 class _TonioSemaphore:
@@ -107,4 +107,9 @@ class TonioBackend:
     semaphore = _TonioSemaphore
     queue = staticmethod(_unbounded)
     monotonic = staticmethod(_now)
-    sleep = staticmethod(_colored.sleep)  # async sleep(seconds), for deadline races (`select`)
+    sleep = staticmethod(_colored.sleep)  # async sleep(seconds)
+    # `timeout(coro, seconds) -> (result, completed)` — tonio's native deadline; the h1 server
+    # uses it to bound the request-head read (measured ~12-16% faster than racing sleep() via
+    # select). Same contract as AsyncioBackend.timeout. tonio still can't wake a parked recv from
+    # another task, so it does NOT advertise `native_read_interrupt` (idle shutdown stays select).
+    timeout = staticmethod(_timeout)

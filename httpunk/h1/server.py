@@ -53,7 +53,6 @@ _CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
 # (io.rs: 8192 + 4096*100). Bounds per-connection memory against a slow/oversized head.
 _MAX_HEAD_SIZE = 8192 + 4096 * 100
 _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L249)
-_TIMED_OUT = object()  # sentinel: the header read exceeded `header_read_timeout`
 # The HTTP/2 connection preface (client prior-knowledge). An h1 server that sees it
 # closes silently with a version error rather than writing a 400 (hyper `on_parse_error`
 # -> `has_h2_prefix` -> `new_version_h2`, conn.rs L29/L809-812).
@@ -193,6 +192,12 @@ class ServerConnection(H1ConnectionBase):
         # Max time to read a complete request head before closing (slowloris defence),
         # hyper's `header_read_timeout` (default 30s, http1.rs L249). `None` disables it.
         self._header_read_timeout = header_read_timeout
+        # The head-read deadline always uses `backend.timeout` (every backend implements it).
+        # This capability is extra: a backend that can wake a parked read from another task
+        # (asyncio) lets us skip the per-read shutdown `select`; absent (tonio) → use `select`.
+        # See `_read_or_shutdown` + `graceful_shutdown`.
+        self._native_read_interrupt = getattr(self.backend, "native_read_interrupt", False)
+        self._idle_read_parked = False  # True only while parked in the idle between-requests read
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
@@ -206,6 +211,10 @@ class ServerConnection(H1ConnectionBase):
         # loop to completion and closes; nothing is awaited/closed here.
         self._reusable = False
         self._shutdown_evt.set()
+        if self._native_read_interrupt and self._idle_read_parked:
+            # asyncio: wake the read parked idly between requests so it returns promptly and
+            # the connection closes, instead of relying on a per-read select race (tonio's path).
+            self.transport.interrupt_read()
 
     def mark_unusable(self):
         self._reusable = False
@@ -314,22 +323,17 @@ class ServerConnection(H1ConnectionBase):
         return False
 
     async def _read_request_head(self, codec, initial=b""):
-        # Bound the head read by `header_read_timeout` (slowloris defence, hyper
-        # http1.rs L249): race the read against a deadline; if it wins, close with no
-        # response (hyper closes on a header-read timeout). `select` cancels the losing
-        # branch, cleanly dropping the parked read. `None` disables the timeout.
-        # NIT (design cleanup, deferred): this `sleep` + `select` deadline could become a
-        # normalized `backend.timeout(coro, seconds)` primitive — more direct, no
-        # sentinel / nested select. Kept as-is for now (see TODONOTES).
+        # Bound the head read by `header_read_timeout` (slowloris defence, hyper http1.rs L249):
+        # if the deadline wins, close with no response (hyper closes on a header-read timeout).
+        # `backend.timeout(coro, seconds) -> (result, completed)` cancels the read cleanly on
+        # expiry — cheap on every backend (asyncio: one task + one timer; tonio: its native
+        # timeout). `None` disables the deadline.
         if self._header_read_timeout is None:
             return await self._read_head_frames(codec, initial)
-
-        async def _deadline():
-            await self.backend.sleep(self._header_read_timeout)
-            return _TIMED_OUT
-
-        result = await self.backend.select(self._read_head_frames(codec, initial), _deadline())
-        if result is _TIMED_OUT:
+        result, completed = await self.backend.timeout(
+            self._read_head_frames(codec, initial), self._header_read_timeout
+        )
+        if not completed:
             self._closed = True
             self._reusable = False
             self._close_transport()
@@ -390,6 +394,20 @@ class ServerConnection(H1ConnectionBase):
         if self._shutdown_evt.is_set():
             return _SHUTDOWN
 
+        if self._native_read_interrupt:
+            # asyncio: a plain read; if it parks, graceful_shutdown() wakes it via
+            # `interrupt_read` (a shutdown-woken read returns b"") — no per-read select race.
+            self._idle_read_parked = True
+            try:
+                data = await self.transport.receive_some(n)
+            finally:
+                self._idle_read_parked = False
+            if not data and self._shutdown_evt.is_set():
+                return _SHUTDOWN
+            return data
+
+        # Backends without native read control (tonio can't wake a parked recv from another
+        # task): race the read against the shutdown signal via `select`.
         def _recv():
             return self.transport.receive_some(n)
 
