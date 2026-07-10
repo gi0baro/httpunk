@@ -27,6 +27,11 @@ whose body is flow-control-gated on the client's windows.
 Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 """
 
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Awaitable
+from typing import TYPE_CHECKING, Any
+
 from .._common import BaseServer, read_all
 from ..exceptions import (
     ConnectionClosedError,
@@ -38,6 +43,11 @@ from .connection import PREFACE, H2ConnectionBase
 from .settings import LocalSettings, Settings
 from .stream import Stream
 from .streams import _RESET_STREAM_SECS, StreamManager, _StreamError
+
+
+if TYPE_CHECKING:
+    from .._backend import BackendLike
+    from ..types import Body, HeadersInput
 
 
 _DEFAULT_MAX_CONCURRENT = 200  # hyper server SETTINGS_MAX_CONCURRENT_STREAMS (proto/h2/server.rs)
@@ -59,6 +69,13 @@ class ServerRequest:
     """An incoming request + the handle to respond to it (h2: the `(Request,
     SendResponse)` pair yielded by the server `Connection`)."""
 
+    method: str
+    scheme: str | None
+    authority: str | None  # the :authority pseudo-header
+    path: str | None  # the :path pseudo-header
+    target: str | None  # alias of path, symmetric with the client's Request.target
+    headers: HeaderMap
+
     def __init__(self, stream, manager, *, method, scheme, authority, path, headers):
         self.method = method  # str, e.g. "GET"
         self.scheme = scheme  # str | None
@@ -70,12 +87,12 @@ class ServerRequest:
         self._manager = manager
 
     @property
-    def trailers(self):
+    def trailers(self) -> HeaderMap | None:
         """Trailing request headers (a `HeaderMap`) if the client sent a trailers
         frame after the body, else None."""
         return self._stream.trailers
 
-    async def aiter_bytes(self):
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield request body chunks as they arrive; each consumed chunk releases
         recv-window capacity (-> WINDOW_UPDATE), mirroring the client's read side."""
         while True:
@@ -87,22 +104,22 @@ class ServerRequest:
         if self._stream.error is not None:
             raise self._stream.error
 
-    def read(self):
+    def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())
 
-    def respond(self, status, *, headers=None, body=None):
+    def respond(self, status: int, *, headers: HeadersInput = None, body: Body = None) -> Awaitable[None]:
         """Send the response: HEADERS (+ body, flow-control-gated). `body` is None,
         `bytes`, or a (sync/async) iterable of `bytes`. h2: `SendResponse`."""
         return self._manager.send_response(self._stream, status, headers, body)
 
-    def reset(self, error_code=None):
+    def reset(self, error_code: int | None = None) -> Awaitable[None]:
         """Abort this stream with RST_STREAM instead of a normal response — e.g. when a
         handler fails. Defaults to INTERNAL_ERROR; a no-op once the response has already
         been sent. Only this stream is affected (h2 `SendResponse` drop / `send_reset`)."""
         reason = int(H2Reason.INTERNAL_ERROR) if error_code is None else int(error_code)
         return self._manager.reset_stream(self._stream, reason)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, path={self.path!r})"
 
 
@@ -397,7 +414,7 @@ class ServerConnection(H2ConnectionBase):
             self.streams._stop_accepting()  # already drained -> end the accept loop now
 
 
-class H2Server(BaseServer):
+class H2Server(BaseServer[ServerRequest]):
     """An HTTP/2 server connection over a caller-supplied, already-accepted
     `transport` (BYO transport, like hyper's `server::conn::http2`; accepting the
     socket / TLS / ALPN and the accept loop are the caller's job). The
@@ -412,8 +429,13 @@ class H2Server(BaseServer):
     """
 
     def __init__(
-        self, transport, *, backend=None, max_concurrent_streams=_DEFAULT_MAX_CONCURRENT, initial_window_size=None
-    ):
+        self,
+        transport: Any,
+        *,
+        backend: BackendLike | None = None,
+        max_concurrent_streams: int = _DEFAULT_MAX_CONCURRENT,
+        initial_window_size: int | None = None,
+    ) -> None:
         self._conn = ServerConnection(
             transport,
             backend=backend,

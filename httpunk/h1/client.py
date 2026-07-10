@@ -10,6 +10,11 @@ Cross-reference: hyper `client::conn::http1` (`SendRequest`/`Connection`) +
 `proto/h1/{conn,dispatch,role}.rs` (the Client path).
 """
 
+from __future__ import annotations
+
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Any
+
 from .._common import BaseClientConnection
 from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import ConnectionClosedError
@@ -17,6 +22,11 @@ from ..http import HeaderMap
 from ..types import Response
 from .connection import H1ConnectionBase
 from .share import H1ResponseBody, H1Upgraded
+
+
+if TYPE_CHECKING:
+    from .._backend import BackendLike
+    from ..types import Request
 
 
 class Connection(H1ConnectionBase):
@@ -324,23 +334,23 @@ class H1Connection(BaseClientConnection):
     used to rewrite the target. `__aenter__`/`__aexit__`/`request` come from
     `BaseClientConnection` (identical to `H2Connection`)."""
 
-    def __init__(self, transport, *, authority=None, backend=None):
+    def __init__(self, transport: Any, *, authority: str | None = None, backend: BackendLike | None = None) -> None:
         self._conn = Connection(transport, authority=authority, backend=backend)
 
-    def ready(self):
+    def ready(self) -> Awaitable[None]:
         """Wait until the connection can accept a request (h1 has no stream slots;
         this waits for the single in-flight request/response to finish). Mirrors
         h2's `conn.ready`."""
         return self._conn.wait_idle()
 
     @property
-    def closed(self):
+    def closed(self) -> bool:
         """True once the connection can serve no more requests (closed or failed). A
         synchronous liveness check so a pool can evict a dead connection
         (util.Singleton self-heal)."""
         return self._conn._closed or self._conn.error is not None
 
-    def send_request(self, request):
+    def send_request(self, request: Request) -> Awaitable[Response]:
         """Send `request` and return its `Response` once the head arrives.
         Mirrors h2's `send_request` (hyper `SendRequest::send_request`).
 

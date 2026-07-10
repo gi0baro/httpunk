@@ -14,9 +14,17 @@ then consumes the replayed preface in `_before_frames`; the h1 server parses the
 replayed request line.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from ..h1.server import H1Server
 from ..h2.connection import PREFACE
 from ..h2.server import H2Server
+
+
+if TYPE_CHECKING:
+    from .._backend import BackendLike
 
 
 _CANCELLED = object()  # sentinel: the sniff's read lost the race to the cancel signal
@@ -53,7 +61,13 @@ class _PrewoundTransport:
         return getattr(self._transport, name)
 
 
-async def serve(transport, *, backend=None, only=None, cancel=None):
+async def serve(
+    transport: Any,
+    *,
+    backend: BackendLike | None = None,
+    only: str | None = None,
+    cancel: Any = None,
+) -> H2Server | H1Server:
     """Sniff `transport` and return the matching **un-entered** server (`H2Server`
     or `H1Server`) over a prewound transport that replays the sniffed bytes.
 

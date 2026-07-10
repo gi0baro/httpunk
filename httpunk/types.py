@@ -8,7 +8,21 @@ crate, not re-implemented here).
 Cross-reference: the `http` crate's `Request` / `Response` / `HeaderMap`.
 """
 
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any
+
 from .http import HeaderMap
+
+
+if TYPE_CHECKING:
+    from .h1.share import H1Upgraded
+
+
+# Public annotation aliases, reused across the client/server facades.
+HeadersInput = HeaderMap | Mapping[str, str] | Iterable[tuple[str, str]] | None
+Body = bytes | Iterable[bytes] | AsyncIterator[bytes] | None
 
 
 class Request:
@@ -28,7 +42,15 @@ class Request:
 
     __slots__ = ("method", "target", "headers", "body", "trailers")
 
-    def __init__(self, method, target, *, headers=None, body=None, trailers=None):
+    def __init__(
+        self,
+        method: str,
+        target: str,
+        *,
+        headers: HeadersInput = None,
+        body: Body = None,
+        trailers: HeadersInput = None,
+    ) -> None:
         self.method = method
         self.target = target
         self.headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
@@ -37,7 +59,7 @@ class Request:
             None if trailers is None else (trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers))
         )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Request(method={self.method!r}, target={self.target!r})"
 
 
@@ -52,48 +74,48 @@ class Response:
     reset). Use as an async context manager to guarantee release.
     """
 
-    def __init__(self, status, headers, body):
+    def __init__(self, status: int, headers: HeaderMap, body: Any) -> None:
         self.status = status
         self.headers = headers  # httpunk.http.HeaderMap
         self._body = body
 
     @property
-    def trailers(self):
+    def trailers(self) -> HeaderMap | None:
         """Trailing headers (a `HeaderMap`) delivered after the body, else None
         (h2 trailers frame / h1 chunked trailers). Available once the body is read."""
         return self._body.trailers
 
     @property
-    def upgraded(self):
+    def upgraded(self) -> H1Upgraded | None:
         """For an HTTP/1 101 / CONNECT upgrade, the raw tunnel (`H1Upgraded`) the
         caller now owns; None otherwise (including every HTTP/2 response)."""
         return self._body.upgraded
 
     @property
-    def is_upgrade(self):
+    def is_upgrade(self) -> bool:
         return self._body.upgraded is not None
 
-    async def aiter_bytes(self):
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield body chunks as they arrive (decoded/flow-controlled by the backend)."""
         async for chunk in self._body.aiter_bytes():
             yield chunk
 
-    async def read(self):
+    async def read(self) -> bytes:
         return b"".join([chunk async for chunk in self._body.aiter_bytes()])
 
-    def aclose(self):
+    def aclose(self) -> Awaitable[None]:
         """Release the response. If the body wasn't fully read, cancel it (the
         backend RSTs the stream on h2, or closes the connection on h1). Idempotent."""
         return self._body.aclose()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Response:
         return self
 
-    async def __aexit__(self, exc_type, exc_value, exc_tb):
+    async def __aexit__(self, exc_type: object, exc_value: object, exc_tb: object) -> bool:
         await self.aclose()
         return False
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self._body.upgraded is not None:
             return f"Response(status={self.status}, upgraded)"
         return f"Response(status={self.status})"

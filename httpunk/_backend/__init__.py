@@ -9,7 +9,10 @@ picking `asyncio` never imports tonio) or a backend instance. This module import
 backend eagerly; `Backend.<member>.create()` does the import on demand.
 """
 
+from __future__ import annotations
+
 import enum
+from typing import TYPE_CHECKING, Any
 
 
 class Backend(enum.Enum):
@@ -20,7 +23,7 @@ class Backend(enum.Enum):
     tonio = "tonio"
     asyncio = "asyncio"
 
-    def create(self):
+    def create(self) -> Any:
         if self is Backend.tonio:
             from .tonio import TonioBackend
 
@@ -30,7 +33,18 @@ class Backend(enum.Enum):
         return AsyncioBackend()
 
 
-def resolve(backend):
+if TYPE_CHECKING:
+    from .asyncio import AsyncioBackend
+    from .tonio import TonioBackend
+
+    # What every public `backend=` parameter accepts: a `Backend` enum member (the
+    # documented path) or an already-created backend instance (`httpunk.asyncio`
+    # passes one; `resolve()` returns whatever it's given). The backends share an
+    # implicit interface but no nominal base, so this is a union of the concretes.
+    BackendLike = Backend | AsyncioBackend | TonioBackend
+
+
+def resolve(backend) -> Any:
     """Resolve a `backend` argument to a backend instance: a `Backend` member →
     a fresh instance (lazy import); an instance → itself. `None` raises — there is
     no default (see the module docstring). Call this **module-qualified**

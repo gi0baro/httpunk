@@ -25,12 +25,22 @@ Cross-reference: hyper 1.10.1 `proto/h1/{role,conn,dispatch}.rs` (server path) a
 `client/conn`/`server/conn`.
 """
 
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Awaitable
+from typing import TYPE_CHECKING, Any
+
 from .._common import BaseServer, read_all
 from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import ConnectionClosedError
 from ..http import HeaderMap
 from .connection import H1ConnectionBase
 from .share import H1Upgraded
+
+
+if TYPE_CHECKING:
+    from .._backend import BackendLike
+    from ..types import Body, HeadersInput
 
 
 _READ_SIZE = 65536
@@ -77,6 +87,16 @@ class ServerRequest:
     """An incoming request + the handle to respond to it (hyper: the request +
     its `Sender`/response channel). One in flight at a time."""
 
+    method: str
+    target: str  # the request-target (origin/absolute/authority form)
+    path: str  # alias of target
+    headers: HeaderMap
+    trailers: HeaderMap | None  # chunked trailers, populated once the body is read
+    keep_alive: bool
+    is_upgrade: bool
+    content_length: int | None  # declared request Content-Length (None if chunked)
+    upgraded: H1Upgraded | None  # the raw tunnel once a CONNECT/Upgrade is answered
+
     def __init__(
         self,
         conn,
@@ -110,7 +130,7 @@ class ServerRequest:
         self._body_done = decoder.is_complete
         self._responded = False
 
-    async def aiter_bytes(self):
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield request body chunks, pulling transport bytes on demand (decoded
         by `H1BodyDecoder`). Sends `100 Continue` first if the client asked for it."""
         if self._decoder.is_complete:
@@ -143,10 +163,10 @@ class ServerRequest:
         self.trailers = self._decoder.take_trailers()
         self._body_done = True
 
-    def read(self):
+    def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())
 
-    async def respond(self, status, *, headers=None, body=None):
+    async def respond(self, status: int, *, headers: HeadersInput = None, body: Body = None) -> None:
         """Send the response head (+ body). `body` is None, `bytes`, or a
         (sync/async) iterable of `bytes`. hyper: `Server::encode`."""
         if self._responded:
@@ -154,7 +174,7 @@ class ServerRequest:
         self._responded = True
         await self._conn.send_response(self, status, headers, body)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, target={self.target!r})"
 
 
@@ -484,7 +504,7 @@ class ServerConnection(H1ConnectionBase):
         return hdrs
 
 
-class H1Server(BaseServer):
+class H1Server(BaseServer[ServerRequest]):
     """An HTTP/1 server connection over a caller-supplied, already-accepted
     `transport` (BYO transport, like hyper's `server::conn::http1`). The
     async-context-manager + accept-iterator come from `BaseServer` (identical to
@@ -495,5 +515,11 @@ class H1Server(BaseServer):
                 await request.respond(200, body=b"hi")
     """
 
-    def __init__(self, transport, *, backend=None, header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT):
+    def __init__(
+        self,
+        transport: Any,
+        *,
+        backend: BackendLike | None = None,
+        header_read_timeout: float = _DEFAULT_HEADER_READ_TIMEOUT,
+    ) -> None:
         self._conn = ServerConnection(transport, backend=backend, header_read_timeout=header_read_timeout)

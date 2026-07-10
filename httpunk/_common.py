@@ -7,7 +7,19 @@ shells that collapse the driver into an async-context-managed handle. Everything
 protocol-specific stays in the h1/h2 role files.
 """
 
-from .types import Request
+from __future__ import annotations
+
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Generic, TypeVar
+
+from .types import Body, HeadersInput, Request, Response
+
+
+if TYPE_CHECKING:
+    from typing import Self
+
+
+_RequestT = TypeVar("_RequestT")
 
 
 async def aiter_body(body):
@@ -42,46 +54,54 @@ class BaseClientConnection:
     it takes the method explicitly (no per-verb helpers like `get()` — httpunk is
     low-level, and a single arbitrary shortcut would be inconsistent)."""
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         await self._conn.connect()
         return self
 
-    async def __aexit__(self, exc_type, exc_value, exc_tb):
+    async def __aexit__(self, exc_type: object, exc_value: object, exc_tb: object) -> bool:
         await self._conn.close()
         return False
 
-    def request(self, method, target, *, headers=None, body=None, trailers=None):
+    def request(
+        self,
+        method: str,
+        target: str,
+        *,
+        headers: HeadersInput = None,
+        body: Body = None,
+        trailers: HeadersInput = None,
+    ) -> Awaitable[Response]:
         return self.send_request(Request(method, target, headers=headers, body=body, trailers=trailers))
 
 
-class BaseServer:
+class BaseServer(Generic[_RequestT]):
     """Shared public server-facade glue (h1/h2): async-context-manager entry/exit
     + the accept iterator over `self._conn.next_request()`. Subclasses build
     `self._conn` (which exposes `start`/`close`/`next_request`)."""
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         await self._conn.start()
         return self
 
-    async def __aexit__(self, exc_type, exc_value, exc_tb):
+    async def __aexit__(self, exc_type: object, exc_value: object, exc_tb: object) -> bool:
         await self._conn.close()
         return False
 
-    def __aiter__(self):
+    def __aiter__(self) -> Self:
         return self
 
-    async def __anext__(self):
+    async def __anext__(self) -> _RequestT:
         request = await self._conn.next_request()
         if request is None:  # connection closed / can serve no more
             raise StopAsyncIteration
         return request
 
-    def accept(self):
+    def accept(self) -> Awaitable[_RequestT | None]:
         """Return the next incoming `ServerRequest`, or None once the connection
         can serve no more. (`async for` over the server is the ergonomic form.)"""
         return self._conn.next_request()
 
-    def graceful_shutdown(self):
+    def graceful_shutdown(self) -> Awaitable[None]:
         """Signal a graceful shutdown (non-blocking, like hyper's
         `Connection::graceful_shutdown`): h2 sends GOAWAY and refuses new streams;
         h1 stops reusing the connection and releases an idle read. In-flight work

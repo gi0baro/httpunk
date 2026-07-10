@@ -16,6 +16,8 @@ flow-control / API-misuse errors raised by the extension share the same base):
 they compare equal to ints), or a plain int for codes outside the RFC set.
 """
 
+from __future__ import annotations
+
 from ._httpunk import (
     ConnectionClosedError as ConnectionClosedError,
     H2Error as H2Error,
@@ -38,7 +40,11 @@ class GoAwayError(H2Error):
     """The peer sent GOAWAY. Streams with id > `last_stream_id` were not
     processed and are safe to retry on a new connection."""
 
-    def __init__(self, last_stream_id, error_code, debug_data=b""):
+    last_stream_id: int
+    error_code: H2Reason | int
+    debug_data: bytes
+
+    def __init__(self, last_stream_id: int, error_code: int, debug_data: bytes = b"") -> None:
         self.last_stream_id = last_stream_id
         self.error_code = _reason(error_code)
         self.debug_data = debug_data
@@ -48,7 +54,10 @@ class GoAwayError(H2Error):
 class StreamResetError(H2Error):
     """The peer sent RST_STREAM for this stream."""
 
-    def __init__(self, stream_id, error_code):
+    stream_id: int
+    error_code: H2Reason | int
+
+    def __init__(self, stream_id: int, error_code: int) -> None:
         self.stream_id = stream_id
         self.error_code = _reason(error_code)
         super().__init__(f"RST_STREAM(stream_id={stream_id}, error_code={self.error_code!r})")

@@ -22,8 +22,12 @@ requests on it. Liveness is checked at *use* time (a request on a dead connectio
 raises, as with any pool); `retain()` is the eviction hook for stale connections.
 """
 
+from __future__ import annotations
+
 import contextlib
 import threading
+from collections.abc import Awaitable, Callable
+from typing import Any
 from urllib.parse import urlsplit
 
 from .. import _backend
@@ -41,7 +45,9 @@ class Singleton:
     Mirrors hyper-util `pool::singleton::Singleton` (State: empty → making → made).
     """
 
-    def __init__(self, connector, *, backend=None):
+    def __init__(
+        self, connector: Callable[..., Awaitable[Any]], *, backend: _backend.BackendLike | None = None
+    ) -> None:
         self._connector = connector
         self._backend = _backend.resolve(backend)
         self._lock = threading.Lock()  # guards the state machine (no await held)
@@ -50,7 +56,7 @@ class Singleton:
         self._error = None
         self._ready = None  # event signalling the current making round is done
 
-    async def get(self, dst=None):
+    async def get(self, dst: Any = None) -> Any:
         """The shared connection, connecting once. Concurrent callers during the
         connect wait for it; if that connect fails, the driver raises the real error
         and the waiters get `Canceled`."""
@@ -97,7 +103,7 @@ class Singleton:
                 return self._conn
         raise Canceled("the connection attempt this call was waiting on failed")
 
-    async def retain(self, predicate):
+    async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Drop (and close) the shared connection if `predicate(conn)` is False —
         the eviction hook for a dead/stale connection. No-op while empty/making."""
         with self._lock:
@@ -108,12 +114,12 @@ class Singleton:
         if conn is not None:
             await conn.__aexit__(None, None, None)
 
-    def is_empty(self):
+    def is_empty(self) -> bool:
         """True iff no connection has been made (or is being made)."""
         with self._lock:
             return self._state == "empty"
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         """Close the shared connection and reset to empty."""
         with self._lock:
             conn, self._conn, self._state = self._conn, None, "empty"
@@ -128,13 +134,15 @@ class Cache:
     it to the idle set. Release is a lease context manager (the Python stand-in for
     hyper-util's drop-returns-to-cache)."""
 
-    def __init__(self, connector, *, backend=None):
+    def __init__(
+        self, connector: Callable[..., Awaitable[Any]], *, backend: _backend.BackendLike | None = None
+    ) -> None:
         self._connector = connector
         self._backend = _backend.resolve(backend)
         self._lock = threading.Lock()
         self._idle = []
 
-    def checkout(self, dst=None):
+    def checkout(self, dst: Any = None) -> _Lease:
         """A lease over a connection: `async with cache.checkout(dst) as conn: ...`.
         On a clean exit the connection returns to the idle set for reuse; if the body
         raised, it is closed instead (a failed exchange may have left it unusable)."""
@@ -164,7 +172,7 @@ class Cache:
         with self._lock:
             self._idle.append(conn)
 
-    async def retain(self, predicate):
+    async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Keep only the idle connections `predicate(conn)` returns True for; close
         the rest. The eviction hook for idle/stale connections."""
         with self._lock:
@@ -175,12 +183,12 @@ class Cache:
         for conn in drop:
             await conn.__aexit__(None, None, None)
 
-    def is_empty(self):
+    def is_empty(self) -> bool:
         """True iff no idle connections are cached."""
         with self._lock:
             return not self._idle
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         """Close every idle connection."""
         with self._lock:
             conns, self._idle = self._idle, []
@@ -237,13 +245,13 @@ class Map:
     chooses per destination (a `Singleton`, a `Cache`, …); `Map` only owns the
     keyed lookup + lifecycle."""
 
-    def __init__(self, make_pool, *, key=_default_key):
+    def __init__(self, make_pool: Callable[[str], Any], *, key: Callable[[str], Any] = _default_key) -> None:
         self._make_pool = make_pool  # (url) -> a pool (Singleton | Cache | ...)
         self._key = key  # (url) -> hashable key; default (scheme, host, port)
         self._lock = threading.Lock()
         self._pools = {}
 
-    def pool_for(self, url):
+    def pool_for(self, url: str) -> Any:
         """The inner pool for `url`'s key, creating it via the factory on first use."""
         k = self._key(url)
         with self._lock:
@@ -253,12 +261,12 @@ class Map:
                 self._pools[k] = pool
             return pool
 
-    def is_empty(self):
+    def is_empty(self) -> bool:
         """True iff no per-destination pools exist yet."""
         with self._lock:
             return not self._pools
 
-    async def retain(self, predicate):
+    async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Prune stale connections across every per-destination pool — forwards
         `retain(predicate)` to each inner pool (the eviction hook, consistent with
         `Singleton`/`Cache`) (F52). Empty inner pools are left in place (rebuilt lazily
@@ -268,7 +276,7 @@ class Map:
         for pool in pools:
             await pool.retain(predicate)
 
-    async def clear(self):
+    async def clear(self) -> None:
         """Close every per-destination pool and drop the routing table; the `Map`
         stays usable and rebuilds pools lazily on the next `pool_for` (F52)."""
         with self._lock:
@@ -276,6 +284,6 @@ class Map:
         for pool in pools:
             await pool.aclose()
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         """Close every per-destination pool (end of life)."""
         await self.clear()

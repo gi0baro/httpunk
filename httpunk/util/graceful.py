@@ -27,13 +27,17 @@ the public `graceful_shutdown()` is touched — no driver internals.
         await graceful.shutdown()
 """
 
+from __future__ import annotations
+
 import threading
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from .. import _backend
 
 
 class GracefulShutdown:
-    def __init__(self, backend=None):
+    def __init__(self, backend: _backend.BackendLike | None = None) -> None:
         self._backend = _backend.resolve(backend)
         self._signal = self._backend.event()  # the shutdown signal (≈ hyper-util's watch channel)
         self._lock = threading.Lock()  # guards the live-connection count (free-threaded)
@@ -41,11 +45,11 @@ class GracefulShutdown:
         self._all_done = self._backend.event()
         self._all_done.set()  # no connections watched yet
 
-    def count(self):
+    def count(self) -> int:
         """Number of connections currently being watched (≈ `receiver_count`)."""
         return self._live
 
-    def watcher(self):
+    def watcher(self) -> _Watcher:
         """Register a watch slot SYNCHRONOUSLY and return a `Watcher` whose async
         `watch(server, serve)` drives the connection to completion. Mirrors hyper-util
         `GracefulShutdown::watcher()`: the count is bumped on the caller's task, before
@@ -57,7 +61,7 @@ class GracefulShutdown:
             self._all_done.clear()
         return _Watcher(self)
 
-    def watch(self, server, serve):
+    def watch(self, server: Any, serve: Callable[..., Awaitable[None]]) -> Awaitable[None]:
         """Convenience for `watcher().watch(server, serve)` — returns the connection-
         driving coroutine to spawn. NOTE this is a plain (sync) method: it registers the
         slot synchronously when CALLED (via `watcher()`), so `spawn(graceful.watch(...))`
@@ -65,7 +69,7 @@ class GracefulShutdown:
         `watch() = watcher().watch()` (F53)."""
         return self.watcher().watch(server, serve)
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         """Signal every watched connection to shut down gracefully and wait until
         they have all finished their in-flight work and closed."""
         self._signal.set()

@@ -20,8 +20,11 @@ and calls your `handle` per request.
 the client's opening bytes.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
+from typing import Any, TypeVar
 
 from ._backend.asyncio import AsyncioBackend, _AsyncioStream
 from .h1.server import H1Server
@@ -30,6 +33,8 @@ from .util import auto
 
 
 __all__ = ["AutoServerProtocol", "H1ServerProtocol", "H2ServerProtocol", "ServerConnections"]
+
+_ProtocolT = TypeVar("_ProtocolT", bound="_ServerProtocol")
 
 
 class _ServerProtocol(_AsyncioStream):
@@ -102,14 +107,14 @@ class _ServerProtocol(_AsyncioStream):
             with contextlib.suppress(Exception):
                 await request.reset()
 
-    async def handle(self, request):
+    async def handle(self, request: Any) -> None:
         """Override: produce the response for `request` via `request.respond(...)`.
         This is where uvicorn/hypercorn bridge to ASGI."""
         raise NotImplementedError("subclass must implement `async def handle(self, request)`")
 
     # ----- host-coordinated graceful shutdown -----
 
-    async def graceful_shutdown(self):
+    async def graceful_shutdown(self) -> None:
         """Signal a graceful shutdown of THIS connection (non-blocking): the driver
         stops accepting new requests (h2 GOAWAY / h1 disable-keep-alive), in-flight
         ones finish, then it closes. Idempotent. The host tracks its live protocols
@@ -120,7 +125,7 @@ class _ServerProtocol(_AsyncioStream):
         self._graceful_requested = True
         await self._maybe_apply_graceful()
 
-    async def wait_closed(self):
+    async def wait_closed(self) -> None:
         """Wait until this connection's serve loop has finished (drained + closed).
         Does not re-raise a handler/serve error — the connection is simply done."""
         if self._serve_task is not None:
@@ -159,7 +164,7 @@ class AutoServerProtocol(_ServerProtocol):
     async def _make_server(self):
         return await auto.serve(self, backend=self._backend, cancel=self._sniff_cancel)
 
-    async def graceful_shutdown(self):
+    async def graceful_shutdown(self) -> None:
         # Interrupt an in-progress preface sniff so a graceful shutdown of a
         # still-silent client doesn't linger (≈ hyper-util `ReadVersion::cancel`, F36).
         # Harmless once the server is built (nothing is waiting on the signal).
@@ -184,10 +189,10 @@ class ServerConnections:
         await conns.shutdown(timeout=30)  # drain in-flight, force-close stragglers
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._live = set()
 
-    def track(self, protocol_cls):
+    def track(self, protocol_cls: type[_ProtocolT]) -> type[_ProtocolT]:
         """Return a `create_server` factory (a `protocol_cls` subclass) that keeps
         this registry's live set current — add on `connection_made`, discard when
         the connection's serve task finishes."""
@@ -199,13 +204,13 @@ class ServerConnections:
                 registry._live.add(self)
                 self._serve_task.add_done_callback(lambda _t: registry._live.discard(self))
 
-        return _Tracked
+        return _Tracked  # type: ignore[return-value]  # a dynamic subclass of protocol_cls
 
-    def count(self):
+    def count(self) -> int:
         """How many connections are currently live."""
         return len(self._live)
 
-    async def shutdown(self, *, timeout=None):
+    async def shutdown(self, *, timeout: float | None = None) -> None:
         """Signal every live connection to shut down gracefully and await them to
         drain; past `timeout`, force-close the stragglers (transport close + cancel
         their serve task) so this always returns."""

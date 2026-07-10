@@ -16,8 +16,12 @@ This layer is low-level by design — no pool, connector, or high-level client
 Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 """
 
+from __future__ import annotations
+
 import contextlib
 import threading
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
 from ..exceptions import ConnectionClosedError, H2ProtocolError, H2Reason
@@ -27,6 +31,11 @@ from .settings import LocalSettings, Settings
 from .share import H2ResponseBody
 from .stream import Stream
 from .streams import StreamManager
+
+
+if TYPE_CHECKING:
+    from .._backend import BackendLike
+    from ..types import Request
 
 
 # hyper's HTTP/2 client profile (hyper `proto/h2/client.rs`): a 2 MB per-stream recv
@@ -323,12 +332,20 @@ class H2Connection(BaseClientConnection):
     `BaseClientConnection` (identical to `H1Connection`).
     """
 
-    def __init__(self, transport, *, authority=None, scheme="http", backend=None, initial_window_size=None):
+    def __init__(
+        self,
+        transport: Any,
+        *,
+        authority: str | None = None,
+        scheme: str = "http",
+        backend: BackendLike | None = None,
+        initial_window_size: int | None = None,
+    ) -> None:
         self._conn = Connection(
             transport, authority=authority, scheme=scheme, backend=backend, initial_window_size=initial_window_size
         )
 
-    def ready(self):
+    def ready(self) -> Awaitable[None]:
         """Wait until the connection can accept a new request — it's alive (not
         failed, no GOAWAY received) and a MAX_CONCURRENT_STREAMS slot is free —
         then return. Raises if the connection has failed or the peer sent GOAWAY.
@@ -343,13 +360,13 @@ class H2Connection(BaseClientConnection):
         return self._conn.streams.wait_until_ready()
 
     @property
-    def closed(self):
+    def closed(self) -> bool:
         """True once the connection can serve no more requests — the driver failed or
         the peer sent GOAWAY. A synchronous liveness check so a pool can evict a dead
         shared connection (util.Singleton self-heal)."""
         return self._conn.error is not None or self._conn.streams._goaway is not None
 
-    async def send_request(self, request):
+    async def send_request(self, request: Request) -> Response:
         """Send `request` and return its `Response` once the head arrives.
 
         h2: client.rs `SendRequest::send_request` (L512). Open the stream + send

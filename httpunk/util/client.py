@@ -6,6 +6,9 @@ This sits *above* the codec, so — unlike the core — there is no wire-protoco
 fidelity constraint; the reference is hyper-util's non-legacy behavior/shape.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from .. import _backend
@@ -13,11 +16,21 @@ from ..h1.client import H1Connection
 from ..h2.client import H2Connection
 
 
+if TYPE_CHECKING:
+    import ssl
+
+
 _DEFAULT_ALPN = ("h2", "http/1.1")
 _DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
-async def connect(url, *, backend=None, alpn=_DEFAULT_ALPN, ssl_context=None):
+async def connect(
+    url: str,
+    *,
+    backend: _backend.BackendLike | None = None,
+    alpn: tuple[str, ...] = _DEFAULT_ALPN,
+    ssl_context: ssl.SSLContext | None = None,
+) -> H2Connection | H1Connection:
     """Connect to `url` and return the matching **un-entered** low-level connection
     (`H2Connection` or `H1Connection`), with `authority` set from the URL.
 
