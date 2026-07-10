@@ -277,6 +277,37 @@ async def test_server_header_read_timeout_closes_slow_head():
 
 
 @pytest.mark.tonio
+async def test_server_detach_hands_off_open_connection():
+    """detach() stops the accept loop and relinquishes the transport WITHOUT closing it,
+    returning bytes read past the request head — so a caller can take over the raw connection
+    for a protocol upgrade (e.g. WebSocket)."""
+    listener, host, port = await _listener()
+    captured = {}
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                captured["leftover"] = req.detach()  # loop ends next (detached), socket stays open
+        # `__aexit__` ran (close() is a no-op after detach) — the transport is still usable, so
+        # the caller drives its own upgrade response on the raw connection.
+        await transport.send_all(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: custom\r\n\r\nOWNED")
+
+    async with scope() as s:
+        s.spawn(serve())
+        client = await _raw_client(host, port)
+        # request head + trailing bytes the client sent past it (must survive as `leftover`)
+        await client.send_all(
+            b"GET /up HTTP/1.1\r\nhost: x\r\nupgrade: custom\r\nconnection: upgrade\r\n\r\nEXTRA"
+        )
+        data = await _read_until(client, b"OWNED")
+        s.cancel()
+
+    assert captured["leftover"] == b"EXTRA"  # bytes past the head handed back
+    assert b"101 Switching Protocols" in data and data.endswith(b"OWNED")  # socket stayed open
+
+
+@pytest.mark.tonio
 async def test_server_no_100_continue_for_http10():
     """An HTTP/1.0 request never gets an auto 100-continue, even with `Expect:
     100-continue` — hyper gates the interim on version > 1.0 (conn.rs L311). F16."""

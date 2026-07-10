@@ -173,6 +173,22 @@ class ServerRequest:
         self._responded = True
         await self._conn.send_response(self, status, headers, body)
 
+    def detach(self) -> bytes:
+        """Take over the raw connection for a protocol upgrade (WebSocket, or a custom protocol):
+        stop the server's accept loop and relinquish the transport WITHOUT closing it, returning
+        any bytes already read past the request head (to replay). The caller — which supplied the
+        transport to `H1Server` — owns it afterwards and must drive the upgrade itself (httpunk
+        sends no response). Like httpunk's 101/CONNECT tunnel hand-off, but caller-driven.
+
+        After this, the accept loop ends (`next_request` returns None) and the server's close on
+        `__aexit__` is a no-op, so the transport stays open. cf. Go's `http.Hijacker`."""
+        if self._responded:
+            raise RuntimeError("cannot detach: a response was already sent for this request")
+        self._responded = True
+        leftover = self._decoder.take_buffered()
+        self._conn._detach()
+        return leftover
+
     def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, target={self.target!r})"
 
