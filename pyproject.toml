@@ -33,13 +33,10 @@ dynamic = [
 ]
 
 requires-python = ">=3.10"
-# tonio is the free-threaded runtime backend; it builds only on free-threaded
-# CPython >= 3.14 (non-Windows). There is no free-threaded PEP 508 marker, so gate on
-# 3.14 + non-Windows as the closest approximation. Off that, httpunk runs on the
-# asyncio backend (`Backend.asyncio`), which needs no extra dependency.
-dependencies = [
-    "tonio>=0.7.1; python_version >= '3.14' and platform_system != 'Windows'",
-]
+dependencies = []
+
+[project.optional-dependencies]
+tonio = ["tonio~=0.7.1; python_version >= '3.14'"]
 
 [dependency-groups]
 build = [
@@ -52,6 +49,9 @@ test = [
     'pytest~=8.3',
     'pytest-asyncio~=0.24',
     'trustme~=1.1',
+    # tonio only builds on free-threaded CPython >= 3.14; the marker is required so the
+    # lockfile resolves across the project's full `requires-python` (>=3.10) range.
+    "tonio; python_version >= '3.14'",
 ]
 
 all = [

@@ -25,8 +25,13 @@ class Backend(enum.Enum):
 
     def create(self) -> Any:
         if self is Backend.tonio:
-            from .tonio import TonioBackend
-
+            try:
+                from .tonio import TonioBackend
+            except ImportError as exc:
+                raise ImportError(
+                    "the tonio backend requires the 'tonio' package — install it with "
+                    "`pip install httpunk[tonio]` (needs free-threaded CPython >= 3.14 on Unix)"
+                ) from exc
             return TonioBackend()
         from .asyncio import AsyncioBackend
 
