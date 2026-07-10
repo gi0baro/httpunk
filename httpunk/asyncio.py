@@ -1,11 +1,11 @@
-"""Reusable asyncio server protocols — embed httpunk in any asyncio server (uvicorn,
-hypercorn, …) by subclassing one of these and implementing `handle(request)`.
+"""Reusable asyncio protocols — embed httpunk in any asyncio program. They are
+`asyncio.Protocol` subclasses of the asyncio backend's `_AsyncioStream` (the byte
+transport the driver reads/writes); the host owns the loop and hands the protocol a
+transport. Unlike uvicorn's h11/httptools protocols (HTTP/1 only), these also bring **HTTP/2**.
 
-Unlike uvicorn's h11/httptools protocols (HTTP/1 only), these also bring **HTTP/2**.
-They are `asyncio.Protocol` subclasses of the asyncio backend's `_AsyncioStream`:
-the host owns the loop and hands the protocol a transport
-via `loop.create_server(factory)`; the protocol drives httpunk's server over *itself*
-and calls your `handle` per request.
+**Server** — subclass one and implement `handle(request)`, then hand it to
+`loop.create_server(factory)`; the protocol drives httpunk's server over *itself* and calls
+your `handle` per request:
 
     class MyServer(httpunk.asyncio.AutoServerProtocol):
         async def handle(self, request):
@@ -16,8 +16,19 @@ and calls your `handle` per request.
     async with server:
         await server.serve_forever()
 
-`H1ServerProtocol` / `H2ServerProtocol` force the protocol; `AutoServerProtocol` sniffs h1-vs-h2 from
-the client's opening bytes.
+**Client** (the mirror) — hand one to `loop.create_connection(factory)`; once connected,
+`await proto.ready()` returns the httpunk client connection to send requests on:
+
+    transport, proto = await loop.create_connection(
+        lambda: httpunk.asyncio.H2ClientProtocol(authority="example.com:443", scheme="https"),
+        "example.com", 443, ssl=ctx,
+    )
+    conn = await proto.ready()
+    resp = await conn.request("GET", "/", headers={"host": "example.com"})
+    await proto.aclose()
+
+`H1*`/`H2*` force the protocol; `Auto*` picks h1-vs-h2 (server: from the client's opening
+bytes; client: from the TLS ALPN result).
 """
 
 from __future__ import annotations
@@ -27,12 +38,22 @@ import contextlib
 from typing import Any, TypeVar
 
 from ._backend.asyncio import AsyncioBackend, _AsyncioStream
+from .h1.client import H1Connection
 from .h1.server import H1Server
+from .h2.client import H2Connection
 from .h2.server import H2Server
 from .util import auto
 
 
-__all__ = ["AutoServerProtocol", "H1ServerProtocol", "H2ServerProtocol", "ServerConnections"]
+__all__ = [
+    "AutoClientProtocol",
+    "AutoServerProtocol",
+    "H1ClientProtocol",
+    "H1ServerProtocol",
+    "H2ClientProtocol",
+    "H2ServerProtocol",
+    "ServerConnections",
+]
 
 _ProtocolT = TypeVar("_ProtocolT", bound="_ServerProtocol")
 
@@ -229,3 +250,74 @@ class ServerConnections:
                 if c._serve_task is not None:
                     c._serve_task.cancel()  # hard-cancel a stuck handler / accept loop
             await asyncio.wait(pending)
+
+
+class _ClientProtocol(_AsyncioStream):
+    """Base for the reusable client protocols — the client-side mirror of `_ServerProtocol`.
+    `_AsyncioStream` is the transport the driver reads/writes; on `connection_made` this builds
+    an httpunk client connection over `self` and spawns its handshake. `ready()` awaits the
+    handshake and returns the connection facade to send requests on. Subclasses provide
+    `_make_client`. There is no `handle` — the client is caller-driven, not push."""
+
+    def __init__(self, *, authority: str | None = None, scheme: str | None = None) -> None:
+        super().__init__()
+        self._backend = AsyncioBackend()  # it's an asyncio protocol -> the asyncio backend
+        self._authority = authority
+        self._scheme = scheme
+        # Built in connection_made; None until then (so aclose() before a dial is a no-op).
+        self._client: H1Connection | H2Connection | None = None
+        self._connect_task: asyncio.Task[object] | None = None
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        self._client = self._make_client()
+        # Run the HTTP handshake (the facade's __aenter__ -> conn.connect(): preface + SETTINGS
+        # for h2, a no-op for h1) concurrently; `ready()` awaits it. Retrieve the task's result
+        # so a handshake failure doesn't surface as a bare "Task exception was never retrieved".
+        task = self._loop.create_task(self._client.__aenter__())
+        self._connect_task = task
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+    def _make_client(self) -> H1Connection | H2Connection:
+        raise NotImplementedError
+
+    async def ready(self) -> H1Connection | H2Connection:
+        """Await the connection handshake, then return the ready client facade
+        (`H1Connection`/`H2Connection`) to send requests on."""
+        assert self._connect_task is not None and self._client is not None  # set in connection_made
+        await self._connect_task
+        await self._client.ready()
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the connection — drops the read/write scopes and the transport. A no-op if the
+        connection was never established (`connection_made` not yet called)."""
+        if self._client is not None:
+            await self._client.__aexit__(None, None, None)
+
+
+class H1ClientProtocol(_ClientProtocol):
+    """Speak HTTP/1 on this connection."""
+
+    def _make_client(self):
+        return H1Connection(self, authority=self._authority, backend=self._backend)
+
+
+class H2ClientProtocol(_ClientProtocol):
+    """Speak HTTP/2 on this connection."""
+
+    def _make_client(self):
+        return H2Connection(self, authority=self._authority, scheme=self._scheme or "http", backend=self._backend)
+
+
+class AutoClientProtocol(_ClientProtocol):
+    """Pick HTTP/1 or HTTP/2 from the TLS ALPN result — the client-side analogue of
+    `AutoServerProtocol`'s preface sniff. `h2` -> HTTP/2; anything else (including plain TCP
+    with no ALPN) -> HTTP/1, matching `httpunk.util.connect`."""
+
+    def _make_client(self):
+        ssl_object = self._transport.get_extra_info("ssl_object")
+        selected = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+        if selected == "h2":
+            return H2Connection(self, authority=self._authority, scheme=self._scheme or "https", backend=self._backend)
+        return H1Connection(self, authority=self._authority, backend=self._backend)

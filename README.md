@@ -1,13 +1,15 @@
 # httpunk
 
-httpunk is a Rust-powered HTTP library for Python.
+httpunk is a Rust-powered async HTTP library for Python.
 It's powered by the [hyper](https://github.com/hyperium/hyper) stack and Rust crates like [http](https://github.com/hyperium/http).
 
 httpunk is deliberately *low-level*: you bring your own connected transport, and
 build requests and read responses directly. It's meant to be a solid, performant
 base for building HTTP clients and servers on top of.
 
-> **Note:** httpunk is in an early, alpha stage. The API may change between releases.
+httpunk's API mirrors hyper's wherever possible.
+
+> **Note:** httpunk is in an early, alpha stage.
 
 > **Note:** httpunk was built with substantial help from LLMs, under human supervision.
 
@@ -65,16 +67,19 @@ asyncio.run(main())
 pip install httpunk
 ```
 
-The `asyncio` backend has no extra dependencies. The `tonio` backend pulls in
-[tonio](https://github.com/gi0baro/tonio) and is only installed automatically on free-threaded
-CPython 3.14+ on Unix systems.
+httpunk supports additional backends beyond `asyncio`, but they require extra dependencies.
+Enable one via the relevant extra:
+
+```
+pip install httpunk[tonio]
+```
 
 ## Features
 
 - **HTTP/1 and HTTP/2**, client and server implementations
 - **Protocol-neutral structures** such as `Request`, `Response`, `HeaderMap`
 - **Multiple backend support**: `asyncio` and `tonio` (with `trio` targeted for future releases)
-- **AsyncIO ready-to-go protocols**: extensible `asyncio.Protocol` server classes (H1, H2, Auto)
+- **AsyncIO ready-to-go protocols**: extensible `asyncio.Protocol` classes (H1, H2, Auto)
 - **Batteries in the `util` module**: connect and ALPN negotiation, h1/h2 auto-detection, connection pooling, graceful shutdown, proxy-environment matching.
 
 ## Usage
@@ -271,7 +276,7 @@ except HTTPunkError:
 ### Utilities
 
 `httpunk.util` collects the higher-level conveniences a real client/server host needs. Unlike
-the core, these carry no wire-protocol fidelity constraint — they mirror hyper-util's shapes.
+the core, these carry no wire-protocol fidelity constraint.
 
 #### connect
 
@@ -333,10 +338,9 @@ All pools expose `retain(predicate)` (evict connections a predicate rejects), `i
 
 #### Graceful shutdown
 
-`GracefulShutdown` coordinates a graceful shutdown across many connections (hyper-util's
-`server::graceful::GracefulShutdown`). `watch(server, serve)` registers a connection and
-returns the coroutine that drives it; `shutdown()` signals every watched connection and waits
-for them to drain.
+`GracefulShutdown` coordinates a graceful shutdown across many connections.
+`watch(server, serve)` registers a connection and returns the coroutine that drives it;
+`shutdown()` signals every watched connection and waits for them to drain.
 
 ```python
 from httpunk.util import GracefulShutdown
@@ -368,8 +372,10 @@ if intercept is not None:
 
 ### AsyncIO utilities
 
-`httpunk.asyncio` provides reusable `asyncio.Protocol` server classes so you can embed httpunk
-in any asyncio-based server. Just subclass one and implement `handle(request)`:
+`httpunk.asyncio` provides reusable `asyncio.Protocol` classes so you
+can embed httpunk in any asyncio program.
+
+**Server protocols** — subclass one and implement `handle(request)`:
 
 - `H1ServerProtocol` / `H2ServerProtocol` — force the protocol.
 - `AutoServerProtocol` — detect HTTP/1 vs HTTP/2 from the client's opening bytes.
@@ -406,6 +412,38 @@ server = await loop.create_server(conns.track(MyServer), host, port)
 # ... on shutdown:
 server.close()                     # stop accepting new connections
 await conns.shutdown(timeout=30)   # drain in-flight, force-close stragglers
+```
+
+**Client protocols** — the mirror of the server ones, for `loop.create_connection`. Once the
+connection is up, `await proto.ready()` returns the httpunk client connection to send requests
+on. Configuration (`authority`/`scheme`) is passed via a factory closure, since
+`create_connection` calls the factory with no arguments.
+
+- `H1ClientProtocol` / `H2ClientProtocol` — force the protocol.
+- `AutoClientProtocol` — pick HTTP/1 vs HTTP/2 from the TLS ALPN result (plain TCP → HTTP/1).
+
+```python
+import asyncio
+import ssl
+
+import httpunk.asyncio
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    transport, proto = await loop.create_connection(
+        lambda: httpunk.asyncio.H2ClientProtocol(authority="example.com:443", scheme="https"),
+        "example.com", 443, ssl=ctx, server_hostname="example.com",
+    )
+    conn = await proto.ready()                 # await handshake -> H2Connection
+    resp = await conn.request("GET", "/", headers={"host": "example.com"})
+    print(resp.status, await resp.read())
+    await proto.aclose()
+
+
+asyncio.run(main())
 ```
 
 ## License
