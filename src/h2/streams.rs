@@ -16,7 +16,7 @@ use vendor_h2::frame::{Reason, Reset, StreamId};
 use vendor_h2::proto::streams::{FlowControl, State};
 use vendor_h2::proto::{Error, Initiator};
 
-use crate::py::errors::{ConnectionClosedError, HTTPunkError};
+use crate::errors::{ConnectionClosedError, HTTPunkError};
 
 create_exception!(
     _httpunk,

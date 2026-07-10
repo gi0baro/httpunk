@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Mutex;
 
-use crate::py::http::HeaderMap;
+use crate::http::HeaderMap;
 use vendor_hyper::{
     BodyDecode, BodyDecoder, BodyEncoder, encode_request, encode_response, parse_request,
     parse_response,

@@ -1,12 +1,11 @@
 use pyo3::prelude::*;
 use std::sync::OnceLock;
 
-// The vendored third-party code lives in separate workspace member crates —
-// `vendor_h2` (hyperium/h2 frame+hpack) and `vendor_hyper` (hyper h1 role+encode)
-// — so each owns its crate root (upstream `crate::` paths resolve with no
-// rewrite → byte-identical) and is excluded from this crate's fmt/clippy. This
-// crate is just the PyO3 adapter layer over them.
-mod py;
+mod errors;
+mod h1;
+mod h2;
+mod http;
+mod proxy;
 
 pub fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();
@@ -21,7 +20,11 @@ pub fn get_lib_version() -> &'static str {
 fn _httpunk(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
     module.add("__version__", get_lib_version())?;
 
-    py::register(module)?;
+    errors::register(module)?;
+    http::register(module)?;
+    h2::register(module)?;
+    h1::register(module)?;
+    proxy::register(module)?;
 
     Ok(())
 }

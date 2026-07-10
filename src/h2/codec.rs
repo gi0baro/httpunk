@@ -16,7 +16,7 @@ use pyo3::types::PyBytes;
 use std::sync::Mutex;
 
 use super::streams::H2ProtocolError;
-use crate::py::http::HeaderMap;
+use crate::http::HeaderMap;
 use vendor_h2::frame::{self, HEADER_LEN, Head, Kind};
 use vendor_h2::hpack;
 
