@@ -1,26 +1,15 @@
 # httpunk
 
-*Low-level HTTP/1 and HTTP/2 for Python, built on [hyper](https://hyper.rs).*
+httpunk is a Rust-powered HTTP library for Python.
+It's powered by the [hyper](https://github.com/hyperium/hyper) stack and Rust crates like [http](https://github.com/hyperium/http).
 
-httpunk is a low-level HTTP/1 and HTTP/2 client **and** server library for Python. It wraps
-the Rust [hyper](https://github.com/hyperium/hyper) stack (hyper, [h2](https://github.com/hyperium/h2)
-and hyper-util) as a native extension and drives it with a thin async orchestration layer in
-Python. The protocol machinery is the real hyper codebase; httpunk gives you Pythonic
-connection/server objects on top of it.
+httpunk is deliberately *low-level*: you bring your own connected transport, and
+build requests and read responses directly. It's meant to be a solid, performant
+base for building HTTP clients and servers on top of.
 
-It is deliberately *low-level*, in the same spirit as hyper's own `client::conn` /
-`server::conn`: you bring your own connected transport, you build requests and read responses
-by hand, and there are no per-verb shortcuts or hidden header magic. If you want a batteries-
-included HTTP client, this is the layer such a client would be built on — not the client
-itself.
+> **Note:** httpunk is in an early, alpha stage. The API may change between releases.
 
-> **Note**
-> httpunk is in an early, alpha stage. The API may change between releases.
-
-> **Note**
-> httpunk runs on CPython 3.10+ and PyPy. The high-performance `tonio` backend requires
-> free-threaded CPython 3.14+; the `asyncio` backend runs everywhere. See
-> [Backends](#backends).
+> **Note:** httpunk was built with substantial help from LLMs, under human supervision.
 
 ## In a nutshell
 
@@ -76,27 +65,17 @@ asyncio.run(main())
 pip install httpunk
 ```
 
-httpunk ships pre-built wheels containing the Rust extension, so a Rust toolchain is not
-required to install.
-
 The `asyncio` backend has no extra dependencies. The `tonio` backend pulls in
 [tonio](https://github.com/gi0baro/tonio) and is only installed automatically on free-threaded
-CPython 3.14+ (non-Windows).
+CPython 3.14+ on Unix systems.
 
 ## Features
 
-- **HTTP/1 and HTTP/2**, client and server, backed by the real hyper/h2 protocol code.
-- **Bring your own transport** — connections and servers are handed an already-connected
-  (client) or already-accepted (server) transport, so dialing, TLS and socket ownership stay
-  in your hands (or in `httpunk.util`).
-- **Protocol-neutral messages** — the same `Request` / `Response` / `HeaderMap` types work
-  across HTTP/1 and HTTP/2, so callers can treat the two interchangeably.
-- **Two interchangeable backends** — `tonio` (a multi-threaded runtime for free-threaded
-  Python) and `asyncio` (the standard library), selected explicitly per connection/server.
-- **`asyncio` embedding** — reusable `asyncio.Protocol` server classes bring HTTP/2 to
-  asyncio-based hosts (uvicorn/hypercorn-style) that otherwise only speak HTTP/1.
-- **Batteries in `httpunk.util`** — connect + ALPN negotiation, h1/h2 auto-detection,
-  connection pooling, graceful shutdown, and proxy-environment matching.
+- **HTTP/1 and HTTP/2**, client and server implementations
+- **Protocol-neutral structures** such as `Request`, `Response`, `HeaderMap`
+- **Multiple backend support**: `asyncio` and `tonio` (with `trio` targeted for future releases)
+- **AsyncIO ready-to-go protocols**: extensible `asyncio.Protocol` server classes (H1, H2, Auto)
+- **Batteries in the `util` module**: connect and ALPN negotiation, h1/h2 auto-detection, connection pooling, graceful shutdown, proxy-environment matching.
 
 ## Usage
 
@@ -146,7 +125,7 @@ transport.
 `Request` is protocol-neutral: `Request(method, target, *, headers=None, body=None,
 trailers=None)`. The request-target is sent **verbatim** (a path, an absolute URL, or an
 authority for `CONNECT`) — httpunk never rewrites it or auto-adds a `Host` header, so you
-supply headers explicitly. This is the same low-level contract as hyper's `client::conn`.
+supply headers explicitly.
 
 `Response` exposes `status`, `headers` (a `HeaderMap`), and a lazily-streamed body:
 
@@ -221,7 +200,7 @@ other streams keep running.
 
 HTTP/1 serves one request/response at a time (the loop won't yield the next until the current
 one is answered); HTTP/2 multiplexes, so for concurrent handling you would spawn a task per
-request. The [`httpunk.asyncio`](#httpunkasyncio) protocols handle that for you.
+request. The [AsyncIO](#asyncio-utilities) protocols handle that for you.
 
 Servers support cooperative graceful shutdown via `server.graceful_shutdown()` (see
 [`GracefulShutdown`](#graceful-shutdown) for coordinating this across many connections).
@@ -248,26 +227,32 @@ iterable of `(name, value)` pairs.
 
 ### Errors
 
-httpunk's exceptions derive from a common `H2Error` base (defined in Rust, shared with the h2
-state machine):
+httpunk's exceptions all derive from a common `HTTPunkError` root. `ConnectionClosedError`
+is **protocol-neutral** — raised on both HTTP/1 and HTTP/2 when the transport closes with
+work in flight — so it sits directly under the root. Every **HTTP/2-specific** error shares
+the `H2Error` sub-base:
 
 ```
-H2Error
-├── H2ProtocolError      connection-level protocol violation (-> GOAWAY)
-├── H2StreamError        stream-level protocol violation (-> RST_STREAM)
-├── H2UserError          local API misuse
-├── H2FlowControlError   flow-control window over/underflow
-├── ConnectionClosedError    transport closed / IO error with work in flight
-├── GoAwayError          the peer sent GOAWAY
-└── StreamResetError     the peer sent RST_STREAM for a stream
+HTTPunkError
+├── ConnectionClosedError    transport closed / IO error with work in flight  (HTTP/1 + HTTP/2)
+└── H2Error                  base for HTTP/2 protocol errors
+    ├── H2ProtocolError      connection-level protocol violation (-> GOAWAY)
+    ├── H2StreamError        stream-level protocol violation (-> RST_STREAM)
+    ├── H2UserError          local API misuse
+    ├── H2FlowControlError   flow-control window over/underflow
+    ├── GoAwayError          the peer sent GOAWAY
+    └── StreamResetError     the peer sent RST_STREAM for a stream
 ```
+
+Catch `H2Error` for HTTP/2 protocol failures, `ConnectionClosedError` for a dropped
+transport, or `HTTPunkError` for anything httpunk raises.
 
 `GoAwayError` carries `last_stream_id`, `error_code` and `debug_data`; `StreamResetError`
 carries `stream_id` and `error_code`. Error codes are `H2Reason` members (an `IntEnum`, so
 they compare equal to plain ints) for known codes, or a raw int otherwise.
 
 ```python
-from httpunk import GoAwayError, StreamResetError, H2Error
+from httpunk import ConnectionClosedError, GoAwayError, HTTPunkError, StreamResetError
 
 try:
     resp = await conn.request("GET", "/")
@@ -277,11 +262,13 @@ except StreamResetError as exc:
 except GoAwayError as exc:
     # streams above last_stream_id were not processed and are safe to retry
     print("server going away:", exc.last_stream_id)
-except H2Error:
+except ConnectionClosedError:
+    print("transport dropped")
+except HTTPunkError:
     ...
 ```
 
-### `httpunk.util`
+### Utilities
 
 `httpunk.util` collects the higher-level conveniences a real client/server host needs. Unlike
 the core, these carry no wire-protocol fidelity constraint — they mirror hyper-util's shapes.
@@ -304,7 +291,7 @@ async with await connect("https://example.com", backend=Backend.asyncio) as conn
     resp = await conn.request("GET", "/", headers={"host": "example.com"})
 ```
 
-#### auto.serve
+#### Auto protocol
 
 `auto.serve(transport, *, backend, only=None, cancel=None)` sniffs an accepted transport's
 opening bytes and returns the matching **un-entered** `H1Server` or `H2Server` — the accepting-
@@ -379,11 +366,10 @@ if intercept is not None:
     print(intercept.uri)   # the proxy to use for this URL
 ```
 
-### `httpunk.asyncio`
+### AsyncIO utilities
 
 `httpunk.asyncio` provides reusable `asyncio.Protocol` server classes so you can embed httpunk
-in any asyncio-based server. Unlike the HTTP/1-only protocols shipped by uvicorn/hypercorn,
-these also bring **HTTP/2**. Subclass one and implement `handle(request)`:
+in any asyncio-based server. Just subclass one and implement `handle(request)`:
 
 - `H1ServerProtocol` / `H2ServerProtocol` — force the protocol.
 - `AutoServerProtocol` — detect HTTP/1 vs HTTP/2 from the client's opening bytes.
