@@ -7,7 +7,7 @@ from _client import open_h1
 from tonio.colored import Event, scope
 from tonio.colored.net import open_tcp_listeners
 
-from httpunk import H2Error
+from httpunk import HTTPunkError
 
 
 async def _read_request(stream):
@@ -214,7 +214,7 @@ async def test_connection_close_refuses_reuse():
         s.spawn(_serve(listener, [resp], requests, done))
         async with open_h1(host, port) as conn:
             assert await (await conn.request("GET", "/")).read() == b"hi"
-            with pytest.raises(H2Error):  # ConnectionClosedError: server said Connection: close
+            with pytest.raises(HTTPunkError):  # ConnectionClosedError: server said Connection: close
                 await conn.request("GET", "/again")
         await done.wait()
         s.cancel()

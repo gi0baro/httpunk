@@ -23,11 +23,15 @@ HeaderNameLike = str | bytes
 HeaderValueLike = str | bytes
 
 # ===========================================================================
-# Errors  (src/py/h2/streams.rs — registered on the h2 module, used everywhere)
+# Errors  (protocol-neutral root + ConnectionClosedError in src/py/errors.rs;
+# the H2* protocol errors in src/py/h2/streams.rs)
 # ===========================================================================
 
-class H2Error(Exception):
-    """Base class for every httpunk protocol/transport error."""
+class HTTPunkError(Exception):
+    """Base class for every httpunk error (HTTP/1 and HTTP/2)."""
+
+class H2Error(HTTPunkError):
+    """Base class for every httpunk HTTP/2 protocol error."""
 
 class H2ProtocolError(H2Error):
     """Connection-level protocol violation (-> GOAWAY). args = (reason: int | None, message: str)."""
@@ -42,9 +46,10 @@ class H2UserError(H2Error):
 class H2FlowControlError(H2Error):
     """Flow-control window over/underflow. args = (reason: int,)."""
 
-class ConnectionClosedError(H2Error):
+class ConnectionClosedError(HTTPunkError):
     """The transport closed (EOF/reset/IO error) with work still in flight — a
-    transport failure, not a protocol violation (so no GOAWAY)."""
+    transport failure, not a protocol violation (so no GOAWAY). Protocol-neutral:
+    raised on both HTTP/1 and HTTP/2, hence it sits under HTTPunkError, not H2Error."""
 
 # ===========================================================================
 # HeaderMap  (src/py/http/mod.rs)

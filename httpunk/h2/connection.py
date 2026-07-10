@@ -206,9 +206,12 @@ class H2ConnectionBase:
             self._fail(exc)
         except OSError as exc:
             # A raw transport error — an abrupt peer RST (ConnectionResetError), a
-            # broken pipe, etc. Surface it as a clean `ConnectionClosedError` (an
-            # H2Error) so callers see the protocol error type, not a bare socket errno
-            # (h2 maps Io errors this way; cf. the explicit EOF branch above).
+            # broken pipe, etc. Surface it as a clean `ConnectionClosedError` (a
+            # transport failure, not a protocol violation, so no GOAWAY) rather than a
+            # bare socket errno (h2 maps Io errors this way; cf. the explicit EOF branch
+            # above). It is protocol-neutral (an `HTTPunkError`, not an `H2Error`), so it
+            # is NOT caught by the `except H2Error` GOAWAY branch above — correctly, since
+            # you can't send GOAWAY on a dead transport.
             self._fail(ConnectionClosedError(f"connection closed: {exc}"))
         except Exception as exc:  # any other unexpected error (cancellation is BaseException)
             self._fail(exc)

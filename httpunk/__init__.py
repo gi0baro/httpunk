@@ -10,6 +10,7 @@ from .exceptions import (
     H2Reason as H2Reason,
     H2StreamError as H2StreamError,
     H2UserError as H2UserError,
+    HTTPunkError as HTTPunkError,
     StreamResetError as StreamResetError,
 )
 from .h1 import H1Connection as H1Connection, H1Server as H1Server

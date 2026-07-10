@@ -1,6 +1,7 @@
 """Phase 3 error taxonomy: the client surfaces GOAWAY / RST_STREAM / EOF as
-typed exceptions (all subclasses of H2Error), driven by a server that emits
-those frames."""
+typed exceptions (all subclasses of HTTPunkError — the protocol violations under
+H2Error, connection-closed under ConnectionClosedError), driven by a server that
+emits those frames."""
 
 import pytest
 from _client import open_h2
@@ -14,6 +15,7 @@ from httpunk import (
     H2FlowControlError,
     H2ProtocolError,
     H2Reason,
+    HTTPunkError,
     StreamResetError,
 )
 from httpunk._backend.tonio import TonioBackend
@@ -179,7 +181,7 @@ async def test_connection_closed_raises():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            with pytest.raises(H2Error):  # ConnectionClosedError (or a reset surfaced as such)
+            with pytest.raises(HTTPunkError):  # ConnectionClosedError (or a reset surfaced as such)
                 await conn.request("GET", "/")
         s.cancel()
 
@@ -712,7 +714,7 @@ async def test_close_wakes_inflight_waiter():
             await req_received.wait()  # do_get has sent HEADERS and is parked on the head
             await conn.__aexit__(None, None, None)  # close while do_get is parked
         # inner joined -> do_get finished; it must have been woken with an error
-        assert isinstance(outcome.get("err"), H2Error)
+        assert isinstance(outcome.get("err"), HTTPunkError)
         s.cancel()
 
 

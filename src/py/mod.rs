@@ -7,6 +7,7 @@
 //! short/internal; the Python-facing names (the pyclass `name = "..."`) are all
 //! `H2`-prefixed so their origin is unambiguous from Python.
 
+mod errors;
 mod h1;
 mod h2;
 mod http;
@@ -16,8 +17,10 @@ use pyo3::prelude::*;
 
 /// Register all pyclasses, exceptions, and enums on the extension module.
 pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
+    errors::register(m)?;
     http::register(m)?;
     h2::register(m)?;
     h1::register(m)?;
-    proxy::register(m)
+    proxy::register(m)?;
+    Ok(())
 }

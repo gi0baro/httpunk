@@ -1,16 +1,19 @@
 """httpunk's error taxonomy.
 
-Everything derives from `H2Error` (defined in Rust so the state-machine /
-flow-control / API-misuse errors raised by the extension share the same base):
+Everything derives from `HTTPunkError`, the neutral root. `ConnectionClosedError`
+is protocol-neutral (raised on both HTTP/1 and HTTP/2); every other subtype is
+HTTP/2-specific and shares the `H2Error` sub-base (defined in Rust, so the
+state-machine / flow-control / API-misuse errors raised by the extension share it):
 
-    H2Error
-    ├── H2ProtocolError      connection-level protocol violation (-> GOAWAY; Rust)
-    ├── H2StreamError        stream-level protocol violation (-> RST_STREAM; Rust)
-    ├── H2UserError          local API misuse (from the Rust state machine)
-    ├── H2FlowControlError   flow-control window over/underflow (Rust)
-    ├── ConnectionClosedError     transport closed/IO error with work in flight (Rust)
-    ├── GoAwayError          peer sent GOAWAY
-    └── StreamResetError          peer sent RST_STREAM for a stream
+    HTTPunkError
+    ├── ConnectionClosedError     transport closed/IO error with work in flight (HTTP/1 + HTTP/2; Rust)
+    └── H2Error                   base for HTTP/2 protocol errors (Rust)
+        ├── H2ProtocolError       connection-level protocol violation (-> GOAWAY; Rust)
+        ├── H2StreamError         stream-level protocol violation (-> RST_STREAM; Rust)
+        ├── H2UserError           local API misuse (from the Rust state machine)
+        ├── H2FlowControlError    flow-control window over/underflow (Rust)
+        ├── GoAwayError           peer sent GOAWAY
+        └── StreamResetError      peer sent RST_STREAM for a stream
 
 `error_code` attributes are `H2Reason` members for known codes (an `IntEnum`, so
 they compare equal to ints), or a plain int for codes outside the RFC set.
@@ -26,6 +29,7 @@ from ._httpunk import (
     H2Reason as H2Reason,
     H2StreamError as H2StreamError,
     H2UserError as H2UserError,
+    HTTPunkError as HTTPunkError,
 )
 
 

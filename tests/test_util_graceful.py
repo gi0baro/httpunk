@@ -17,7 +17,7 @@ from tonio.colored.net import open_tcp_listeners
 from httpunk import H1Connection, H2Connection, H2Reason
 from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import H2Codec, H2FrameGoAway, H2FramePing
-from httpunk.exceptions import H2Error
+from httpunk.exceptions import HTTPunkError
 from httpunk.h1.server import H1Server, ServerConnection as H1ServerConnection
 from httpunk.h2.server import H2Server, ServerConnection as H2ServerConnection
 from httpunk.http import HeaderMap
@@ -230,8 +230,9 @@ async def test_h2_graceful_drains_open_connection_then_closes():
         assert graceful.count() == 0
 
         # A new request is refused: either GoAwayError (the client saw our GOAWAY) or
-        # ConnectionClosedError (it saw EOF first) — both are H2Error, timing-dependent.
-        with pytest.raises(H2Error):
+        # ConnectionClosedError (it saw EOF first) — both are HTTPunkError (GoAwayError is
+        # also an H2Error; ConnectionClosedError is protocol-neutral), timing-dependent.
+        with pytest.raises(HTTPunkError):
             await conn.request("GET", "/")
         await conn.__aexit__(None, None, None)
 

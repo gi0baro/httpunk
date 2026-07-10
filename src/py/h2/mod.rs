@@ -68,11 +68,6 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
         "H2FlowControlError",
         m.py().get_type::<streams::H2FlowControlError>(),
     )?;
-    m.add(
-        "ConnectionClosedError",
-        m.py().get_type::<streams::ConnectionClosedError>(),
-    )?;
-
     m.add("H2Reason", build_reason(m.py())?)?;
 
     Ok(())

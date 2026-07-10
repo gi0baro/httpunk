@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from httpunk import H1Connection, H2Connection, H2Error
+from httpunk import H1Connection, H2Connection, H2Error, HTTPunkError
 from httpunk._backend.asyncio import AsyncioBackend
 from httpunk.asyncio import AutoServerProtocol, H1ServerProtocol, H2ServerProtocol, ServerConnections
 
@@ -154,7 +154,7 @@ async def test_h2_protocol_graceful_shutdown():
         proto = protocols[0]
         await proto.graceful_shutdown()  # GOAWAY + refuse-new
         await proto.wait_closed()  # drains (idle) + closes -> resolves
-        with pytest.raises(H2Error):  # new work refused after the GOAWAY
+        with pytest.raises(HTTPunkError):  # new work refused after the GOAWAY (GoAway or ConnClosed)
             await conn.request("GET", "/again")
         await conn.__aexit__(None, None, None)
 
@@ -193,8 +193,8 @@ async def test_server_connections_tracks_and_gracefully_shuts_down():
         assert conns.count() == 1  # the live connection is tracked
         await conns.shutdown(timeout=5)  # graceful; the idle connection drains + closes
         assert conns.count() == 0  # deregistered when its serve task finished
-        with pytest.raises(H2Error):
-            await conn.request("GET", "/again")  # refused after the GOAWAY
+        with pytest.raises(HTTPunkError):
+            await conn.request("GET", "/again")  # refused after the GOAWAY (GoAway or ConnClosed)
         await conn.__aexit__(None, None, None)
 
 

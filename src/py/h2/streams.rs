@@ -7,7 +7,7 @@
 //! value, so they are `Sync` and safe to share across worker threads.
 
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Mutex;
 
@@ -16,11 +16,13 @@ use vendor_h2::frame::{Reason, Reset, StreamId};
 use vendor_h2::proto::streams::{FlowControl, State};
 use vendor_h2::proto::{Error, Initiator};
 
+use crate::py::errors::{ConnectionClosedError, HTTPunkError};
+
 create_exception!(
     _httpunk,
     H2Error,
-    PyException,
-    "Base class for every httpunk HTTP/2 error."
+    HTTPunkError,
+    "Base class for every httpunk HTTP/2 protocol error."
 );
 create_exception!(
     _httpunk,
@@ -47,14 +49,6 @@ create_exception!(
     H2Error,
     "Flow-control window over/underflow. args = (reason: int,)."
 );
-create_exception!(
-    _httpunk,
-    ConnectionClosedError,
-    H2Error,
-    "The transport closed (EOF/reset/IO error) with work still in flight — a \
-     transport failure, not a protocol violation (so no GOAWAY)."
-);
-
 /// Stable discriminant tag for each `h2::UserError` variant, so Python callers
 /// can distinguish them programmatically (e.g. `OverflowedStreamId` =
 /// retry-on-a-new-connection) instead of matching the display string.

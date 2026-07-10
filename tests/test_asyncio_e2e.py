@@ -12,7 +12,7 @@ import sys
 import pytest
 import trustme
 
-from httpunk import H1Connection, H2Connection, H2Error
+from httpunk import H1Connection, H2Connection, HTTPunkError
 from httpunk._backend.asyncio import AsyncioBackend, _AsyncioStream
 from httpunk.h1.server import H1Server
 from httpunk.h2.server import H2Server
@@ -246,6 +246,6 @@ async def test_h2_graceful_drains_and_refuses_new():
         assert graceful.count() == 1
         await graceful.shutdown()  # GOAWAY + drain (idle) + close
         assert graceful.count() == 0
-        with pytest.raises(H2Error):  # new work refused after shutdown
+        with pytest.raises(HTTPunkError):  # new work refused after shutdown (GoAway or ConnClosed)
             await conn.request("GET", "/")
         await conn.__aexit__(None, None, None)
