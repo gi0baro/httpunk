@@ -4,7 +4,7 @@ authors = [
     {name = "Giovanni Barillari", email = "g@baro.dev"},
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: BSD License",
     "Operating System :: MacOS",
@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Python",
     "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP",
 ]
 
 dynamic = [

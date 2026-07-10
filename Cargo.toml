@@ -1,14 +1,14 @@
 [package]
 name = "httpunk"
 version = "0.1.0-alpha1"
-description = "TBD"
+description = "The Rust HTTP library for Python"
 authors = [
     "Giovanni Barillari <g@baro.dev>",
 ]
 license = "BSD-3-Clause"
 edition = "2024"
 
-keywords = ["http"]
+keywords = ["http", "h10", "h11", "h2"]
 
 readme = "README.md"
 homepage = "https://github.com/gi0baro/httpunk"
