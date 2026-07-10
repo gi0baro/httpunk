@@ -1,10 +1,10 @@
 """asyncio backend: the runtime primitives the drivers need, on `asyncio`.
 
 The second backend (after tonio), validating that the drivers depend only on the
-seam (see PLAN §12). `import asyncio` below is the stdlib (absolute imports) — this
+seam. `import asyncio` below is the stdlib (absolute imports) — this
 module is `httpunk._backend.asyncio`, not the top-level package.
 
-Approach B (PLAN §12.4): asyncio's TCP is transport/protocol-based and eagerly
+asyncio's TCP is transport/protocol-based and eagerly
 drains the kernel socket into a userspace buffer, so — unlike tonio — a non-blocking
 `receive_nowait` must peek *that* buffer. Rather than lean on `StreamReader`'s
 private `_buffer`, we own a custom `asyncio.Protocol` (`_AsyncioStream`) that IS the

@@ -47,7 +47,7 @@ echo "vendoring from: $SRC"
 # 1. Copy the sans-IO leaf modules verbatim (head parse/encode, the body
 #    Encoder + Decoder, and the sync support they pull in). The genuinely-async
 #    orchestration (conn.rs, dispatch.rs, most of io.rs, client/server/upgrade)
-#    is NOT vendored — that is rewritten in Python (see PLAN.md §4).
+#    is NOT vendored — that is rewritten in Python.
 mkdir -p "$DST/proto/h1" "$DST/body" "$DST/ext" "$DST/common"
 cp "$SRC/src/proto/h1/role.rs" "$DST/proto/h1/role.rs"
 cp "$SRC/src/proto/h1/encode.rs" "$DST/proto/h1/encode.rs"

@@ -30,8 +30,7 @@ include = [
 
 # The vendored third-party crates live in their own workspace members so each
 # owns its crate root (upstream `crate::` paths resolve with no rewrite → truly
-# byte-identical) and is excluded from the main crate's fmt/clippy. See
-# THIRD-PARTY.md and PLAN.md §4.
+# byte-identical) and is excluded from the main crate's fmt/clippy.
 [workspace]
 members = ["crates/vendor-h2", "crates/vendor-hyper", "crates/vendor-hyper-util"]
 

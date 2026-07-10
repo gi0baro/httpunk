@@ -5,7 +5,7 @@
 //! support types they depend on (`headers`, `ext`, `error`, `body::length`,
 //! `proto::MessageHead`). hyper's async `conn`, `decode`, `io`, `dispatch`,
 //! `client`, `server` and `upgrade` are intentionally *not* vendored — that
-//! orchestration is rewritten in Python (see `PLAN.md`).
+//! orchestration is rewritten in Python.
 //!
 //! The `.rs` files under here are kept **byte-identical to upstream** so a
 //! `git diff` between two vendored versions shows only genuine upstream changes.

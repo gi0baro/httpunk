@@ -4,7 +4,7 @@
 Connection reuse is inherently runtime-bound (it manages live connections), so —
 unlike the vendored proxy matcher — it lives in Python. hyper-util layers these as
 tower `Service`s; we keep the same *concepts and names* as concrete helpers, with
-**no** `Service`/`MakeService` abstraction (the decided approach, PLAN §11.6):
+**no** `Service`/`MakeService` abstraction:
 
 - `Singleton` — coalesce concurrent connects to **one shared** connection (the HTTP/2
   case: one multiplexed connection for all callers).

@@ -6,7 +6,7 @@
 //! frame parse/serialize) and `hpack` (HPACK header compression), plus the tiny
 //! `ext::Protocol` type they depend on. h2's async `codec`, `proto`, `client`
 //! and `server` are intentionally *not* vendored — that orchestration is
-//! rewritten in Python (see `PLAN.md`).
+//! rewritten in Python.
 //!
 //! The `.rs` files under here are kept **byte-identical to upstream modulo a
 //! uniform `crate::` -> `crate::` rewrite** the vendor script applies, so

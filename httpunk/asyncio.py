@@ -2,8 +2,8 @@
 hypercorn, …) by subclassing one of these and implementing `handle(request)`.
 
 Unlike uvicorn's h11/httptools protocols (HTTP/1 only), these also bring **HTTP/2**.
-They are `asyncio.Protocol` subclasses of the asyncio backend's `_AsyncioStream`
-(approach B, PLAN §12.8): the host owns the loop and hands the protocol a transport
+They are `asyncio.Protocol` subclasses of the asyncio backend's `_AsyncioStream`:
+the host owns the loop and hands the protocol a transport
 via `loop.create_server(factory)`; the protocol drives httpunk's server over *itself*
 and calls your `handle` per request.
 

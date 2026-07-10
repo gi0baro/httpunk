@@ -10,8 +10,7 @@ MAX_CONCURRENT_STREAMS), `Connection` (the client protocol driver over the share
 collapses `http2::handshake` + the spawned `Connection` driver + `SendRequest`
 into one async-context-managed object. The core method is `send_request(Request)
 -> Response` (≈ `SendRequest::send_request`); `request` is a thin wrapper.
-This layer is low-level by design — no pool, connector, or high-level client
-(those live downstream; see PLAN.md §3.3).
+This layer is low-level by design — no pool, connector, or high-level client.
 
 Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 """
