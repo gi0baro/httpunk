@@ -49,9 +49,7 @@ test = [
     'pytest~=8.3',
     'pytest-asyncio~=0.24',
     'trustme~=1.1',
-    # tonio only builds on free-threaded CPython >= 3.14; the marker is required so the
-    # lockfile resolves across the project's full `requires-python` (>=3.10) range.
-    "tonio; python_version >= '3.14'",
+    "tonio; python_version >= '3.14' and platform_system != 'Windows'",
 ]
 
 all = [
