@@ -297,9 +297,7 @@ async def test_server_detach_hands_off_open_connection():
         s.spawn(serve())
         client = await _raw_client(host, port)
         # request head + trailing bytes the client sent past it (must survive as `leftover`)
-        await client.send_all(
-            b"GET /up HTTP/1.1\r\nhost: x\r\nupgrade: custom\r\nconnection: upgrade\r\n\r\nEXTRA"
-        )
+        await client.send_all(b"GET /up HTTP/1.1\r\nhost: x\r\nupgrade: custom\r\nconnection: upgrade\r\n\r\nEXTRA")
         data = await _read_until(client, b"OWNED")
         s.cancel()
 
