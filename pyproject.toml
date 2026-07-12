@@ -36,7 +36,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-tonio = ["tonio~=0.7.1; python_version >= '3.14'"]
+tonio = ["tonio~=0.8.1; python_version >= '3.14'"]
 
 [dependency-groups]
 build = [
