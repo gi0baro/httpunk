@@ -9,6 +9,7 @@ from _client import open_h1
 from tonio.colored import scope
 from tonio.colored.net import open_tcp_listeners
 
+from httpunk._backend.asyncio import AsyncioBackend
 from httpunk._backend.tonio import TonioBackend
 from httpunk.exceptions import ConnectionClosedError
 from httpunk.h1 import H1Server
@@ -75,6 +76,22 @@ class _StubTransport:
 
     def close(self):
         self.closed = True
+
+
+class _PeekableStub(_StubTransport):
+    """A stub whose SECOND payload becomes readable only after the first is consumed —
+    models a pipelined request sitting buffered in the transport while the previous
+    request is being served."""
+
+    def __init__(self, first, buffered):
+        super().__init__(first)
+        self._buffered = buffered
+
+    async def receive_some(self, max_bytes=65536):
+        if self._data:
+            return await super().receive_some(max_bytes)
+        chunk, self._buffered = self._buffered[:max_bytes], self._buffered[max_bytes:]
+        return chunk
 
 
 async def _echo_server(listener, seen=None):
@@ -274,6 +291,26 @@ async def test_server_header_read_timeout_closes_slow_head():
         data = await _drain_all(transport)  # server times out and closes -> EOF
         assert data == b""  # no response sent; the connection was just closed
         s.cancel()
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_wins_over_buffered_pipelined_request():
+    """REGRESSION GUARD: a graceful-shutdown signal is honored BEFORE any idle read consumes
+    already-buffered bytes — hyper stops parsing new heads once keep-alive is disabled
+    (`can_read_head` under KA::Disabled), so a pipelined request already sitting in the
+    transport must NOT be served. Whitebox: the shutdown event is set directly (without
+    `graceful_shutdown()`'s `_reusable = False`, which would end the accept loop before the
+    read even starts) to pin the in-loop ordering: shutdown check -> read."""
+    transport = _PeekableStub(
+        b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n",
+        b"GET /b HTTP/1.1\r\nhost: x\r\n\r\n",
+    )
+    conn = ServerConnection(transport, backend=AsyncioBackend())
+    req = await conn.next_request()
+    assert req.target == "/a"
+    await req.respond(200)
+    conn._shutdown_evt.set()  # signal only (whitebox) — see docstring
+    assert await conn.next_request() is None  # /b is readable but must NOT be parsed
 
 
 @pytest.mark.tonio

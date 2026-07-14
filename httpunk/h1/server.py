@@ -372,13 +372,22 @@ class ServerConnection(H1ConnectionBase):
         idle = not initial  # no bytes of this request seen yet -> a graceful shutdown may end it
         while True:
             if idle:
-                # Between requests: race the read against a graceful-shutdown signal
-                # so an idle keep-alive connection completes promptly (tonio can't
-                # wake a parked recv from another task; hyper's poll re-checks
-                # `should_read` and completes instead of reading).
-                data = await self._read_or_shutdown(_READ_SIZE)
-                if data is _SHUTDOWN:
+                # Between requests: a graceful shutdown may end the wait (see
+                # `_read_or_shutdown` — sync; returns the sentinel or the read awaitable).
+                read = self._read_or_shutdown(_READ_SIZE)
+                if read is _SHUTDOWN:
                     return None
+                # Flag the park as idle so graceful_shutdown() may wake THIS read only —
+                # never a mid-head read (a request in flight must complete).
+                self._idle_read_parked = True
+                try:
+                    data = await read
+                finally:
+                    self._idle_read_parked = False
+                if data is _SHUTDOWN:  # tonio select: the shutdown signal won the race
+                    return None
+                # An interrupt_read shutdown wake surfaces as b"" and falls into the EOF
+                # return below — same outcome either way (loop ends; close, no response).
             else:
                 data = await self.transport.receive_some(_READ_SIZE)
             if not data:
@@ -403,27 +412,24 @@ class ServerConnection(H1ConnectionBase):
             if buffered >= _MAX_HEAD_SIZE:
                 raise ValueError("message head is too large (Parse::TooLarge)")
 
-    async def _read_or_shutdown(self, n):
-        # Read the next head byte(s), or `_SHUTDOWN` if `graceful_shutdown()` fires
-        # first. The backend's `select` cancels the losing branch, so the parked read
-        # is cleanly dropped when shutdown wins.
+    def _read_or_shutdown(self, n):
+        """The next idle-read awaitable, or `_SHUTDOWN` if a graceful shutdown was already
+        requested. A plain (sync) function so the fast path adds no wrapper coroutine: the
+        caller awaits the returned awaitable with `_idle_read_parked` set around it (so
+        `graceful_shutdown()` wakes only an idly-parked read, never a mid-head one) and
+        treats an awaited `_SHUTDOWN` — or a woken `b""` — as shutdown, not data.
+
+        asyncio (`native_read_interrupt`): a plain read; if it parks, graceful_shutdown()
+        wakes it via `interrupt_read` and the read returns b"". Backends without a native
+        read interrupt (tonio can't wake a parked recv from another task): race the read
+        against the shutdown signal via `select`, which cancels the losing branch — hyper's
+        poll instead re-checks `should_read` and completes without reading."""
         if self._shutdown_evt.is_set():
             return _SHUTDOWN
 
         if self._native_read_interrupt:
-            # asyncio: a plain read; if it parks, graceful_shutdown() wakes it via
-            # `interrupt_read` (a shutdown-woken read returns b"") — no per-read select race.
-            self._idle_read_parked = True
-            try:
-                data = await self.transport.receive_some(n)
-            finally:
-                self._idle_read_parked = False
-            if not data and self._shutdown_evt.is_set():
-                return _SHUTDOWN
-            return data
+            return self.transport.receive_some(n)
 
-        # Backends without native read control (tonio can't wake a parked recv from another
-        # task): race the read against the shutdown signal via `select`.
         def _recv():
             return self.transport.receive_some(n)
 
@@ -431,7 +437,7 @@ class ServerConnection(H1ConnectionBase):
             await self._shutdown_evt.wait()
             return _SHUTDOWN
 
-        return await self.backend.select(_recv(), _await_shutdown())
+        return self.backend.select(_recv(), _await_shutdown())
 
     async def _send_error(self, codec, status):
         """Best-effort automatic error response (bodyless, `Connection: close`),
