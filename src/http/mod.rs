@@ -238,6 +238,22 @@ impl HeaderMap {
         Ok(self.items_list(py)?.unbind())
     }
 
+    /// Every `(name, value)` pair with the name as raw `bytes` (already lowercase
+    /// ASCII in the `http` crate), in order, duplicates included — the exact shape
+    /// ASGI servers want for a scope's `headers`, in one boundary crossing and with
+    /// no per-name re-encoding.
+    fn raw_items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let guard = self.inner.lock().unwrap();
+        let list = PyList::empty(py);
+        for (name, value) in guard.iter() {
+            list.append((
+                PyBytes::new(py, name.as_str().as_bytes()),
+                PyBytes::new(py, value.as_bytes()),
+            ))?;
+        }
+        Ok(list.unbind())
+    }
+
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let list = PyList::new(py, self.keys())?;
         Ok(list.try_iter()?.into_any().unbind())

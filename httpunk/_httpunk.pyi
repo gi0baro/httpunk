@@ -88,6 +88,11 @@ class HeaderMap:
     def items(self) -> list[tuple[str, bytes]]:
         """Every `(name, value)` pair, in order (duplicates included)."""
 
+    def raw_items(self) -> list[tuple[bytes, bytes]]:
+        """Every `(name, value)` pair with the name as raw `bytes` (already lowercase
+        ASCII), in order, duplicates included — the exact shape ASGI servers want for a
+        scope's `headers`, in one boundary crossing with no per-name re-encoding."""
+
     def __iter__(self) -> Iterator[str]: ...
     def __len__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...

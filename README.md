@@ -230,6 +230,13 @@ h.get_all("set-cookie")      # [b'a=1', b'b=2']
 Anywhere a `headers=` argument is accepted you can pass a `HeaderMap`, a mapping, or an
 iterable of `(name, value)` pairs.
 
+For consumers that want raw pairs — e.g. an ASGI server building a scope's `headers` —
+`raw_items()` returns `(bytes, bytes)` tuples (names already lowercase) in one call:
+
+```python
+h.raw_items()                # [(b'content-type', b'text/plain'), (b'set-cookie', b'a=1'), ...]
+```
+
 ### Errors
 
 httpunk's exceptions all derive from a common `HTTPunkError` root. `ConnectionClosedError`
