@@ -1,6 +1,6 @@
 [package]
 name = "httpunk"
-version = "0.1.1"
+version = "0.1.2"
 description = "The Rust HTTP library for Python"
 authors = [
     "Giovanni Barillari <g@baro.dev>",
