@@ -19,4 +19,4 @@ client-proxy-system = []
 http = "1"
 ipnet = "2.9"
 percent-encoding = "2.3"
-base64 = "0.22"
+base64 = "0.23"
