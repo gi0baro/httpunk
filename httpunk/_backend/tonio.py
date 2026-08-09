@@ -13,6 +13,7 @@ from tonio.colored.net.tls import open_tls_over_tcp_stream as _open_tls_over_tcp
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
 from tonio.colored.sync.channel import unbounded as _unbounded
 from tonio.colored.time import time as _now, timeout as _timeout
+from tonio.exceptions import CancelledError
 
 
 class _TonioSemaphore:
@@ -29,7 +30,12 @@ class _TonioSemaphore:
     async def acquire(self):
         event = self._sem.acquire()
         if event is not None:
-            await event.waiter(None)
+            try:
+                await event.waiter(None)
+            except CancelledError:
+                if not event.set():
+                    self._sem.release()
+                raise
 
     def release(self):
         self._sem.release()
