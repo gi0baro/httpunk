@@ -22,7 +22,6 @@ of h2's streams layer to a coroutine model, so refs are the logic each method
 mirrors, not a line-for-line port.
 """
 
-import contextlib
 import threading
 
 from .._common import aiter_body
@@ -222,7 +221,7 @@ class StreamManager:
         # state, and framing on a non-streaming stream must surface the reset (F45).
         if not st.state.is_send_streaming():
             raise self._send_stopped_error(st)
-        await self._conn.send_frame(self._conn.codec.serialize_trailers(st.id, trailers))
+        await self._conn.send_frame_or_fail(self._conn.codec.serialize_trailers(st.id, trailers))
 
     async def _send_data(self, st, data, end_stream):
         # h2: proto/streams/send.rs `send_data` (L297) + the flow-control-gated
@@ -242,14 +241,18 @@ class StreamManager:
             # to signal end-of-stream"). So an interior empty chunk goes on the wire as
             # an empty non-END_STREAM DATA frame, matching h2 (F40). Empty payload =>
             # zero window, so no reservation needed.
-            await self._conn.send_frame(self._conn.codec.serialize_data(st.id, b"", end_stream=end_stream))
+            await self._conn.send_frame_or_fail(self._conn.codec.serialize_data(st.id, b"", end_stream=end_stream))
             return
         offset = 0
         while offset < len(data):
             n = await self._reserve_send_window(st, len(data) - offset)
             piece = data[offset : offset + n]
             last = end_stream and (offset + n == len(data))
-            await self._conn.send_frame(self._conn.codec.serialize_data(st.id, piece, end_stream=last))
+            # `send_frame_or_fail`: an interrupted DATA write may be partial, which
+            # poisons the connection — that also makes the window just reserved
+            # above moot (a dead connection's ledger doesn't matter), so the debit
+            # needs no unwind.
+            await self._conn.send_frame_or_fail(self._conn.codec.serialize_data(st.id, piece, end_stream=last))
             offset += n
 
     async def _reserve_send_window(self, st, want):
@@ -304,7 +307,7 @@ class StreamManager:
         WINDOW_UPDATE(0) increment to emit (0 if below the aggregation threshold). The
         whole assign -> unclaimed -> inc_window sequence runs under `_recv_window_lock`
         so two concurrent releasers can't both claim the same unclaimed capacity (F21).
-        The caller sends the WINDOW_UPDATE OUTSIDE the lock."""
+        The caller enqueues the WINDOW_UPDATE (outside the lock, sync)."""
         with self._recv_window_lock:
             self._conn_recv.assign_capacity(n)
             unclaimed = self._conn_recv.unclaimed_capacity()
@@ -323,10 +326,16 @@ class StreamManager:
         """
         if st.recv_reclaimed:
             # The stream was reset and its in-flight capacity already returned to the
-            # connection (`_reclaim_stream_capacity`); releasing the same buffered-but-
+            # connection (`_reclaim_stream_accounting`); releasing the same buffered-but-
             # unread bytes again would credit the connection window twice (F22).
             return
-        # Accounting under the lock (F21); WINDOW_UPDATE sends afterwards, unlocked.
+        # Accounting under the lock (F21); WINDOW_UPDATEs enqueued after, unlocked.
+        # Enqueue, not await: `inc_window` commits "this credit was granted" to our
+        # ledger, and nothing ever re-sends it (`unclaimed_capacity` is 0 from here
+        # on) — a cancellation landing on an inline send would silently diverge our
+        # window view from the peer's for the connection's lifetime. The sync
+        # enqueue makes commit+emission one uninterruptible step (h2 queues these
+        # under its store mutex for the same reason).
         stream_wu = conn_wu = 0
         with self._recv_window_lock:
             st.recv_unreleased = max(0, st.recv_unreleased - n)
@@ -342,29 +351,31 @@ class StreamManager:
                 self._conn_recv.inc_window(conn_unclaimed)
                 conn_wu = conn_unclaimed
         if stream_wu:
-            await self._conn.send_frame(self._conn.codec.serialize_window_update(st.id, stream_wu))
+            self._conn.enqueue_frame(self._conn.codec.serialize_window_update(st.id, stream_wu))
         if conn_wu:
-            await self._conn.send_frame(self._conn.codec.serialize_window_update(0, conn_wu))
+            self._conn.enqueue_frame(self._conn.codec.serialize_window_update(0, conn_wu))
 
-    async def _reclaim_stream_capacity(self, st):
-        # Reclaim the connection window consumed by data the app will never read
-        # (h2 recv.rs `release_closed_capacity` L493 returns `in_flight_recv_data`).
+    def _reclaim_stream_accounting(self, st):
+        """Reclaim the connection window consumed by data the app will never read
+        (h2 recv.rs `release_closed_capacity` L493 returns `in_flight_recv_data`).
+        SYNC accounting only — returns the WINDOW_UPDATE(0) increment for the
+        caller to send (best-effort, after all sync bookkeeping is committed)."""
         with self._recv_window_lock:
             n, st.recv_unreleased = st.recv_unreleased, 0
             st.recv_reclaimed = True  # F22: a later release_capacity must not re-release these
-        if n:
-            await self._release_conn_capacity(n)
+        return self._reclaim_conn(n) if n else 0
 
     async def _release_conn_capacity(self, n):
         """Return `n` bytes of connection-level recv capacity and emit a
-        WINDOW_UPDATE(0) once the reclaimed amount crosses the threshold.
+        WINDOW_UPDATE(0) once the reclaimed amount crosses the threshold
+        (enqueued — commit + emission as one uninterruptible step).
 
         h2: proto/streams/recv.rs `release_connection_capacity` (L435) +
         `ignore_data` (used when a frame's data won't reach the app).
         """
         conn_wu = self._reclaim_conn(n)
         if conn_wu:
-            await self._conn.send_frame(self._conn.codec.serialize_window_update(0, conn_wu))
+            self._conn.enqueue_frame(self._conn.codec.serialize_window_update(0, conn_wu))
 
     async def raise_connection_window(self):
         """Advertise a larger connection-level recv window than the 65535 protocol
@@ -396,20 +407,38 @@ class StreamManager:
             # `reset_on_error` set) and reclaim + drop the stream — otherwise
             # `send_request` hangs forever and the stream + its slot leak (F18). h2 runs
             # `set_reset` + `notify_recv` BEFORE its own closed check for this reason.
+            # This is also the (idempotent) REPAIR path a retried
+            # `H2ResponseBody.aclose` lands on. Everything here is sync — the
+            # WINDOW_UPDATE is enqueued, so a retried aclose after connection
+            # death cannot raise on a dead transport (F60; the write pump owns
+            # send failures, and a dead connection's queue simply never drains).
             st.headers_evt.set()
             st.body_send.send(None)
             st.window_evt.set()
-            await self._reclaim_stream_capacity(st)
+            conn_wu = self._reclaim_stream_accounting(st)
             self._close_stream(st)
+            self._enqueue_reset_expiration(st)  # no-op unless the closure was a local reset
+            if conn_wu:
+                self._conn.enqueue_frame(self._conn.codec.serialize_window_update(0, conn_wu))
             return
+        # The ENTIRE reset commits synchronously — state transition, waiter wakes,
+        # window reclaim accounting, concurrency-slot free, reset-expiration entry,
+        # and (via the sync enqueue) the RST_STREAM + WINDOW_UPDATE emission. No
+        # suspension point anywhere, so no interruption can leak the slot or the
+        # connection window, and the frames cannot be lost to a cancellation. This
+        # is h2's own shape: streams.rs `send_reset` does all of it under the store
+        # mutex and queues the frames for the connection task to flush.
         st.state.set_reset(st.id, error_code, initiator)
-        await self._conn.send_frame(self._conn.codec.serialize_rst_stream(st.id, error_code))
         st.headers_evt.set()  # unblock a caller still awaiting the response head
         st.body_send.send(None)  # unblock any body reader
         st.window_evt.set()  # unblock a sender parked on flow control
-        await self._reclaim_stream_capacity(st)
-        self._close_stream(st)
+        conn_wu = self._reclaim_stream_accounting(st)
+        self._close_stream(st)  # frees the MAX_CONCURRENT_STREAMS slot
         self._enqueue_reset_expiration(st)
+        frames = self._conn.codec.serialize_rst_stream(st.id, error_code)
+        if conn_wu:
+            frames += self._conn.codec.serialize_window_update(0, conn_wu)
+        self._conn.enqueue_frame(frames)
 
     async def reset_on_error(self, stream_id, reason):
         """Reset a stream after a stream-level protocol violation by the peer.
@@ -439,8 +468,9 @@ class StreamManager:
             self._clear_expired_reset_streams()
             if len(self._reset_streams) < _RESET_STREAM_MAX:
                 self._reset_streams[stream_id] = self._conn.backend.monotonic()
-            with contextlib.suppress(Exception):
-                await self._conn.send_frame(self._conn.codec.serialize_rst_stream(stream_id, reason))
+            # Enqueued: sync, can't raise on a dead transport (the write pump owns
+            # send failures), so the old best-effort suppress is unnecessary.
+            self._conn.enqueue_frame(self._conn.codec.serialize_rst_stream(stream_id, reason))
 
     def _enqueue_reset_expiration(self, st):
         """Record a locally-reset stream so late frames the peer sent before
@@ -776,9 +806,13 @@ class StreamManager:
             st.body_send.send(None)  # unblock the response-body reader (it re-raises st.error)
         st.window_evt.set()  # wake a request-body sender parked on flow control (state is now Closed)
         # Reclaim the connection window consumed by this stream's unread data
-        # (h2 recv.rs `release_closed_capacity` on `transition_after`).
-        await self._reclaim_stream_capacity(st)
+        # (h2 recv.rs `release_closed_capacity` on `transition_after`). All sync —
+        # accounting committed and the WINDOW_UPDATE enqueued as one step, same as
+        # `reset_stream`.
+        conn_wu = self._reclaim_stream_accounting(st)
         self._close_stream(st)
+        if conn_wu:
+            self._conn.enqueue_frame(self._conn.codec.serialize_window_update(0, conn_wu))
 
     # ===== teardown (h2: proto/streams/streams.rs handle_error / recv_eof) =====
 

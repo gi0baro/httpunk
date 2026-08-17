@@ -17,6 +17,8 @@ handed off to the caller — mirroring hyper's `Upgraded` (`on_upgrade` /
 `Connection::into_parts`).
 """
 
+import threading
+
 
 class H1Upgraded:
     """The raw connection after an HTTP/1 upgrade (101) or CONNECT tunnel — a
@@ -78,6 +80,12 @@ class H1ResponseBody:
         # An upgrade has already handed the transport to `upgraded`; there is no
         # slot to release and no body to read.
         self._released = upgraded is not None
+        # One-shot release latch: `_released` alone is a check-then-act, and on a
+        # free-threaded build the two release paths can run on different threads
+        # (a GC finalizer unwinding an abandoned body generator vs. the user's
+        # aclose chain) — both passing the check would double-release the
+        # driver's 1-permit slot and put two exchanges on one connection.
+        self._release_latch = threading.Lock()
         # A bodyless response (204, HEAD, CL: 0) has nothing to read, so its slot can
         # be freed at once — but freeing it now must also tear down the request-body
         # writer (`release_slot` is async since it may cancel/join that writer), which
@@ -133,7 +141,13 @@ class H1ResponseBody:
             await self._release(keep_alive=False)
 
     async def _release(self, keep_alive=None):
-        if self._released:
+        # Atomic one-shot: a non-blocking Lock.acquire is a cross-thread CAS that
+        # can never block (safe from a GC finalization context — no deadlock even
+        # if GC fires while a release is in flight on this same object). The
+        # first caller wins; every later (or concurrent) caller no-ops. The
+        # `_released` flag stays as the cheap advisory check for aclose/_finish
+        # (and is pre-set for upgraded bodies, which never touch the latch).
+        if self._released or not self._release_latch.acquire(blocking=False):
             return
         self._released = True
         await self._driver.release_slot(self._keep_alive if keep_alive is None else keep_alive)

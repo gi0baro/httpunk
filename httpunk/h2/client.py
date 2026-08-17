@@ -139,7 +139,7 @@ class ClientStreamManager(StreamManager):
             st.holds_slot = True
             self._streams[stream_id] = st
             st.state.send_open(eos=end_stream)
-            await self._conn.send_frame(
+            await self._conn.send_frame_or_fail(
                 self._conn.codec.serialize_request_headers(stream_id, method, url, headers, end_stream=end_stream)
             )
         # The connection may have failed / GOAWAY'd between our pre-lock check and

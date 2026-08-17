@@ -49,7 +49,14 @@ class H2ResponseBody:
 
         h2: share.rs `SendStream::send_reset` (L355) — dropping a `RecvStream`
         with an unfinished body resets the stream so the peer stops sending.
+
+        Only a fully-received body short-circuits (h2 guards its Drop-reset on
+        `!eos` the same way). A CLOSED state does NOT: `reset_stream`'s closed
+        branch is the idempotent repair path for a previous reset that was
+        interrupted before completing, so a retried aclose must reach it rather
+        than no-op with the concurrency slot still leaked.
         """
         st = self._stream
-        if not st.state.is_closed() and not st.state.is_recv_end_stream():
-            await self._manager.reset_stream(st, H2Reason.CANCEL)
+        if st.state.is_recv_end_stream():
+            return  # body fully received — nothing to cancel
+        await self._manager.reset_stream(st, H2Reason.CANCEL)

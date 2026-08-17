@@ -69,6 +69,10 @@ class H2ConnectionBase:
         # timing is unaffected (the pump's parked-recv close race is delicate).
         self._write_scope = self.backend.scope()
         self._send_lock = self.backend.lock()
+        # Control-frame write queue, drained by `_write_pump` (spawned in `_begin`).
+        # `enqueue_frame` is SYNC, so bookkeeping + frame emission commit as one
+        # uninterruptible step — see the design note on `enqueue_frame`.
+        self._write_send, self._write_recv = self.backend.queue()
         self._transport = transport
         self._settings = settings  # SETTINGS sync (proto/settings.rs)
         self._goaway_replied = False  # sent our acknowledging GOAWAY after a peer GOAWAY (F23)
@@ -104,6 +108,10 @@ class H2ConnectionBase:
         await self._scope.__aenter__()
         await self._write_scope.__aenter__()
         await self.send_frame(preface + self.codec.serialize_settings(**settings))
+        # The control-frame write pump starts only AFTER the preface is on the wire,
+        # so enqueued frames (starting with the initial WINDOW_UPDATE below) can
+        # never precede it; the queue is FIFO, so wire order = enqueue order.
+        self._write_scope.spawn(self._write_pump())
         # Advertise our (larger-than-default) connection recv window right after the
         # preface, before any peer data (h2 sends this initial WINDOW_UPDATE(0) as
         # part of connection setup, from `initial_connection_window_size`).
@@ -118,9 +126,11 @@ class H2ConnectionBase:
         # `__aexit__` waiting on a task that never wakes → the intermittent
         # teardown hang). The EOF also unblocks the peer's read loop. `cancel()`
         # then covers the rare case where the pump is parked elsewhere.
-        # Tear down background body writers FIRST (they're abortable — parked on flow
-        # control / send, not a native recv poll), so the pump's scope is pump-only
-        # when we close the transport + join it (keeping that delicate race baseline).
+        # Tear down background body writers + the control-frame write pump FIRST
+        # (they're abortable — parked on flow control / send / the write queue, not a
+        # native recv poll), so the pump's scope is pump-only when we close the
+        # transport + join it (keeping that delicate race baseline). Control frames
+        # still queued at this point are dropped — moot, the connection is closing.
         self._write_scope.cancel()
         await self._write_scope.__aexit__(None, None, None)
         if self._transport is not None:
@@ -139,6 +149,84 @@ class H2ConnectionBase:
     async def send_frame(self, data):
         async with self._send_lock:
             await self._transport.send_all(data)
+
+    # Design note (why three send paths, vs h2's single frame queue): in the h2
+    # crate ALL socket I/O belongs to the one connection task — user handles only
+    # mutate the store and wake it, frames are queued under the store mutex, and a
+    # partially-written frame is resumed on the next poll. That structure makes two
+    # whole failure classes unrepresentable there: (a) a state change committed
+    # whose frame never goes out (the committing future was cancelled between
+    # commit and write), and (b) a truncated frame left on the wire desyncing the
+    # peer's framing. httpunk instead writes inline from (cancellable) user tasks
+    # — deliberate: no send-data buffering (F41 relies on it) and natural TCP
+    # backpressure on the uploader — so those two classes exist HERE and are
+    # handled explicitly:
+    #
+    # - CONTROL frames whose loss silently diverges shared ledgers or strands the
+    #   peer (WINDOW_UPDATE, RST_STREAM) go through `enqueue_frame`: the sync
+    #   enqueue makes commit+emission one uninterruptible step, and the write pump
+    #   (never user-cancelled) does the writing — the h2-queue property for the
+    #   frames that need it.
+    # - STREAM frames (HEADERS/DATA/trailers) stay inline via `send_frame_or_fail`,
+    #   which poisons the connection on ANY interruption mid-write: a possibly
+    #   half-written frame means framing integrity can no longer be proven, so we
+    #   fail loudly ourselves instead of letting the peer discover the desync.
+    # - Connection-lifecycle frames (preface/SETTINGS, GOAWAY, acks) keep plain
+    #   `send_frame`: they run in the pump/handshake/shutdown, not under user
+    #   cancellation, and GOAWAY needs flushed-before-stop semantics a queue would
+    #   complicate.
+    #
+    # The full-fidelity alternative — port h2's buffered-send/`reserve_capacity`
+    # model and route DATA through the queue too — remains open as a future step;
+    # this hybrid was chosen to keep F41's zero-buffering and the inline hot path.
+
+    def enqueue_frame(self, data):
+        """Queue a control frame for the write pump — synchronous, so a caller can
+        commit its bookkeeping (window ledgers, stream state) and the frame's
+        emission as ONE uninterruptible step: no cancellation can land between a
+        committed ledger and the wire any more (the punkreq class of bug)."""
+        self._write_send.send(data)
+
+    async def _write_pump(self):
+        """Drain `enqueue_frame`d control frames to the transport. Runs in
+        `_write_scope` (torn down first in `close()`, so the read-pump scope stays
+        pump-only for its delicate teardown). A write failure fails the whole
+        connection — same as h2, where a connection-task write error is fatal."""
+        while True:
+            data = await self._write_recv.receive()
+            try:
+                async with self._send_lock:
+                    await self._transport.send_all(data)
+            except OSError as exc:
+                self._fail(ConnectionClosedError(f"connection closed: {exc}"))
+                break
+            except Exception as exc:
+                self._fail(exc)
+                break
+
+    async def send_frame_or_fail(self, data):
+        """Send a stream frame (HEADERS/DATA/trailers) inline; any interruption of
+        the write itself — error, cancellation, GC unwind — POISONS the connection.
+        `send_all` loops per-syscall, so an interruption may leave a truncated
+        frame on the wire; every later frame would then be parsed mid-frame by the
+        peer. We cannot tell "nothing written" from "half written", so fail the
+        connection ourselves (h2 equivalent: write errors are connection-fatal;
+        partial writes are unrepresentable — the connection task resumes them).
+        Cancellation while WAITING for the send lock is safe (nothing written) and
+        does not poison."""
+        async with self._send_lock:
+            try:
+                await self._transport.send_all(data)
+            except BaseException as exc:
+                if isinstance(exc, OSError):
+                    self._fail(ConnectionClosedError(f"connection closed: {exc}"))
+                elif isinstance(exc, Exception):
+                    self._fail(exc)
+                else:  # cancellation / GC unwind: the frame may be half-written
+                    self._fail(ConnectionClosedError("connection poisoned: frame write interrupted"))
+                if self._transport is not None:  # unblock the peer + our read pump
+                    self.backend.close_transport(self._transport)
+                raise
 
     async def _maybe_goaway_reply(self):
         """If the peer has GOAWAY'd us with a REAL last-stream-id and no streams remain,

@@ -280,7 +280,7 @@ class ServerStreamManager(StreamManager):
         hdrs = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
         end_stream = body is None
         st.state.send_open(eos=end_stream)  # send response HEADERS
-        await self._conn.send_frame(
+        await self._conn.send_frame_or_fail(
             self._conn.codec.serialize_response_headers(st.id, status, hdrs, end_stream=end_stream)
         )
         if end_stream:
@@ -297,7 +297,9 @@ class ServerStreamManager(StreamManager):
         if not st.state.is_closed():  # recv half still open -> client still sending
             await self.reset_stream(st, int(H2Reason.NO_ERROR))
         else:  # fully closed but body may sit buffered-unread -> just reclaim its window
-            await self._reclaim_stream_capacity(st)
+            conn_wu = self._reclaim_stream_accounting(st)
+            if conn_wu:
+                self._conn.enqueue_frame(self._conn.codec.serialize_window_update(0, conn_wu))
 
     async def next_request(self):
         req = await self._incoming_recv.receive()

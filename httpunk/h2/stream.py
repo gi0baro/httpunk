@@ -41,7 +41,7 @@ class Stream:
         # reclaimed at connection level if the stream is cancelled/reset/closed
         # (h2 recv.rs `in_flight_recv_data` / `release_closed_capacity`).
         self.recv_unreleased = 0
-        # Set once `_reclaim_stream_capacity` has returned this stream's in-flight recv
+        # Set once `_reclaim_stream_accounting` has returned this stream's in-flight recv
         # data to the connection window (on reset/abort). A later `release_capacity`
         # for the same buffered-but-unread bytes must then be a no-op, or it would
         # credit the connection window twice (F22).

@@ -67,6 +67,12 @@ class Connection(H1ConnectionBase):
         self._peer_http10 = False
         # One request/response in flight at a time (h1 has no multiplexing).
         self._slot = self.backend.semaphore(1)
+        # True while an exchange holds the slot (hyper `Conn::is_busy`, conn.rs
+        # L293) — the SYNC observable a pool needs at park time: a connection
+        # whose last exchange never completed (its release was interrupted) must
+        # be dropped, not parked as idle keepalive. Set on slot acquire, cleared
+        # wherever the slot is released.
+        self._busy = False
         # The in-flight request's background body writer (single-in-flight): its
         # detached scope + an event set when the body was sent in FULL. hyper's
         # poll_loop writes the body independently of reading the response, so an early
@@ -110,7 +116,9 @@ class Connection(H1ConnectionBase):
         # (L192); we do not add it. `Conn` is busy for the duration (conn.rs L293),
         # modeled by the 1-permit slot.
         await self._acquire()
+        self._busy = True
         if self._closed or self.error is not None:
+            self._busy = False
             self._slot.release()
             raise self.error or ConnectionClosedError("connection closed")
         # hyper's always-polled Connection validates the read buffer is empty before it
@@ -127,6 +135,7 @@ class Connection(H1ConnectionBase):
         if pending:
             self.poison_unexpected(len(pending))
             self._fail(self.error)  # the stream is corrupt — close, don't reuse
+            self._busy = False
             self._slot.release()
             raise self.error
         try:
@@ -210,6 +219,7 @@ class Connection(H1ConnectionBase):
                 await self._teardown_writer(cancel=True)  # the request-body write is moot
                 upgraded = H1Upgraded(self.transport, codec.take_body())
                 self._detach()
+                self._busy = False
                 self._slot.release()
                 body = H1ResponseBody(self, None, keep_alive=False, upgraded=upgraded)
                 return Response(resp_head.status, resp_head.headers, body)
@@ -228,9 +238,12 @@ class Connection(H1ConnectionBase):
                 await body._finish()
             return Response(resp_head.status, resp_head.headers, body)
         except BaseException as exc:
-            await self._teardown_writer(cancel=True)
-            self._fail(exc)
-            self._slot.release()
+            self._fail(exc)  # sync poison BEFORE the teardown suspension (see release_slot)
+            try:
+                await self._teardown_writer(cancel=True)
+            finally:
+                self._busy = False
+                self._slot.release()
             raise
 
     async def _write_request(self, codec, head, body, body_done, write_error, body_failed, trailers=None):
@@ -301,19 +314,34 @@ class Connection(H1ConnectionBase):
         was fully sent — hyper reuses only once both the read and write halves reach
         `KeepAlive` (conn.rs L370-400). If the writer is still running (the server
         answered early and the caller didn't wait out the upload), the request is
-        incomplete on the wire, so cancel it and close; otherwise join it (instant)."""
+        incomplete on the wire, so cancel it and close; otherwise join it (instant).
+
+        The reuse verdict is committed SYNCHRONOUSLY, before the writer teardown:
+        that await is a suspension point, and an interruption there (cancellation,
+        or tonio's one-shot GC unwind of an abandoned body generator) must not
+        leave an open connection whose `closed` lies to a pool above. In hyper the
+        equivalent state transitions are sync between polls, so this unreachable
+        state cannot exist there — same discipline here. The slot is released in
+        `finally` for the same reason: on non-reuse the connection is already
+        poisoned, and on reuse the exchange genuinely completed, so freeing the
+        slot is correct even if the writer join was cut short."""
         fully_sent = self._writer_done is None or self._writer_done.is_set()
-        await self._teardown_writer(cancel=not fully_sent)
         if not (resp_keep_alive and fully_sent):
             self._closed = True
-            self._close_transport()
-        self._slot.release()
+            self._close_transport()  # sync by design (backend.close_transport)
+        try:
+            await self._teardown_writer(cancel=not fully_sent)
+        finally:
+            self._busy = False
+            self._slot.release()
 
     async def close(self):
-        # A response body left unread (or an early exit) can leave the background
-        # writer still running; abort + join it before closing the transport.
-        await self._teardown_writer(cancel=True)
+        # Commit `_closed` + close the transport FIRST (the base close is sync —
+        # no suspension), then abort + join a still-running background writer.
+        # The join can be interrupted (it suspends); a force-close must never
+        # come away with `closed` still False.
         await super().close()
+        await self._teardown_writer(cancel=True)
 
     def _fail(self, exc):
         if self.error is None and not isinstance(exc, ConnectionClosedError):
@@ -349,6 +377,16 @@ class H1Connection(BaseClientConnection):
         synchronous liveness check so a pool can evict a dead connection
         (util.Singleton self-heal)."""
         return self._conn._closed or self._conn.error is not None
+
+    @property
+    def busy(self) -> bool:
+        """True while a request/response exchange holds the connection's single
+        in-flight slot (hyper `Conn::is_busy`). A synchronous check so a pool can
+        refuse to park a connection whose last exchange never completed — e.g. a
+        release interrupted mid-teardown left the slot held; parking it would make
+        the next request wait forever. Pool discipline: `if conn.closed or
+        conn.busy: drop`."""
+        return self._conn._busy
 
     def send_request(self, request: Request) -> Awaitable[Response]:
         """Send `request` and return its `Response` once the head arrives.

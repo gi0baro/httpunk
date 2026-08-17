@@ -97,8 +97,18 @@ class Response:
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield body chunks as they arrive (decoded/flow-controlled by the backend)."""
-        async for chunk in self._body.aiter_bytes():
-            yield chunk
+        # Own the inner generator and close it deterministically: `async for` does
+        # NOT aclose its iterator on early exit, so a bare pass-through would turn
+        # every caller's correct aclose of THIS wrapper into an abandonment of the
+        # inner generator — whose unwind path awaits (the h1 body releases the
+        # connection slot there), which an abandoned-to-GC generator can never run
+        # to completion (tonio finalizes nothing, by design).
+        inner = self._body.aiter_bytes()
+        try:
+            async for chunk in inner:
+                yield chunk
+        finally:
+            await inner.aclose()
 
     async def read(self) -> bytes:
         return b"".join([chunk async for chunk in self._body.aiter_bytes()])

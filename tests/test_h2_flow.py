@@ -300,7 +300,7 @@ async def test_reset_wakes_flow_blocked_sender():
 
 @pytest.mark.tonio
 async def test_reset_does_not_double_release_connection_window():
-    """When a stream is reset, `_reclaim_stream_capacity` returns its in-flight recv
+    """When a stream is reset, `_reclaim_stream_accounting` returns its in-flight recv
     data to the CONNECTION window. If the app then consumes the still-buffered bytes,
     `release_capacity` must NOT credit the connection window a second time (F22).
     Socket-free: a small amount stays below the WINDOW_UPDATE threshold, so nothing is
@@ -313,7 +313,7 @@ async def test_reset_does_not_double_release_connection_window():
     mgr._conn_recv.send_data(100)  # the pump consumed 100 conn-window bytes (recv_data)
     st.recv_unreleased = 100  # ...delivered to the body queue, not yet read
 
-    await mgr._reclaim_stream_capacity(st)  # a reset returns the 100 to the conn window
+    mgr._reclaim_stream_accounting(st)  # a reset returns the 100 to the conn window
     assert st.recv_reclaimed is True
     restored = mgr._conn_recv.available()
 

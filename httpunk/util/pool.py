@@ -209,20 +209,24 @@ class _Lease:
         return self._conn
 
     async def __aexit__(self, exc_type, exc_value, exc_tb):
-        if exc_type is None:
-            self._cache._checkin(self._conn)  # clean exit -> back to the idle set
+        conn = self._conn
+        # Park only a connection that is alive AND whose last exchange completed
+        # (hyper-util parks on `is_open()`; `busy` is h1's sync "the in-flight
+        # slot is still held" observable). A clean-exit caller can still leave an
+        # incomplete exchange — e.g. a release interrupted mid-teardown left the
+        # slot held — and parking that connection would deadlock the next
+        # checkout on `send_request`. Drop it instead: never park open-and-lying.
+        if exc_type is None and not (conn.closed or getattr(conn, "busy", False)):
+            self._cache._checkin(conn)  # clean exit + completed exchange -> idle set
         else:
             # Deliberate simplification vs hyper-util (F51, documented WON'T-FIX): on ANY
             # exception during use we close the connection, whereas hyper-util returns it
-            # to the pool when it's still open (`is_open()`). Doing that safely here needs
-            # a SYNCHRONOUS "is this connection idle/reusable right now" check the facades
-            # don't expose (`.closed` only tells dead-or-not; `.ready()` is async): a
-            # caller that raised MID-response left the connection's request slot HELD, and
-            # returning that to the pool would DEADLOCK the next checkout on `send_request`.
-            # Closing on error is the safe, conservative choice; the only cost is not
-            # reusing a connection whose exchange happened to complete before the caller
-            # raised for an unrelated reason.
-            await self._conn.__aexit__(None, None, None)
+            # to the pool when it's still open (`is_open()`). The sync `closed or busy`
+            # check above could now discriminate here too, but closing on error stays
+            # the safe, conservative choice; the only cost is not reusing a connection
+            # whose exchange happened to complete before the caller raised for an
+            # unrelated reason.
+            await conn.__aexit__(None, None, None)
         return False
 
 
