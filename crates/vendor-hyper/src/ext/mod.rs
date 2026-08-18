@@ -181,7 +181,7 @@ impl HeaderCaseMap {
 
     #[cfg(any(feature = "client", feature = "server"))]
     pub fn default() -> Self {
-        Self(Default::default())
+        Self(HeaderMap::default())
     }
 
     #[cfg(any(test, feature = "ffi"))]

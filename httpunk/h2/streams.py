@@ -34,6 +34,14 @@ _DEFAULT_WINDOW = 65_535
 _LOCAL_MAX_ERROR_RESETS = 1024  # h2 DEFAULT_LOCAL_RESET_COUNT_MAX
 _RESET_STREAM_MAX = 50  # h2 DEFAULT_RESET_STREAM_MAX (streams kept for late frames)
 _RESET_STREAM_SECS = 1.0  # h2 DEFAULT_RESET_STREAM_SECS (how long to keep them)
+# DATA-framing budget (h2 0.4.16 #935): flow control bounds payload BYTES, not
+# frame COUNT — a peer fragmenting data into tiny frames bloats the buffered
+# chunk queue while staying inside every window. Frames smaller than the
+# threshold consume budget (the bookkeeping overhead they impose beyond their
+# payload); larger frames earn it back, capped at the initial budget; consuming
+# a buffered small chunk returns its charge. Exhaustion is a connection error.
+_DATA_FRAME_OVERHEAD_THRESHOLD = 256  # h2 DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD
+_DATA_FRAME_BUDGET = _DATA_FRAME_OVERHEAD_THRESHOLD * 100  # h2 DEFAULT_DATA_FRAME_BUDGET
 
 _INVALID_CONTENT_LENGTH = object()  # sentinel: content-length header failed to parse
 _UNSET = object()  # sentinel: no chunk buffered yet (send_body one-ahead lookahead)
@@ -130,6 +138,11 @@ class StreamManager:
         # Count of streams we've reset due to peer-caused errors; too many means
         # the peer is misbehaving -> escalate to GOAWAY (h2 local_max_error_reset).
         self._local_error_resets = 0
+        # Connection-level DATA-framing budget (h2 counts.rs `data_frame_budget`,
+        # #935 — see the constants above). Charged in the pump (`recv_data`),
+        # released by the body readers, which run on other tasks/threads -> lock.
+        self._data_frame_budget = _DATA_FRAME_BUDGET
+        self._data_budget_lock = threading.Lock()
 
     # ===== role hooks (mirror h2's `Peer` trait + `Dyn` role discriminant) =====
 
@@ -213,6 +226,22 @@ class StreamManager:
         sender (peer reset / connection failure), mirroring h2 `send_data`'s
         Inactive/UnexpectedFrameType errors."""
         return st.error or self._conn.error or StreamResetError(st.id, int(H2Reason.CANCEL))
+
+    @staticmethod
+    def check_send_headers(fields):
+        """Reject connection-specific header fields in an outbound HEADERS block
+        (RFC 9113 §8.2.2) — h2 send.rs `check_headers`, extended to trailers in
+        0.4.16 (#925): the receive path treats such a field as malformed, so the
+        library must not GENERATE a block the peer is required to reject. `te`
+        is allowed only with the exact value "trailers" (h2 compares strictly).
+        Raises ValueError (h2 `UserError::MalformedHeaders` — a caller error,
+        NOT a protocol error: the connection and stream stay usable)."""
+        for name in ("connection", "transfer-encoding", "upgrade", "keep-alive", "proxy-connection"):
+            if fields.get(name) is not None:
+                raise ValueError(f"connection-specific header field {name!r} is forbidden in HTTP/2")
+        te = fields.get("te")
+        if te is not None and bytes(te) != b"trailers":
+            raise ValueError('the `te` header may only carry the value "trailers" in HTTP/2')
 
     async def _send_trailers(self, st, trailers):
         # A trailing HEADERS frame (END_STREAM) sent after the body (h2 share.rs
@@ -495,6 +524,40 @@ class StreamManager:
         for sid in [s for s, at in self._reset_streams.items() if now - at > _RESET_STREAM_SECS]:
             del self._reset_streams[sid]
 
+    # ===== DATA-framing budget (h2 0.4.16 counts.rs, #935) =====
+
+    def _record_data_frame(self, payload_len):
+        """Charge the budget for a received DATA frame: a small frame consumes
+        the overhead it imposes beyond its payload, a large frame earns budget
+        back (capped at the initial amount). Exhaustion means the peer is
+        fragmenting pathologically -> connection ENHANCE_YOUR_CALM, same
+        escalation as the reset-flood cap (h2 `record_data_frame`)."""
+        with self._data_budget_lock:
+            if payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
+                cost = _DATA_FRAME_OVERHEAD_THRESHOLD - payload_len
+                if cost > self._data_frame_budget:
+                    raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too many small DATA frames")
+                self._data_frame_budget -= cost
+            else:
+                self._data_frame_budget = min(
+                    self._data_frame_budget + (payload_len - _DATA_FRAME_OVERHEAD_THRESHOLD),
+                    _DATA_FRAME_BUDGET,
+                )
+
+    def release_data_frame(self, payload_len):
+        """Return a consumed chunk's buffering charge — called by the body
+        readers when a buffered chunk is taken off the stream's queue (h2
+        `release_data_frame`; upstream hooks `poll_data`). Promptly-consumed
+        small messages on a long-lived connection thus never exhaust the budget;
+        only frames that PILE UP (or empty frames, which are never delivered and
+        never release) drain it."""
+        if payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
+            with self._data_budget_lock:
+                self._data_frame_budget = min(
+                    self._data_frame_budget + (_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len),
+                    _DATA_FRAME_BUDGET,
+                )
+
     # ===== SETTINGS application (h2: proto/streams/streams.rs apply_*_settings) =====
 
     def apply_remote_settings(self, frame):
@@ -742,6 +805,15 @@ class StreamManager:
         padding = sz - payload_len
         if padding:
             await self.release_capacity(st, padding)
+        # DATA-framing budget (#935). An empty non-final DATA frame has no effect
+        # on the HTTP message: window accounting is done (above), so drop it
+        # without delivering (h2 recv.rs) — and since it is never delivered, its
+        # budget charge is never returned, so a flood of them drains the budget
+        # and dies with ENHANCE_YOUR_CALM (raised by `_record_data_frame`, ->
+        # pump -> GOAWAY).
+        self._record_data_frame(payload_len)
+        if payload_len == 0 and not frame.end_stream:
+            return
         st.body_send.send(frame.data)
         if frame.end_stream:
             st.state.recv_close()
@@ -791,13 +863,14 @@ class StreamManager:
             return  # forgotten stream -> ignore
         self._note_remote_reset(st)  # server: Rapid-Reset cap; may GOAWAY(ENHANCE_YOUR_CALM)
         # A reset that arrives AFTER we already received the full response (END_STREAM)
-        # is benign — the response stands. h2 keeps the enqueued DATA+EOS ahead of the
-        # reset in the recv buffer, so the clean EOF terminates the stream before the
-        # reset is ever reached (state.rs recv_reset no-ops a closed stream). We use an
-        # `error` flag checked after EOF, so mirror that ordering explicitly: don't
-        # surface the reset as an error once the recv half has ended cleanly. This is
-        # the common server nginx-compat case — RST_STREAM(NO_ERROR) after responding
-        # without reading the request body (see the server's drop-of-request, F3).
+        # is benign — the response stands. Since h2 0.4.16 (#922) the vendored state
+        # machine encodes this itself: `recv_reset` on a recv-ended stream transitions
+        # to `Closed(ErrorAfterEndStream)`, PRESERVING `is_recv_end_stream()` (which
+        # also lets `H2ResponseBody.aclose` short-circuit on such a stream). We still
+        # pre-capture `recv_ended` and gate the `error` flag on it — the flag is what
+        # our readers check after EOF — so driver behavior is identical either way.
+        # This is the common server nginx-compat case: RST_STREAM(NO_ERROR) after
+        # responding without reading the request body (server drop-of-request, F3).
         recv_ended = st.state.is_recv_end_stream()
         st.state.recv_reset(frame.stream_id, frame.error_code, queued=False)
         if not recv_ended:

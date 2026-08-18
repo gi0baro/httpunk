@@ -99,6 +99,7 @@ class ServerRequest:
             chunk = await self._stream.body_recv.receive()
             if chunk is None:  # EOF (end of stream, reset, or connection failure)
                 break
+            self._manager.release_data_frame(len(chunk))  # return its buffering charge (#935)
             await self._manager.release_capacity(self._stream, len(chunk))
             yield chunk
         if self._stream.error is not None:
@@ -278,6 +279,11 @@ class ServerStreamManager(StreamManager):
         if st.state.is_closed():
             raise ConnectionClosedError("stream already closed")
         hdrs = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
+        # Same RFC 9113 §8.2.2 rejection as the client's request/trailer paths
+        # (h2 send.rs `send_headers` -> `check_headers`): checked BEFORE the
+        # state transition, so a rejected call leaves the stream untouched and
+        # still able to send a valid response.
+        self.check_send_headers(hdrs)
         end_stream = body is None
         st.state.send_open(eos=end_stream)  # send response HEADERS
         await self._conn.send_frame_or_fail(

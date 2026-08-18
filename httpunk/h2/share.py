@@ -38,6 +38,7 @@ class H2ResponseBody:
             chunk = await self._stream.body_recv.receive()
             if chunk is None:  # EOF sentinel (end of stream, cancel, or error)
                 break
+            self._manager.release_data_frame(len(chunk))  # return its buffering charge (#935)
             await self._manager.release_capacity(self._stream, len(chunk))
             yield chunk
         if self._stream.error is not None:

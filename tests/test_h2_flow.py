@@ -18,9 +18,11 @@ from httpunk._httpunk import (
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
 )
+from httpunk.exceptions import H2ProtocolError
 from httpunk.h2.client import Connection
 from httpunk.h2.connection import PREFACE
 from httpunk.h2.stream import Stream
+from httpunk.h2.streams import _DATA_FRAME_BUDGET, _DATA_FRAME_OVERHEAD_THRESHOLD
 from httpunk.http import HeaderMap
 
 
@@ -319,3 +321,70 @@ async def test_reset_does_not_double_release_connection_window():
 
     await mgr.release_capacity(st, 100)  # app reads the buffered bytes -> must be a no-op
     assert mgr._conn_recv.available() == restored  # NOT credited twice
+
+
+def _recv_streaming_manager():
+    """Socket-free manager with one stream whose recv half is streaming, plus a
+    codec round-trip helper to mint DATA frames (H2FrameData has no Python
+    constructor — serialize then parse)."""
+    conn = Connection(None)  # constructed only; never connected
+    mgr = conn.streams
+    st = Stream(1, conn.backend, send_window=65535, recv_window=65535)
+    st.state.send_open(eos=True)
+    st.state.recv_open(eos=False, informational=False)
+    mgr._streams[1] = st
+
+    def data(payload, end=False):
+        [frame] = conn.codec.receive(conn.codec.serialize_data(1, payload, end_stream=end))
+        return frame
+
+    return mgr, st, data
+
+
+@pytest.mark.tonio
+async def test_small_data_frame_flood_exhausts_budget():
+    """h2 0.4.16 #935: flow control bounds payload bytes, not frame count — a
+    peer fragmenting into tiny unconsumed frames must exhaust the DATA-framing
+    budget and die with a connection ENHANCE_YOUR_CALM."""
+    mgr, st, data = _recv_streaming_manager()
+    with pytest.raises(H2ProtocolError) as exc:
+        # 1-byte frames cost 255 budget each; 25600 total -> dies by frame 101.
+        for _ in range(101):
+            await mgr.recv_data(data(b"x"))
+    assert exc.value.args[0] == int(H2Reason.ENHANCE_YOUR_CALM)
+
+
+@pytest.mark.tonio
+async def test_consumed_small_frames_return_budget():
+    """Promptly-consumed small messages on a long-lived connection never exhaust
+    the budget (each consumed chunk returns its charge), and a large frame earns
+    budget back (capped) — h2 `release_data_frame`/`record_data_frame`."""
+    mgr, st, data = _recv_streaming_manager()
+    for _ in range(300):  # 3x the raw budget in tiny frames, consumed as they come
+        await mgr.recv_data(data(b"x"))
+        assert await st.body_recv.receive() == b"x"
+        mgr.release_data_frame(1)
+    for _ in range(50):  # now leave 50 tiny frames unconsumed
+        await mgr.recv_data(data(b"x"))
+    drained = mgr._data_frame_budget
+    await mgr.recv_data(data(b"y" * 1000))  # a large frame replenishes...
+    assert mgr._data_frame_budget == drained + (1000 - _DATA_FRAME_OVERHEAD_THRESHOLD)
+    mgr.release_data_frame(2**20)  # ...and replenishing never exceeds the cap
+    assert mgr._data_frame_budget <= _DATA_FRAME_BUDGET
+
+
+@pytest.mark.tonio
+async def test_empty_nonfinal_data_dropped_but_charged():
+    """An empty non-final DATA frame has no effect on the HTTP message: it is
+    never delivered to the app — but it IS charged (and never released, since
+    nothing is consumed), so a flood of them drains the budget (#935)."""
+    mgr, st, data = _recv_streaming_manager()
+    await mgr.recv_data(data(b""))  # dropped
+    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET - _DATA_FRAME_OVERHEAD_THRESHOLD
+    await mgr.recv_data(data(b"real"))
+    assert await st.body_recv.receive() == b"real"  # the empty frame never surfaced
+    # An empty FINAL frame is the message end and IS delivered (h2: only
+    # `!is_end_stream` empties are discarded).
+    await mgr.recv_data(data(b"", end=True))
+    assert await st.body_recv.receive() == b""
+    assert await st.body_recv.receive() is None  # EOF sentinel follows

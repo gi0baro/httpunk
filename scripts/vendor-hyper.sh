@@ -23,7 +23,7 @@
 #     structural shims: drop the unvendored conn/dispatch/h2/upgrade wiring)
 set -euo pipefail
 
-HYPER_VERSION="${HYPER_VERSION:-1.10.1}"
+HYPER_VERSION="${HYPER_VERSION:-1.11.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/crates/vendor-hyper/src"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"

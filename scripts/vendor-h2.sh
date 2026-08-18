@@ -13,7 +13,7 @@
 # uniform pub(crate)->pub widening (see steps below and THIRD-PARTY.md).
 set -euo pipefail
 
-H2_VERSION="${H2_VERSION:-0.4.15}"
+H2_VERSION="${H2_VERSION:-0.4.16}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/crates/vendor-h2/src"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
@@ -66,6 +66,11 @@ perl -0pi -e 's/use crate::proto::\{self, Error, Initiator, PollReset\};/use cra
 perl -0pi -e 's/pub fn recv_open\(&mut self, frame: &frame::Headers\) -> Result<bool, Error> \{\n        let mut initial = false;\n        let eos = frame\.is_end_stream\(\);/pub fn recv_open(\&mut self, eos: bool, informational: bool) -> Result<bool, Error> {\n        let mut initial = false;/' "$DST/proto/streams/state.rs"
 perl -0pi -e 's/frame\.is_informational\(\)/informational/g' "$DST/proto/streams/state.rs"
 perl -0pi -e 's/    \/\/\/ Returns a reason if the stream has been reset\.\n    pub\(super\) fn ensure_reason.*?\n    \}\n//s' "$DST/proto/streams/state.rs"
+#   d. strip the trailing inline `#[cfg(test)] mod tests` (added in 0.4.16): it
+#      drives `recv_open(&frame::Headers)`, the pre-shim signature from (b), so it
+#      can't compile against the shimmed file (same tradeoff as hyper's stripped
+#      decode.rs/date.rs test modules).
+perl -0pi -e 's/\n+#\[cfg\(test\)\]\nmod tests \{.*\z/\n/s' "$DST/proto/streams/state.rs"
 
 # 4. The ONE byte-parity exception: widen `pub(crate)` -> `pub` on the vendored
 #    files so the main `_httpunk` crate (a separate workspace member) can reach

@@ -462,6 +462,89 @@ async def test_h2_request_trailers_round_trip():
 
 
 @pytest.mark.tonio
+async def test_h2_connection_specific_trailers_rejected():
+    """Trailers are a HEADERS block, so connection-specific fields are rejected
+    (RFC 9113 §8.2.2; h2 0.4.16 #925) — BEFORE the stream is opened, so the
+    connection stays fully usable and a subsequent valid trailer still sends."""
+    listener, host, port = await _listener()
+    seen = {}
+
+    async def server():
+        transport = await listener.accept()
+        async with H2Server(transport) as srv:
+            async for req in srv:
+                await req.read()
+                seen["trailers"] = req.trailers
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            with pytest.raises(ValueError):
+                await conn.request("POST", "/", body=b"data", trailers={"connection": "close"})
+            with pytest.raises(ValueError):  # `te` may only carry "trailers"
+                await conn.request("POST", "/", body=b"data", trailers={"te": "gzip"})
+            # The rejected calls never touched the wire — the SAME connection
+            # still carries a valid-trailer request end to end.
+            resp = await conn.request("POST", "/", body=b"data", trailers={"x-checksum": "abc"})
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+    assert seen["trailers"].get("x-checksum") == b"abc"
+
+
+@pytest.mark.tonio
+async def test_h2_connection_specific_request_headers_rejected():
+    """Regular request HEADERS get the same RFC 9113 §8.2.2 rejection as
+    trailers (h2 send.rs `send_headers` -> `check_headers`) — before any
+    stream/slot state is touched, so the connection stays fully usable."""
+    listener, host, port = await _listener()
+
+    async def server():
+        transport = await listener.accept()
+        async with H2Server(transport) as srv:
+            async for req in srv:
+                await req.read()
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            with pytest.raises(ValueError):
+                await conn.request("GET", "/", headers={"connection": "keep-alive"})
+            with pytest.raises(ValueError):  # `te` may only carry "trailers"
+                await conn.request("GET", "/", headers={"te": "gzip"})
+            resp = await conn.request("GET", "/", headers={"te": "trailers"})  # the one legal `te`
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_h2_connection_specific_response_headers_rejected():
+    """The server's response HEADERS get the same §8.2.2 rejection — before the
+    state transition, so the handler can still send a valid response on the
+    same stream after a rejected attempt."""
+    listener, host, port = await _listener()
+
+    async def server():
+        transport = await listener.accept()
+        async with H2Server(transport) as srv:
+            async for req in srv:
+                await req.read()
+                with pytest.raises(ValueError):
+                    await req.respond(200, headers={"connection": "close"}, body=b"nope")
+                await req.respond(200, body=b"ok")  # stream untouched -> still respondable
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("GET", "/")
+            assert resp.status == 200
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+
+@pytest.mark.tonio
 async def test_h2_bodyless_request_with_trailers():
     """A request with trailers but NO body still ends on the trailing HEADERS frame
     (HEADERS + trailers, no DATA) rather than END_STREAM on the request HEADERS (F45)."""

@@ -76,6 +76,8 @@ enum Peer {
 enum Cause {
     EndStream,
     Error(Error),
+    /// The stream was reset after the receive half had already reached EOS.
+    ErrorAfterEndStream(Error),
 
     /// This indicates to the connection that a reset frame must be sent out
     /// once the send queue has been flushed.
@@ -255,6 +257,7 @@ impl State {
     /// - `frame`: the received RST_STREAM frame.
     /// - `queued`: true if this stream has frames in the pending send queue.
     pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
+        let recv_end_stream = self.is_recv_end_stream();
         match self.inner {
             // If the stream is already in a `Closed` state, do nothing,
             // provided that there are no frames still in the send queue.
@@ -280,10 +283,13 @@ impl State {
                     state,
                     queued
                 );
-                self.inner = Closed(Cause::Error(Error::remote_reset(
-                    frame.stream_id(),
-                    frame.reason(),
-                )));
+                let error = Error::remote_reset(frame.stream_id(), frame.reason());
+                // Preserve the received EOS while retaining the reset for the send half.
+                self.inner = Closed(if recv_end_stream {
+                    Cause::ErrorAfterEndStream(error)
+                } else {
+                    Cause::Error(error)
+                });
             }
         }
     }
@@ -355,7 +361,7 @@ impl State {
 
     pub fn is_local_error(&self) -> bool {
         match self.inner {
-            Closed(Cause::Error(ref e)) => e.is_local(),
+            Closed(Cause::Error(ref e) | Cause::ErrorAfterEndStream(ref e)) => e.is_local(),
             Closed(Cause::ScheduledLibraryReset(..)) => true,
             _ => false,
         }
@@ -365,6 +371,11 @@ impl State {
         matches!(
             self.inner,
             Closed(Cause::Error(Error::Reset(_, _, Initiator::Remote)))
+                | Closed(Cause::ErrorAfterEndStream(Error::Reset(
+                    _,
+                    _,
+                    Initiator::Remote
+                )))
         )
     }
 
@@ -410,8 +421,11 @@ impl State {
     }
 
     pub fn is_recv_end_stream(&self) -> bool {
-        // In either case END_STREAM has been received
-        matches!(self.inner, Closed(Cause::EndStream) | HalfClosedRemote(..))
+        // In each case END_STREAM has been received.
+        matches!(
+            self.inner,
+            Closed(Cause::EndStream | Cause::ErrorAfterEndStream(_)) | HalfClosedRemote(..)
+        )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -436,7 +450,9 @@ impl State {
             Closed(Cause::ScheduledLibraryReset(reason)) => {
                 Err(proto::Error::library_go_away(reason))
             }
-            Closed(Cause::EndStream) | HalfClosedRemote(..) | ReservedLocal => Ok(false),
+            Closed(Cause::EndStream | Cause::ErrorAfterEndStream(_))
+            | HalfClosedRemote(..)
+            | ReservedLocal => Ok(false),
             _ => Ok(true),
         }
     }

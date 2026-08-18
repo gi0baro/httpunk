@@ -29,6 +29,12 @@ if TYPE_CHECKING:
     from ..types import Request
 
 
+# Max bytes of a still-incomplete response head before failing the connection —
+# hyper's `DEFAULT_MAX_BUFFER_SIZE` (io.rs: 8192 + 4096*100), the same cap the
+# server role applies to request heads (`h1/server.py` `_MAX_HEAD_SIZE`).
+_MAX_HEAD_SIZE = 8192 + 4096 * 100
+
+
 class Connection(H1ConnectionBase):
     """The client-side h1 driver: writes a request, reads a response, reuses the
     connection on keep-alive. Mirrors hyper's Client `Dispatcher` over `Conn`.
@@ -276,6 +282,7 @@ class Connection(H1ConnectionBase):
     async def _read_head(self, codec, write_error=None):
         # hyper: conn.rs `can_read_head` (L175) + `read_head` -> role.rs
         # `Client::parse` (L1013), which loops past 1xx informational responses.
+        buffered = 0
         while True:
             data = await self.transport.receive_some(65536)
             if not data:
@@ -284,9 +291,18 @@ class Connection(H1ConnectionBase):
                 if write_error:
                     raise write_error[0]
                 raise ConnectionClosedError("connection closed before the response head")
+            buffered += len(data)
             head = codec.receive_head(data)
             if head is not None:
                 return head
+            # Cap the still-incomplete head at hyper's max_buf_size (io.rs
+            # L202-205, enforcement tightened in 1.11.0 #4093): a server
+            # streaming an endless header section must not grow this
+            # connection's buffer without bound. The server role already
+            # enforces the same cap (`_MAX_HEAD_SIZE` + auto-431); the client
+            # just fails the connection (hyper `Parse::TooLarge`).
+            if buffered >= _MAX_HEAD_SIZE:
+                raise ValueError("response head too large (Parse::TooLarge)")
 
     async def _await_body_failure(self, body_failed, write_error):
         # Raced against `_read_head` (once per request, in send_request): if the request

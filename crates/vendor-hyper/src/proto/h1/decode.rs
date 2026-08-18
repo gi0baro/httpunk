@@ -201,13 +201,6 @@ impl Decoder {
                         if trailers_buf.is_some() {
                             trace!("found possible trailers");
 
-                            // decoder enforces that trailers count will not exceed h1_max_headers
-                            if *trailers_cnt >= h1_max_headers {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "chunk trailers count overflow",
-                                )));
-                            }
                             match decode_trailers(
                                 &mut trailers_buf.take().expect("Trailer is None"),
                                 *trailers_cnt,
@@ -353,15 +346,15 @@ impl ChunkedState {
         match byte!(rdr, cx) {
             b @ b'0'..=b'9' => {
                 *size = or_overflow!(size.checked_mul(radix));
-                *size = or_overflow!(size.checked_add((b - b'0') as u64));
+                *size = or_overflow!(size.checked_add(u64::from(b - b'0')));
             }
             b @ b'a'..=b'f' => {
                 *size = or_overflow!(size.checked_mul(radix));
-                *size = or_overflow!(size.checked_add((b + 10 - b'a') as u64));
+                *size = or_overflow!(size.checked_add(u64::from(b + 10 - b'a')));
             }
             b @ b'A'..=b'F' => {
                 *size = or_overflow!(size.checked_mul(radix));
-                *size = or_overflow!(size.checked_add((b + 10 - b'A') as u64));
+                *size = or_overflow!(size.checked_add(u64::from(b + 10 - b'A')));
             }
             _ => {
                 return Poll::Ready(Err(io::Error::new(
@@ -385,15 +378,15 @@ impl ChunkedState {
         match byte!(rdr, cx) {
             b @ b'0'..=b'9' => {
                 *size = or_overflow!(size.checked_mul(radix));
-                *size = or_overflow!(size.checked_add((b - b'0') as u64));
+                *size = or_overflow!(size.checked_add(u64::from(b - b'0')));
             }
             b @ b'a'..=b'f' => {
                 *size = or_overflow!(size.checked_mul(radix));
-                *size = or_overflow!(size.checked_add((b + 10 - b'a') as u64));
+                *size = or_overflow!(size.checked_add(u64::from(b + 10 - b'a')));
             }
             b @ b'A'..=b'F' => {
                 *size = or_overflow!(size.checked_mul(radix));
-                *size = or_overflow!(size.checked_add((b + 10 - b'A') as u64));
+                *size = or_overflow!(size.checked_add(u64::from(b + 10 - b'A')));
             }
             b'\t' | b' ' => return Poll::Ready(Ok(ChunkedState::SizeLws)),
             b';' => return Poll::Ready(Ok(ChunkedState::Extension)),
@@ -645,7 +638,7 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
     let res = httparse::parse_headers(buf, &mut headers);
     match res {
         Ok(httparse::Status::Complete((_, headers))) => {
-            for header in headers.iter() {
+            for header in headers {
                 use std::convert::TryFrom;
                 let name = match HeaderName::try_from(header.name) {
                     Ok(name) => name,
@@ -667,7 +660,7 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
                     }
                 };
 
-                trailers.insert(name, value);
+                trailers.append(name, value);
             }
 
             Ok(trailers)

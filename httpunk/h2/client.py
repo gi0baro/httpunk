@@ -114,6 +114,11 @@ class ClientStreamManager(StreamManager):
         h2: proto/streams/streams.rs `send_request` (L218); state transition =
         state.rs `send_open`.
         """
+        # Reject connection-specific request headers before ANY stream/slot
+        # state is touched (h2 send.rs `send_headers` -> `check_headers`, RFC
+        # 9113 §8.2.2) — same early-validation rationale as the trailers check
+        # in `send_request` (#925): a caller error, the connection stays usable.
+        self.check_send_headers(headers)
         if self._goaway is not None:
             raise self._goaway
         await self._acquire_stream_slot()  # blocks on the limit; increments the count
@@ -378,6 +383,15 @@ class H2Connection(BaseClientConnection):
         # separate empty DATA frame (F39). A HEAD request response never has a body
         # regardless of content-length.
         bodyless = request.body is None or (isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0)
+        # Validate trailers BEFORE opening the stream (h2 0.4.16 #925: send_trailers
+        # rejects connection-specific fields, RFC 9113 §8.2.2). Checked HERE, sync,
+        # because the trailers are sent by the detached background body writer,
+        # whose errors are deliberately suppressed (`_write_body`) — a late reject
+        # there would silently leave the stream half-open. Early validation also
+        # matches upstream's "a rejected call leaves the stream untouched": no
+        # stream is opened, the connection stays fully usable.
+        if request.trailers is not None:
+            self._conn.streams.check_send_headers(request.trailers)
         # Trailers ride a trailing HEADERS frame (with END_STREAM) AFTER the body, so a
         # request with trailers never ends the stream on the request HEADERS even when
         # its body is empty/None (F45).
