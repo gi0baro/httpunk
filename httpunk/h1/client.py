@@ -253,8 +253,7 @@ class Connection(H1ConnectionBase):
         # and only surface it if no response is forthcoming. Cancellation
         # (BaseException) propagates so the scope can unwind cleanly.
         try:
-            await self.transport.send_all(head)
-            await self._send_body(codec, body, trailers)
+            await self._send_head_and_body(codec, head, body, trailers)
             body_done.set()
         except OSError as exc:
             # A TRANSPORT write failure (broken pipe / reset): the peer may have closed

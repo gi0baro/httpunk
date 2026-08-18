@@ -20,6 +20,18 @@ from ..exceptions import ConnectionClosedError
 
 _READ_SIZE = 65536
 
+# Coalescing cutoff for `_send_head_and_body`: an immediate bytes body at or
+# under this size is copied into the head's buffer and written in ONE syscall.
+# Small enough that the memcpy is far cheaper than the syscall it saves; large
+# bodies don't need it (bulk writes of full segments don't Nagle-stall) and
+# copying them would just churn memory. The VALUE is ours, not hyper's: hyper
+# needs no cutoff — its WriteBuf either flattens bodies of any size (bounded by
+# max_buf_size, ~417KB default) or queues chunks copy-free for a vectored
+# writev. A copy cap stands in for that writev path, which the transport seam's
+# single-buffer `send_all` can't express; a future `send_vectored` on the seam
+# would retire the cutoff and match hyper's Queue strategy outright.
+_COALESCE_MAX = 8192
+
 
 class H1ConnectionBase:
     """Role-agnostic h1 connection leaves over a caller-supplied transport
@@ -82,6 +94,30 @@ class H1ConnectionBase:
         if isinstance(body, (bytes, bytearray)):
             return (len(body), False) if len(body) else (None, False)
         return None, True
+
+    async def _send_head_and_body(self, codec, head, body, trailers=None):
+        """Write the message head + framed body. A bodyless message or an
+        immediate small `bytes` body (≤ `_COALESCE_MAX`) is COALESCED with the
+        head into a single transport write — hyper's `WriteBuf` "flatten"
+        strategy (proto/h1/io.rs): one syscall instead of two, and never two
+        small back-to-back segments, so the Nagle × delayed-ACK stall (~40ms
+        per message on sockets without TCP_NODELAY) is structurally impossible
+        for small messages. Streamed/large bodies keep the head-first write —
+        the head must never wait on a body generator, and copying bulk data
+        would cost more than the saved syscall. The coalesced branch mirrors
+        `_send_body` exactly (aiter_body yields a bytes body as one chunk)."""
+        if body is None or (isinstance(body, (bytes, bytearray)) and len(body) <= _COALESCE_MAX):
+            buf = bytearray(head)
+            if codec.body_is_eof():
+                buf += codec.serialize_end()
+            else:
+                if body is not None:
+                    buf += codec.serialize_data(bytes(body))
+                buf += codec.serialize_trailers(trailers) if trailers is not None else codec.serialize_end()
+            await self.transport.send_all(bytes(buf))
+            return
+        await self.transport.send_all(head)
+        await self._send_body(codec, body, trailers)
 
     async def _send_body(self, codec, body, trailers=None):
         # Frame + write the message body via `codec` (the request codec on the

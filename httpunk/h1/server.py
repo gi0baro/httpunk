@@ -448,8 +448,7 @@ class ServerConnection(H1ConnectionBase):
             # itself, so inject it here (F29) rather than emitting a bare error head.
             hdrs = self._negotiate_connection_header(HeaderMap(), keep_alive=False, http10=False, resp_close=False)
             head = codec.serialize_response(status, hdrs, keep_alive=False)
-            await self.transport.send_all(head)
-            await self.transport.send_all(codec.serialize_end())
+            await self.transport.send_all(bytes(head) + bytes(codec.serialize_end()))  # one write (coalesced)
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
             pass
         self._close_transport()
@@ -507,8 +506,7 @@ class ServerConnection(H1ConnectionBase):
                 content_length=content_length,
                 chunked=chunked,
             )
-            await self.transport.send_all(head)
-            await self._send_body(self._codec, body)
+            await self._send_head_and_body(self._codec, head, body)
         except BaseException as exc:
             self._reusable = False
             self._closed = True
