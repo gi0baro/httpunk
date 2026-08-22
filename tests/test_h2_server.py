@@ -568,3 +568,152 @@ async def test_h2_bodyless_request_with_trailers():
 
     assert seen["body"] == b""
     assert seen["trailers"].get("x-done") == b"1"
+
+
+# ===== peer GOAWAY → acknowledging GOAWAY + connection done (F23, server role) =====
+
+
+async def _serve_and_report(listener, done):
+    """Serve one connection; set `done` once the accept loop has exited and the
+    server's `__aexit__` has run (i.e. the transport is closed)."""
+    transport = await listener.accept()
+    with contextlib.suppress(Exception):
+        async with H2Server(transport) as server, scope() as handlers:
+            async for req in server:
+
+                async def handle(r):
+                    await r.read()
+                    await r.respond(200, body=b"ok")
+
+                handlers.spawn(handle(req))
+    done.set()
+
+
+async def _settle_handshake(transport, codec, seen):
+    """Read the server's SETTINGS and ack it BEFORE the test sends GOAWAY: once the
+    server has replied GOAWAY it stops reading (h2: `should_close_now` → no more
+    `poll_next`), so a SETTINGS ack still in flight would sit unread in its socket
+    buffer and turn its close into a TCP RST instead of a FIN."""
+    while not any(isinstance(f, Settings) and not f.ack for f in seen):
+        data = await transport.receive_some(65536)
+        assert data
+        for f in codec.receive(data):
+            if isinstance(f, Settings) and not f.ack:
+                await transport.send_all(codec.serialize_settings_ack())
+            seen.append(f)
+
+
+async def _read_until_eof(transport, codec, *, seen=None):
+    """Read frames (acking SETTINGS) until the peer's FIN. Returns the frames seen."""
+    seen = [] if seen is None else seen
+    while True:
+        data = await transport.receive_some(65536)
+        if not data:
+            return seen
+        for f in codec.receive(data):
+            if isinstance(f, Settings) and not f.ack:
+                await transport.send_all(codec.serialize_settings_ack())
+            seen.append(f)
+
+
+async def _assert_goaway_then_eof(transport, codec, done, *, seen=None):
+    """The one contract under test: the server replies GOAWAY(NO_ERROR), then CLOSES
+    (the client reads EOF — without the fix it hangs here), and its accept loop ends."""
+    seen = await _read_until_eof(transport, codec, seen=seen)
+    goaways = [f for f in seen if isinstance(f, GoAway)]
+    assert len(goaways) == 1 and goaways[0].error_code == H2Reason.NO_ERROR
+    await done.wait()
+    transport.close()
+    return seen
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize("last_id", [0, 1])
+async def test_server_closes_after_goaway_reply_when_idle(last_id):
+    """Peer GOAWAY on an idle connection (one completed request): the server sends its
+    acknowledging GOAWAY(NO_ERROR) AND closes the connection / ends the accept loop —
+    h2 `go_away_now` → `should_close_now` → the connection future resolves (F23).
+    Previously only the GOAWAY went out and the socket leaked forever."""
+    listener, host, port = await _listener()
+    done = Event()
+    async with scope() as s:
+        s.spawn(_serve_and_report(listener, done))
+        transport, codec = await _raw_handshake(host, port)
+        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
+        seen = []
+        while not any(isinstance(f, Headers) for f in seen):  # full response for stream 1
+            data = await transport.receive_some(65536)
+            assert data
+            for f in codec.receive(data):
+                if isinstance(f, Settings) and not f.ack:
+                    await transport.send_all(codec.serialize_settings_ack())
+                seen.append(f)
+        await transport.send_all(codec.serialize_go_away(last_id, H2Reason.NO_ERROR))
+        await _assert_goaway_then_eof(transport, codec, done, seen=seen)
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_closes_after_goaway_reply_no_streams_ever():
+    """Peer GOAWAY right after the handshake, no stream ever opened: same contract."""
+    listener, host, port = await _listener()
+    done = Event()
+    async with scope() as s:
+        s.spawn(_serve_and_report(listener, done))
+        transport, codec = await _raw_handshake(host, port)
+        seen = []
+        await _settle_handshake(transport, codec, seen)
+        await transport.send_all(codec.serialize_go_away(0, H2Reason.NO_ERROR))
+        await _assert_goaway_then_eof(transport, codec, done, seen=seen)
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_closes_after_goaway_received_mid_request():
+    """Peer GOAWAY(last=1) while stream 1 is still in flight, and the peer sends NOTHING
+    more. Stream 1 finishing is a local event — h2's `drop_stream_ref` wakes the
+    connection task so the idle check re-runs (streams.rs L1647); httpunk must do the
+    same from the stream-close path, not only after inbound bytes."""
+    listener, host, port = await _listener()
+    done = Event()
+    async with scope() as s:
+        s.spawn(_serve_and_report(listener, done))
+        transport, codec = await _raw_handshake(host, port)
+        seen = []
+        await _settle_handshake(transport, codec, seen)
+        # Request body still pending (no END_STREAM) when the GOAWAY lands...
+        await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/", end_stream=False))
+        await transport.send_all(codec.serialize_go_away(1, H2Reason.NO_ERROR))
+        # ...then finish it; after this the client is silent.
+        await transport.send_all(codec.serialize_data(1, b"x", end_stream=True))
+        seen = await _assert_goaway_then_eof(transport, codec, done, seen=seen)
+        # Stream 1 was <= last_stream_id, so it was served before the close.
+        assert any(isinstance(f, Headers) and f.stream_id == 1 and f.status == 200 for f in seen)
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_keeps_serving_after_phase1_goaway():
+    """A phase-1 graceful GOAWAY (last_stream_id = 2^31-1) is NOT an idle-close
+    trigger: the connection must stay open and keep serving (h2 `should_close_on_idle`
+    excludes `StreamId::MAX`)."""
+    listener, host, port = await _listener()
+    done = Event()
+    async with scope() as s:
+        s.spawn(_serve_and_report(listener, done))
+        transport, codec = await _raw_handshake(host, port)
+        await transport.send_all(codec.serialize_go_away(2**31 - 1, H2Reason.NO_ERROR))
+        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
+        seen = []
+        while not any(isinstance(f, Headers) for f in seen):
+            data = await transport.receive_some(65536)
+            assert data, "server closed after a phase-1 GOAWAY"
+            for f in codec.receive(data):
+                if isinstance(f, Settings) and not f.ack:
+                    await transport.send_all(codec.serialize_settings_ack())
+                seen.append(f)
+        assert not any(isinstance(f, GoAway) for f in seen)
+        assert not done.is_set()
+        transport.close()
+        await done.wait()  # the server sees our FIN and exits cleanly
+        s.cancel()

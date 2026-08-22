@@ -896,6 +896,19 @@ class StreamManager:
         """
         if st.state.is_closed() and self._streams.pop(st.id, None) is not None:
             self._release_slot(st)
+            self._on_stream_gone()
+
+    def _on_stream_gone(self):
+        """A stream left `_streams`: re-run the connection's idle-close check.
+
+        h2: streams.rs `drop_stream_ref` (L1647) wakes the connection task when a
+        closed stream is released, so `Connection::poll` re-evaluates
+        `error.is_some() && !has_streams()` → `go_away_now(NO_ERROR)`
+        (connection.rs L287-295). Without this, a peer GOAWAY that arrived while
+        a request was in flight would never be acknowledged if the peer sends
+        nothing further — the read pump only re-checks after inbound bytes.
+        """
+        self._conn._maybe_goaway_reply()
 
     def _abort_stream(self, st, exc):
         """Error a stream, unblock its waiters, remove it, and free its slot."""
@@ -912,6 +925,7 @@ class StreamManager:
         st.window_evt.set()  # unblock a sender parked on flow control (it re-checks st.error)
         if self._streams.pop(st.id, None) is not None:
             self._release_slot(st)
+            self._on_stream_gone()  # no-op during `fail_all` (`_conn.error` already set)
 
     def handle_go_away(self, last_stream_id, exc):
         """Peer sent GOAWAY: refuse new streams; streams > last_stream_id were

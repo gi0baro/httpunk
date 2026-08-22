@@ -141,11 +141,16 @@ class H2ConnectionBase:
         # `resp.aclose()` immediately followed by close ENQUEUES the RST_STREAM,
         # and whether the pump wakes before the cancel above is a scheduler race;
         # dropping it would ship the close without ever telling the peer to stop
-        # (h2 likewise drains its pending-send queue before shutdown). Best-effort:
-        # the connection is closing regardless, so a send failure is ignored.
+        # (h2 likewise drains its pending-send queue before shutdown). Unconditional
+        # on `self.error`: h2's `State::Closing` runs `codec.shutdown` = flush THEN
+        # shutdown on every non-IO close (connection.rs L304-310), including the
+        # GOAWAY-exchanged clean close (F23), whose reply GOAWAY sits in this queue
+        # with `error` already set. Best-effort: the connection is closing
+        # regardless, so a send failure (a dead transport — h2's Io branch, which
+        # skips straight to Closed) is ignored.
         with self._write_buf_lock:
             pending, self._write_buf = bytes(self._write_buf), bytearray()
-        if pending and self.error is None and self._transport is not None:
+        if pending and self._transport is not None:
             with contextlib.suppress(Exception):
                 async with self._send_lock:
                     await self._transport.send_all(pending)
@@ -190,7 +195,10 @@ class H2ConnectionBase:
     # - Connection-lifecycle frames (preface/SETTINGS, GOAWAY, acks) keep plain
     #   `send_frame`: they run in the pump/handshake/shutdown, not under user
     #   cancellation, and GOAWAY needs flushed-before-stop semantics a queue would
-    #   complicate.
+    #   complicate. One exception: the idle-after-peer-GOAWAY reply
+    #   (`_maybe_goaway_reply`) is queued, because its trigger can be a sync stream
+    #   close in user-task context; `close()` drains the queue before the FIN, so
+    #   flushed-before-stop still holds.
     #
     # The full-fidelity alternative — port h2's buffered-send/`reserve_capacity`
     # model and route DATA through the queue too — remains open as a future step;
@@ -255,10 +263,27 @@ class H2ConnectionBase:
                     self.backend.close_transport(self._transport)
                 raise
 
-    async def _maybe_goaway_reply(self):
+    def _maybe_goaway_reply(self):
         """If the peer has GOAWAY'd us with a REAL last-stream-id and no streams remain,
-        send our acknowledging GOAWAY(NO_ERROR, last-processed-id) exactly once and
-        report that the pump should stop (F23). No-op otherwise.
+        queue our acknowledging GOAWAY(NO_ERROR, last-processed-id) exactly once and
+        mark the connection DONE (F23). No-op otherwise; returns whether it fired.
+
+        h2: proto/connection.rs `poll` (L287-295) — `go_away_now(NO_ERROR)` once
+        `error.is_some() && !has_streams()`, after which `should_close_now()` makes
+        the connection future resolve `Ready(Ok(()))`: sending the reply and being
+        done are ONE step. The "done" half here is `_fail`, the fan-out every other
+        pump exit gets (server: end the accept loop so the caller's `__aexit__`
+        closes the transport; client: wake openers). `fail_all` aborts nothing
+        (no streams remain) and `error` is set so later use fails as closed — the
+        client still reports `GoAwayError` first (`open_stream`/`wait_until_ready`
+        check `_goaway` before `error`, as h2's conn_error is never overwritten).
+
+        Two triggers, like h2's connection task being woken both by inbound frames
+        and by a stream closing (streams.rs `drop_stream_ref` L1647): the read pump
+        after a batch, and `_close_stream`/`_abort_stream` when the last stream
+        goes. The latter is sync user-task context (a `respond()`/`aclose()`
+        finishing), so the frame goes through `enqueue_frame` — exactly h2's
+        `GoAway.pending` queue; `close()` drains it before the FIN (codec.shutdown).
 
         A phase-1 graceful GOAWAY (`last_stream_id == 2^31-1`) is explicitly NOT a
         trigger — it means "I'm shutting down, keep your in-flight work going" and is
@@ -267,6 +292,7 @@ class H2ConnectionBase:
         (h2's `should_close_on_idle` excludes `StreamId::MAX` for the same reason)."""
         if (
             self._goaway_replied
+            or self.error is not None
             or self.streams._goaway is None
             or self.streams._streams
             or self.streams._goaway_last_id is None
@@ -274,7 +300,8 @@ class H2ConnectionBase:
         ):
             return False
         self._goaway_replied = True
-        await self.send_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), int(H2Reason.NO_ERROR)))
+        self.enqueue_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), int(H2Reason.NO_ERROR)))
+        self._fail(ConnectionClosedError("connection closed: GOAWAY exchanged"))
         return True
 
     # ----- inbound -----
@@ -306,13 +333,15 @@ class H2ConnectionBase:
                         # resets (F25).
                         if se.args[2] != "remote":
                             await self.streams.reset_on_error(se.args[0], se.args[1])
-                # After a peer GOAWAY, once every in-flight stream has finished, send our
+                # After a peer GOAWAY, once every in-flight stream has finished, queue our
                 # acknowledging GOAWAY(NO_ERROR, last-processed-id) and stop serving —
                 # h2's poll loop does exactly this (`go_away_now(NO_ERROR)` once
                 # `error.is_some()` and `!has_streams()`, connection.rs L287-295), rather
-                # than lingering until the peer closes the socket (F23). The transport's
-                # FIN follows on the caller's `__aexit__` (httpunk's user-driven lifecycle).
-                if await self._maybe_goaway_reply():
+                # than lingering until the peer closes the socket (F23). The connection is
+                # DONE (`_fail` inside): the accept loop / openers are woken, and the
+                # transport's FIN follows on the caller's `__aexit__` → `close()`, which
+                # drains the queued GOAWAY first (httpunk's user-driven lifecycle).
+                if self._maybe_goaway_reply():
                     break
         except H2Error as exc:
             # A protocol/flow violation we detected (bad state, HPACK/CONTINUATION,

@@ -160,6 +160,36 @@ async def test_h2_protocol_graceful_shutdown():
 
 
 @pytest.mark.asyncio
+async def test_h2_protocol_closes_after_client_goaway():
+    """The CLIENT GOAWAYs an idle connection: the server replies GOAWAY(NO_ERROR) and
+    then CLOSES — its serve task ends and the client reads EOF (F23, server role, on
+    the asyncio backend). It used to reply and then leak the connection forever:
+    the read pump exited without ending the accept loop, so nothing closed."""
+    server, host, port, protocols = await _serve(_EchoH2)
+    async with server:
+        r, w = await asyncio.open_connection(host, port)
+        # Preface + empty SETTINGS; let the server's SETTINGS arrive and ack it so our
+        # ack is not left unread in its buffer (which would turn the FIN into a RST).
+        w.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + b"\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+        await w.drain()
+        await asyncio.wait_for(r.read(65536), 5)  # server SETTINGS (+ WINDOW_UPDATE)
+        w.write(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00")  # SETTINGS ack
+        w.write(b"\x00\x00\x08\x07\x00\x00\x00\x00\x00" + b"\x00" * 8)  # GOAWAY(last=0, NO_ERROR)
+        await w.drain()
+        got = b""
+        while chunk := await asyncio.wait_for(r.read(65536), 5):  # hangs here without the fix
+            got += chunk
+        frames, i = [], 0  # raw framing: (type, payload)
+        while i < len(got):
+            n = int.from_bytes(got[i : i + 3], "big")
+            frames.append((got[i + 3], got[i + 9 : i + 9 + n]))
+            i += 9 + n
+        assert [p for t, p in frames if t == 0x07] == [b"\x00" * 8]  # GOAWAY(last=0, NO_ERROR), then EOF
+        await asyncio.wait_for(protocols[0].wait_closed(), 5)
+        w.close()
+
+
+@pytest.mark.asyncio
 async def test_h1_protocol_graceful_shutdown_releases_idle():
     # h1 graceful releases the idle head-read (via backend.select) and closes; the
     # protocol's wait_closed() resolves once the connection has drained.

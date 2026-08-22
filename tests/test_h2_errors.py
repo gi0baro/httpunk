@@ -9,6 +9,7 @@ from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import (
+    ConnectionClosedError,
     GoAwayError,
     H2Connection,
     H2Error,
@@ -24,6 +25,7 @@ from httpunk._httpunk import (
     H2FrameData as Data,
     H2FrameGoAway as GoAway,
     H2FrameHeaders as Headers,
+    H2FramePing as Ping,
     H2FrameRstStream as RstStream,
     H2FrameSettings as Settings,
 )
@@ -809,3 +811,47 @@ async def test_end_stream_with_content_length_resets_not_hangs():
             with pytest.raises(H2Error):  # RST_STREAM(PROTOCOL_ERROR), woken promptly
                 await conn.request("GET", "/")
         s.cancel()
+
+
+@pytest.mark.tonio
+async def test_close_flushes_queued_frames_even_after_connection_error():
+    """`close()` drains the control-frame queue BEFORE the FIN regardless of
+    `error` being set — h2's `State::Closing` runs `codec.shutdown` (flush, then
+    shutdown) on every non-IO close (connection.rs L304-310). The GOAWAY-exchanged
+    clean close (F23) relies on this: its reply GOAWAY is queued with `error` already
+    set, and whether the write pump wakes before `close()` tears it down is a
+    scheduler race. The write-pump wake is stubbed out so the queue is guaranteed
+    to still hold the frame when `close()` runs."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    seen = []
+
+    async def server():
+        stream, codec, frames = await _accept_handshake(listener)
+        for f in frames:
+            if isinstance(f, Settings) and not f.ack:
+                await stream.send_all(codec.serialize_settings_ack())
+        while True:
+            chunk = await stream.receive_some(65536)
+            if not chunk:
+                seen.append("eof")
+                break
+            for f in codec.receive(chunk):
+                if isinstance(f, Settings) and not f.ack:
+                    await stream.send_all(codec.serialize_settings_ack())
+                else:
+                    seen.append(f)
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            inner = conn._conn
+            inner._write_evt.set = lambda: None  # the pump never wakes: the frame stays queued
+            inner.enqueue_frame(inner.codec.serialize_ping(b"flushme!"))
+            inner.error = ConnectionClosedError("simulated failure")
+        # `__aexit__` -> `close()` must have written the queued PING before closing.
+        while seen[-1:] != ["eof"]:
+            await sleep(0)
+        s.cancel()
+
+    assert any(isinstance(f, Ping) and f.data == b"flushme!" for f in seen), seen
