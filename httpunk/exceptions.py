@@ -17,6 +17,15 @@ state-machine / flow-control / API-misuse errors raised by the extension share i
 
 `error_code` attributes are `H2Reason` members for known codes (an `IntEnum`, so
 they compare equal to ints), or a plain int for codes outside the RFC set.
+
+An HTTP/1 `send_request` failure raised before the request was handed to the
+writer carries `request_unsent = True` on the exception instance (whatever its
+type — `ConnectionClosedError`, or the unexpected-bytes poison error): nothing
+reached the wire, so the request is safe to retry with any body, streamed
+included. The mirror of hyper's `TrySendError { message: Some(request) }`
+give-back (client/conn/http1.rs L247-263; proto/h1/dispatch.rs L711-733). Read
+it with `getattr(exc, "request_unsent", False)` — it is absent once the write
+may have begun.
 """
 
 from __future__ import annotations

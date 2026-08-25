@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 # server role applies to request heads (`h1/server.py` `_MAX_HEAD_SIZE`).
 _MAX_HEAD_SIZE = 8192 + 4096 * 100
 
+# Sentinel returned by the idle watcher's stop branch (the client mirror of the
+# h1 server's `_SHUTDOWN` select sentinel): "an exchange is starting / the
+# connection is closing", as opposed to data/EOF from the transport.
+_IDLE_STOP = object()
+
 
 class Connection(H1ConnectionBase):
     """The client-side h1 driver: writes a request, reads a response, reuses the
@@ -61,6 +66,12 @@ class Connection(H1ConnectionBase):
     - `Expect: 100-continue` and the request's `Connection: close` are non-gaps for
       the client: hyper hard-codes `expect_continue: false` (role.rs L1161) and
       derives reuse solely from the response's keep-alive (conn.rs L294).
+    - While reusable-idle, a watcher task holds read interest — the re-expression
+      of hyper's always-polled `Connection` future (see `_watch_idle`) — so an
+      idle peer close or stray byte flips `closed`/`error` when it happens, and
+      a `send_request` failure raised before the request was handed to the
+      writer carries `request_unsent = True` (hyper's `TrySendError` message
+      give-back, client/conn/http1.rs L247-263).
     """
 
     def __init__(self, transport, *, authority=None, backend=None):
@@ -87,9 +98,27 @@ class Connection(H1ConnectionBase):
         # (a scope can't be re-armed after `cancel()`), so reuse isn't blocked.
         self._writer_scope = None
         self._writer_done = None
+        # The idle watcher: a background task parked in a read while the
+        # connection is reusable-idle — the Python re-expression of hyper's
+        # always-polled `Connection` future, which keeps read interest registered
+        # for the whole idle period (dispatch.rs L287 falls through to
+        # `poll_read_keep_alive`, conn.rs L435-443; `force_io_read` returns
+        # Pending, conn.rs L510-520), so a peer FIN or stray byte is observed
+        # when it ARRIVES, not at the next send. Python coroutines can't hold
+        # read interest without a parked task — the watcher is that task
+        # (divergence in mechanism only; behavior matches hyper, see
+        # `_watch_idle`). Scope + stop event are per idle period (a scope can't
+        # be re-armed after `cancel()` — same reason `_writer_scope` is
+        # per-request).
+        self._watcher_scope = None
+        self._watcher_stop = None
 
     async def connect(self):
-        pass  # HTTP/1 has no connection preface / handshake (unlike h2)
+        # HTTP/1 has no connection preface / handshake (unlike h2), but hyper's
+        # `Connection` future is polled from the moment it is spawned — the
+        # dial-to-first-send window has read interest upstream, so it is watched
+        # here too.
+        await self._start_watcher()
 
     async def _teardown_writer(self, *, cancel):
         """Finish with the in-flight body writer: `cancel=True` aborts it (still
@@ -102,6 +131,95 @@ class Connection(H1ConnectionBase):
         if cancel:
             scope.cancel()
         await scope.__aexit__(None, None, None)
+
+    async def _start_watcher(self):
+        """Start the idle watcher (see `_watch_idle`). Callers guarantee no
+        exchange can be reading: `connect()` runs before any request, and
+        `release_slot` starts it BEFORE releasing the slot — tonio is
+        work-stealing, so a waiter resumed by the release can run in parallel
+        immediately, and the semaphore release/acquire is the happens-before
+        edge that guarantees it observes (and joins) the watcher before its
+        first read (F55 single-reader). No-op if the connection can serve no
+        more requests."""
+        if self._closed or self.error is not None or self.transport is None:
+            return
+        stop = self.backend.event()
+        scope = self.backend.scope()
+        await scope.__aenter__()
+        self._watcher_scope, self._watcher_stop = scope, stop
+        scope.spawn(self._watch_idle(stop))
+
+    async def _stop_watcher(self):
+        """Signal and JOIN the idle watcher; idempotent, instant when none is
+        running or it already finished. The join is mandatory before any
+        exchange read — concurrent `receive_some` raises (F55). Handles are
+        nulled before the join suspension (same discipline as
+        `_teardown_writer`); if the join is interrupted, the caller must leave
+        the connection unusable (see `send_request`)."""
+        scope, stop = self._watcher_scope, self._watcher_stop
+        if scope is None:
+            return
+        self._watcher_scope = self._watcher_stop = None
+        stop.set()
+        await scope.__aexit__(None, None, None)
+
+    async def _watch_idle(self, stop):
+        """Park in a read until EOF, stray bytes, a transport error, or `stop`.
+        The body of hyper's idle-time `require_empty_read` (conn.rs L458-489),
+        one idle period per call:
+
+        - EOF -> hyper's CLEAN idle close: "found EOF on idle connection,
+          closing" (conn.rs L471-481; `should_error_on_eof` is false when idle —
+          conn.rs L201-204, "it's probably just the connection closing
+          gracefully"). `_closed` only, NO error recorded: a pool discards
+          silently. The transport is closed NOW — hyper's connection task winds
+          down and drops its io (dispatch.rs L152-160) — so the socket never
+          parks in CLOSE_WAIT.
+        - bytes -> `new_unexpected_message` (conn.rs L484-489): poison + close,
+          EVEN IF `stop` fired concurrently. hyper's poll loop checks reads
+          before taking a queued request (`poll_read` runs ahead of `poll_write`
+          each turn, dispatch.rs L146-160), so bytes racing a new request poison
+          the connection — they never parse as that request's response. The
+          select places the read FIRST so a same-tick race resolves the same
+          way; exiting quietly here would silently swallow violation bytes.
+        - transport error -> fail (hyper `force_io_read` io error ->
+          `state.close()`, conn.rs L510-520) — unless a concurrent `close()`
+          already committed the flags.
+        - stop (an exchange is starting / teardown) -> exit, touching nothing.
+
+        The select-vs-stop shape is the h1 server's idle-shutdown pattern
+        (`server.py` `_read_or_shutdown`), used UNIFORMLY on both backends:
+        asyncio's `interrupt_read` wake is unsuitable here — a woken read
+        returns whatever is buffered (bytes, not `b""`, if data raced in — an
+        ambiguous stop/EOF/violation), while a cancelled select loser consumes
+        nothing."""
+        transport = self.transport
+        if transport is None:  # a racing close() nulled it before we ran (F59)
+            return
+        if stop.is_set():
+            # Stopped before this task ever ran — the connect()-then-immediate-
+            # request pattern. Never build the select (the server's
+            # `_read_or_shutdown` fast-path): a spawned-then-cancelled read
+            # branch would be pure churn.
+            return
+
+        async def _await_stop():
+            await stop.wait()
+            return _IDLE_STOP
+
+        try:
+            data = await self.backend.select(transport.receive_some(65536), _await_stop())
+        except Exception as exc:
+            if not self._closed:  # a racing close() already committed the flags
+                self._fail(exc)
+            return
+        if data is _IDLE_STOP:
+            return
+        if data:
+            self.poison_unexpected(len(data))
+            return
+        self._closed = True
+        self._close_transport()
 
     def _acquire(self):
         return self._slot.acquire()  # blocks until the single in-flight slot is free
@@ -123,26 +241,46 @@ class Connection(H1ConnectionBase):
         # modeled by the 1-permit slot.
         await self._acquire()
         self._busy = True
+        # Stop + JOIN the idle watcher before anything may read (F55: concurrent
+        # `receive_some` raises). hyper needs no handoff — the task that reads
+        # while idle IS the poll loop that writes the next request; two Python
+        # tasks need this explicit join. If the join itself is interrupted, the
+        # slot stays held and `busy` stays True ON PURPOSE: the watcher may still
+        # be parked in a read, so the connection must never admit another
+        # exchange (a pool drops on `busy` — same discipline as an interrupted
+        # `release_slot`).
+        await self._stop_watcher()
+        # Checked AFTER the join: the watcher may have observed EOF/bytes and
+        # closed/poisoned the connection while `_acquire` or the join waited —
+        # the mirror of `SendRequest::poll_ready` failing once the connection
+        # task died (client/conn/http1.rs L156-180). `request_unsent` mirrors
+        # hyper handing the request back when the dispatch channel refuses it —
+        # `TrySendError { message: Some(req) }`, client/conn/http1.rs L247-263:
+        # nothing was written, so the caller may safely retry ANY body,
+        # streamed included.
         if self._closed or self.error is not None:
             self._busy = False
             self._slot.release()
-            raise self.error or ConnectionClosedError("connection closed")
+            exc = self.error or ConnectionClosedError("connection closed")
+            exc.request_unsent = True
+            raise exc
         # hyper's always-polled Connection validates the read buffer is empty before it
         # will send (require_empty_read -> new_unexpected_message, conn.rs L463-465; its
         # regression test client_read_bytes_before_writing_request): a server may not
-        # send anything before the client's next request. Lacking a background read task
-        # to notice bytes arriving while idle, poll once here, just before writing — any
-        # bytes waiting are a protocol violation, so poison + fail rather than write a
-        # request that would misparse them as its response (F31, problem b). (An idle
-        # peer *close* still can't be told apart from "no data ready" by a non-blocking
-        # read, so it surfaces only as the write below failing — a known limitation
-        # short of hyper's always-polled connection task.)
+        # send anything before the client's next request. The idle watcher covers the
+        # idle period; this send-time poll mirrors the `read_buf().is_empty()` fast
+        # path and covers the watcher-join -> write gap (F31, problem b) — any bytes
+        # waiting are a protocol violation, so poison (which closes) rather than write
+        # a request that would misparse them as its response. `request_unsent` again
+        # mirrors hyper: a connection error hands a queued-never-taken request back —
+        # including this exact error (proto/h1/dispatch.rs L711-733: recv_msg(Err) ->
+        # rx.try_recv() -> `message: Some(req)`).
         pending = self.backend.receive_nowait(self.transport, 65536)
         if pending:
-            self.poison_unexpected(len(pending))
-            self._fail(self.error)  # the stream is corrupt — close, don't reuse
+            self.poison_unexpected(len(pending))  # records the error AND closes
             self._busy = False
             self._slot.release()
+            self.error.request_unsent = True
             raise self.error
         try:
             codec = H1Codec()
@@ -199,6 +337,12 @@ class Connection(H1ConnectionBase):
             write_error = []
             scope = self.backend.scope()
             await scope.__aenter__()
+            # The `request_unsent` boundary: this spawn is httpunk's analogue of
+            # hyper's dispatcher taking the request off the channel (dispatch.rs
+            # `poll_msg`). From here on a failure NEVER carries the marker — in
+            # hyper, once taken, errors return `message: None` even if no byte
+            # reached the wire (an encoded-but-unflushed head is not handed
+            # back), and this boundary mirrors that exactly.
             scope.spawn(self._write_request(codec, head, body, body_done, write_error, body_failed, trailers))
             self._writer_scope, self._writer_done = scope, body_done
             try:
@@ -223,6 +367,10 @@ class Connection(H1ConnectionBase):
                 # the caller owns; this driver won't touch the transport again
                 # (hyper `on_upgrade` / `Connection::into_parts`).
                 await self._teardown_writer(cancel=True)  # the request-body write is moot
+                # No idle watcher can be running here: it was stopped/joined at
+                # the top of this send_request and is only restarted by
+                # `release_slot` on a reuse verdict, which the upgrade path never
+                # reaches — a detached transport is never watched.
                 upgraded = H1Upgraded(self.transport, codec.take_body())
                 self._detach()
                 self._busy = False
@@ -315,13 +463,19 @@ class Connection(H1ConnectionBase):
         raise write_error[0]
 
     def poison_unexpected(self, nbytes):
-        """The server sent `nbytes` unsolicited bytes past the response body — an
+        """The server sent `nbytes` unsolicited bytes outside a response — an
         HTTP/1 protocol violation (a server may not send anything before the next
-        request). hyper's client fails the connection here via `require_empty_read`
-        -> `new_unexpected_message` (conn.rs L463-465); we record the error so the
-        next `send_request`/`wait_idle` raises it (the slot release closes it)."""
+        request). hyper's client fails the connection via `require_empty_read` ->
+        `new_unexpected_message` (conn.rs L463-465 buffered, L484-489 read) and
+        the errored connection task then winds down, dropping its io
+        (dispatch.rs `poll_catch` L123-141) — so record the error AND close, for
+        every caller (the idle watcher, the send-time guard, the past-body
+        leftover check in share.py). The next `send_request`/`wait_idle` raises
+        the recorded error."""
         if self.error is None:
             self.error = ValueError(f"received {nbytes} unexpected bytes on an idle HTTP/1 connection")
+        self._closed = True
+        self._close_transport()
 
     async def release_slot(self, resp_keep_alive):
         """Free the in-flight slot once the caller has finished the response. Reuse
@@ -341,24 +495,37 @@ class Connection(H1ConnectionBase):
         poisoned, and on reuse the exchange genuinely completed, so freeing the
         slot is correct even if the writer join was cut short."""
         fully_sent = self._writer_done is None or self._writer_done.is_set()
-        if not (resp_keep_alive and fully_sent):
+        reuse = resp_keep_alive and fully_sent
+        if not reuse:
             self._closed = True
             self._close_transport()  # sync by design (backend.close_transport)
         try:
             await self._teardown_writer(cancel=not fully_sent)
+            if reuse:
+                # The connection is reusable-idle again: restore hyper's idle
+                # read interest. Started BEFORE the slot release below (see
+                # `_start_watcher` — the semaphore is the visibility edge for a
+                # parallel waiter); `_start_watcher` no-ops if a racing
+                # close()/failure landed during the writer join.
+                await self._start_watcher()
         finally:
             self._busy = False
             self._slot.release()
 
     async def close(self):
         # Commit `_closed` + close the transport FIRST (the base close is sync —
-        # no suspension), then abort + join a still-running background writer.
-        # The join can be interrupted (it suspends); a force-close must never
-        # come away with `closed` still False.
+        # no suspension), then stop/join the idle watcher (already woken by the
+        # transport close; it sees `_closed` and exits quietly) and abort + join
+        # a still-running background writer. The joins can be interrupted (they
+        # suspend); a force-close must never come away with `closed` still False.
         await super().close()
+        await self._stop_watcher()
         await self._teardown_writer(cancel=True)
 
     def _fail(self, exc):
+        # Sync poison + close. No live watcher to stop here: `_fail` runs only
+        # inside an exchange (slot held, watcher joined at send_request entry)
+        # or from the watcher itself.
         if self.error is None and not isinstance(exc, ConnectionClosedError):
             self.error = exc
         self._closed = True
@@ -412,5 +579,12 @@ class H1Connection(BaseClientConnection):
         absolute-form for a proxy, and an authority (``"host:port"``) is
         authority-form for CONNECT. The caller supplies the ``Host`` header (we
         never auto-add it), exactly like hyper's `client::conn::http1`.
+
+        A failure raised before the request was handed to the writer carries
+        ``request_unsent = True`` on the exception: nothing reached the wire, so
+        the request — any body, streamed included — is safe to retry. The mirror
+        of hyper handing the request back in `TrySendError { message: Some }`
+        (client/conn/http1.rs L247-263; proto/h1/dispatch.rs L711-733). Absent
+        (falsy) once the write may have begun.
         """
         return self._conn.send_request(request.method, request.target, request.headers, request.body, request.trailers)

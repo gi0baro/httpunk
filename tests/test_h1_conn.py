@@ -4,7 +4,7 @@ close-delimited bodies, request bodies, keep-alive reuse, and connection-close."
 
 import pytest
 from _client import open_h1
-from tonio.colored import Event, scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import HTTPunkError
@@ -488,10 +488,11 @@ async def test_unexpected_bytes_past_body_poison_connection():
 async def test_reused_connection_poisoned_by_idle_window_bytes():
     """Bytes a server sends on an ALREADY-IDLE connection — after the client has fully
     consumed the previous response, so NOT coalesced into its body buffer — must still
-    poison the connection. The pre-write `receive_nowait` check catches them so the next
-    request fails rather than misparsing them as its response — hyper's require_empty_read
-    the moment before sending (F31, problem b). Without the pre-write check these bytes
-    live only on the socket, past the decoder, and go unnoticed until misparsed."""
+    poison the connection: hyper's require_empty_read, both halves. Depending on timing
+    the IDLE WATCHER consumes them as they arrive, or the pre-write `receive_nowait`
+    check (the `read_buf().is_empty()` fast path, covering the watcher-join -> write
+    gap, F31 problem b) catches them at send time — either way the next request fails
+    rather than misparsing them as its response."""
     listener, host, port = await _listener()
     r1_read, junk_sent = Event(), Event()
 
@@ -513,6 +514,99 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
             await junk_sent.wait()  # the junk is now sitting in the client's socket buffer
             with pytest.raises(ValueError, match="unexpected"):
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_idle_fin_closes_connection_promptly():
+    """A peer FIN on a PARKED keep-alive connection is observed by the idle watcher
+    with NO send: `closed` flips promptly, no error is recorded (hyper's clean idle
+    close — "found EOF on idle connection, closing", conn.rs L471-481), the transport
+    is really closed (no CLOSE_WAIT parking — the task drops its io, dispatch.rs
+    L152-160), and the next send_request raises `ConnectionClosedError` carrying
+    `request_unsent` (hyper's TrySendError give-back, client/conn/http1.rs L247-263)."""
+    listener, host, port = await _listener()
+    r1_read = Event()
+
+    async def serve():
+        stream = await listener.accept()
+        await _read_request(stream)
+        await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+        await r1_read.wait()  # the client fully consumed r1 — the connection is parked
+        stream.close()  # FIN into the idle connection
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            r1_read.set()
+            for _ in range(400):  # bounded wait — no send may be needed to notice
+                if conn.closed:
+                    break
+                await sleep(0.005)
+            assert conn.closed
+            assert conn._conn.error is None  # clean close, not an error
+            assert conn._conn.transport is None  # socket closed NOW, not at next use
+            with pytest.raises(HTTPunkError) as excinfo:
+                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
+            assert getattr(excinfo.value, "request_unsent", False) is True
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_idle_stray_bytes_poison_promptly():
+    """Bytes arriving on a PARKED connection are consumed by the idle watcher when
+    they ARRIVE (no send needed): the connection is poisoned AND closed immediately
+    (hyper `new_unexpected_message`, conn.rs L484-489 — the errored task drops its
+    io), and the next send_request raises the recorded error with `request_unsent`
+    set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L711-733)."""
+    listener, host, port = await _listener()
+    r1_read = Event()
+
+    async def serve():
+        stream = await listener.accept()
+        await _read_request(stream)
+        await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+        await r1_read.wait()
+        await stream.send_all(b"HTTP/1.1 500 unsolicited\r\n\r\n")  # junk into the parked conn
+        while await stream.receive_some(65536):  # drains to EOF once the watcher closes
+            pass
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            r1_read.set()
+            for _ in range(400):  # bounded wait — the watcher must poison with no send
+                if conn.closed:
+                    break
+                await sleep(0.005)
+            assert conn.closed
+            assert isinstance(conn._conn.error, ValueError)
+            with pytest.raises(ValueError, match="unexpected") as excinfo:
+                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
+            assert getattr(excinfo.value, "request_unsent", False) is True
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_unsent_marker_absent_once_write_begins():
+    """The `request_unsent` boundary: once the request is handed to the writer, a
+    failure must NOT carry the marker — hyper returns `message: None` after the
+    dispatcher takes the request, even if nothing was flushed to the wire."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        stream = await listener.accept()
+        await _read_request(stream)  # the request was written — past the boundary
+        stream.close()  # kill the connection with no response
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            with pytest.raises(HTTPunkError) as excinfo:
+                await conn.request("GET", "/", headers={"host": f"{host}:{port}"})
+            assert getattr(excinfo.value, "request_unsent", False) is False
         s.cancel()
 
 

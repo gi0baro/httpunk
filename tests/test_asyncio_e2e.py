@@ -100,6 +100,47 @@ async def test_h1_get_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_h1_idle_fin_closes_connection_promptly():
+    """The idle watcher on the asyncio backend (select-vs-stop over
+    `_AsyncioStream`): a server FIN on a PARKED keep-alive connection flips
+    `closed` promptly with NO send and no error (hyper's clean idle close,
+    conn.rs L471-481), and the next send_request raises with `request_unsent`
+    (client/conn/http1.rs L247-263)."""
+    backend = AsyncioBackend()
+    host, port, accept, listener = await _listen()
+    r1_read = asyncio.Event()
+
+    async def serve():
+        try:
+            stream = await accept()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += await stream.receive_some(65536)
+            await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            await r1_read.wait()  # the client consumed r1 — the connection is parked
+            stream.close()  # FIN into the idle connection
+        finally:
+            listener.close()
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(serve())
+        transport = await backend.connect_tcp(host, port)
+        async with H1Connection(transport, authority=f"{host}:{port}", backend=backend) as conn:
+            resp = await conn.request("GET", "/a", headers={"host": host})
+            assert await resp.read() == b"ok"
+            r1_read.set()
+            for _ in range(400):  # bounded wait — the watcher must see the FIN unprompted
+                if conn.closed:
+                    break
+                await asyncio.sleep(0.005)
+            assert conn.closed
+            assert conn._conn.error is None  # clean close, not an error
+            with pytest.raises(HTTPunkError) as excinfo:
+                await conn.request("GET", "/b", headers={"host": host})
+            assert getattr(excinfo.value, "request_unsent", False) is True
+
+
+@pytest.mark.asyncio
 async def test_h2_multiplexed_requests():
     backend = AsyncioBackend()
     host, port, serve = await _run_server(_echo_path, lambda s: _h2(s, backend))

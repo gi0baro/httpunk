@@ -210,12 +210,18 @@ class _Lease:
 
     async def __aexit__(self, exc_type, exc_value, exc_tb):
         conn = self._conn
-        # Park only a connection that is alive AND whose last exchange completed
-        # (hyper-util parks on `is_open()`; `busy` is h1's sync "the in-flight
-        # slot is still held" observable). A clean-exit caller can still leave an
-        # incomplete exchange — e.g. a release interrupted mid-teardown left the
-        # slot held — and parking that connection would deadlock the next
-        # checkout on `send_request`. Drop it instead: never park open-and-lying.
+        # Park only a connection that is alive AND whose last exchange completed.
+        # `closed` mirrors hyper-util's `Cached` not returning a service whose
+        # `poll_ready` failed (pool/cache.rs: `Cached::poll_ready` sets
+        # `is_closed` on error; `impl Drop for Cached` then skips the put) —
+        # kept live by the connection itself (the h1 idle watcher / h2 read
+        # pump), exactly as upstream assumes. `busy` is a RUNTIME-FORCED extra
+        # (documented divergence): Rust state transitions are sync between
+        # polls, so "exchange never completed but the lease exited cleanly" is
+        # unrepresentable there, while Python suspension points make it real —
+        # a release interrupted mid-teardown leaves the slot held, and parking
+        # that connection would deadlock the next checkout on `send_request`.
+        # Drop it instead: never park open-and-lying.
         if exc_type is None and not (conn.closed or getattr(conn, "busy", False)):
             self._cache._checkin(conn)  # clean exit + completed exchange -> idle set
         else:
