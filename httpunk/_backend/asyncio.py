@@ -257,6 +257,17 @@ class AsyncioBackend:
         drives the `close_notify`), so no plain/TLS split like tonio."""
         transport.close()
 
+    def spawn_without_results(self, *coros):
+        """Spawn task(s) NOW, discarding their results; returns the join handle
+        (see the tonio backend's twin for the full contract: await-once by a
+        single owner, no cancellation surface, coroutines route their own
+        errors). One coro -> its Task; several -> a gather with
+        `return_exceptions=True`, so the join waits for ALL of them exactly
+        like tonio's barrier does."""
+        if len(coros) == 1:
+            return asyncio.ensure_future(coros[0])
+        return asyncio.gather(*coros, return_exceptions=True)
+
     async def select(self, *coros):
         """Race `coros`; return the first-ready one's result, cancelling the losers.
         Matches tonio's `select` (`_ctl.select`: spawn all in argument order, keep the

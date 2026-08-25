@@ -116,6 +116,17 @@ class TonioBackend:
     # end-of-iteration (F47).
     broken_transport_errors = (ConnectionError, ResourceBroken)
 
+    # Spawn task(s) NOW, discarding their results; returns the join handle.
+    # `await handle` resolves once ALL of them finished — exactly one owner
+    # awaits it, exactly once (tonio's handle is Barrier-based one-shot). NO
+    # cancellation surface, by design: this is the primitive for tasks that
+    # must never be cancelled (flush/handoff obligations — the h2 write pump,
+    # the h1 idle watcher); a group that needs teardown-with-cancel uses
+    # `scope`. Spawned coroutines must not let exceptions escape (drivers
+    # route errors into connection state); an escaped one surfaces at the
+    # join in a backend-specific shape and is a driver bug, not API.
+    spawn_without_results = staticmethod(_colored.spawn.without_results)
+
     select = staticmethod(_colored.select)
     scope = staticmethod(_colored.scope)
     lock = _Lock

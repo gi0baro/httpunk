@@ -863,9 +863,13 @@ async def test_close_flushes_queued_frames_even_after_connection_error():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             inner = conn._conn
-            inner._write_evt.set = lambda: None  # the pump never wakes: the frame stays queued
+            real_set = inner._write_evt.set
+            inner._write_evt.set = lambda: None  # the pump can't wake: the frame stays queued
             inner.enqueue_frame(inner.codec.serialize_ping(b"flushme!"))
             inner.error = ConnectionClosedError("simulated failure")
+            # Restore the wake before `close()` runs: its stop signal must reach
+            # the pump, whose drain-then-exit is what flushes the queued frame.
+            inner._write_evt.set = real_set
         # `__aexit__` -> `close()` must have written the queued PING before closing.
         while seen[-1:] != ["eof"]:
             await sleep(0)

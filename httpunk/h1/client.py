@@ -111,23 +111,25 @@ class Connection(H1ConnectionBase):
         # exchange has started, the bytes that complete it ARE the response's
         # first bytes, handed to `_read_head` via `_watcher_data`/`_watcher_error`
         # — exactly hyper's structure, where one poll loop owns the read across
-        # the idle->busy transition. Scope is per idle period (same reason
-        # `_writer_scope` is per-request).
-        self._watcher_scope = None
+        # the idle->busy transition. A bare task via `spawn_without_results`
+        # (the cancel-free seam primitive — a scope is for groups that DO get
+        # cancelled, like the body writer's): the handle IS the per-idle-period
+        # join, awaited by `_read_head` (handoff) or a teardown path.
+        self._watcher_handle = None
         self._watcher_data = None
         self._watcher_error = None
         self._exchange_active = False
         # Guards the take-ownership pop of the background-task handles
-        # (`_writer_scope`, `_watcher_scope`): a `close()` from another thread
+        # (`_writer_scope`, `_watcher_handle`): a `close()` from another thread
         # (tonio is work-stealing) can race the exchange's own join/teardown
-        # for the SAME scope, and a second `Scope.__aexit__` raises
-        # RuntimeError (tonio `_exit`) — the pop under the lock makes joining
-        # single-owner, so the loser sees None. Held only for the sync swap,
-        # never across an await. Everything else the watcher shares is
-        # lock-free by construction: the handoff fields are published by the
-        # scope join, the handles/flag resets by the slot semaphore, and the
-        # `_exchange_active` read by the runtime's causal chain (flag-set ->
-        # head write -> peer response -> poller wake).
+        # for the SAME handle — a second `Scope.__aexit__` raises RuntimeError
+        # (tonio `_exit`), spawn handles are await-once, and the handoff-field
+        # consumption must have one owner — the pop under the lock makes the
+        # loser see None. Held only for the sync swap, never across an await.
+        # Everything else the watcher shares is lock-free by construction: the
+        # handoff fields are published by the join, the handles/flag resets by
+        # the slot semaphore, and the `_exchange_active` read by the runtime's
+        # causal chain (flag-set -> head write -> peer response -> poller wake).
         self._scopes_lock = threading.Lock()
 
     async def connect(self):
@@ -135,7 +137,7 @@ class Connection(H1ConnectionBase):
         # `Connection` future is polled from the moment it is spawned — the
         # dial-to-first-send window has read interest upstream, so it is watched
         # here too.
-        await self._start_watcher()
+        self._start_watcher()
 
     async def _teardown_writer(self, *, cancel):
         """Finish with the in-flight body writer: `cancel=True` aborts it (still
@@ -153,12 +155,13 @@ class Connection(H1ConnectionBase):
             scope.cancel()
         await scope.__aexit__(None, None, None)
 
-    async def _start_watcher(self):
-        """Arm the idle watcher (see `_watch_idle`) for one idle period.
-        Callers guarantee no exchange can be reading: `connect()` runs before
-        any request, and `release_slot` starts it BEFORE releasing the slot —
-        tonio is work-stealing, so a waiter resumed by the release can run in
-        parallel immediately, and the semaphore release/acquire is the
+    def _start_watcher(self):
+        """Arm the idle watcher (see `_watch_idle`) for one idle period — SYNC:
+        the bare-task spawn suspends nothing, so callers have no interruption
+        window. They guarantee no exchange can be reading: `connect()` runs
+        before any request, and `release_slot` starts it BEFORE releasing the
+        slot — tonio is work-stealing, so a waiter resumed by the release can
+        run in parallel immediately, and the semaphore release/acquire is the
         happens-before edge that guarantees it observes the watcher and takes
         its read as the response's first read (F55 single-reader). No-op if the
         connection can serve no more requests."""
@@ -166,28 +169,27 @@ class Connection(H1ConnectionBase):
             return
         self._exchange_active = False
         self._watcher_data = self._watcher_error = None
-        scope = self.backend.scope()
-        await scope.__aenter__()
-        self._watcher_scope = scope
-        scope.spawn(self._watch_idle())
+        self._watcher_handle = self.backend.spawn_without_results(self._watch_idle())
 
     async def _join_watcher(self):
         """JOIN the idle watcher (never cancel/signal it — see `_watch_idle`):
-        wait for its single read to complete. Idempotent; instant when none is
-        armed or it already finished. On teardown paths the transport is closed
-        first, which is what ends the parked read. Single-owner via the pop
-        under `_scopes_lock` (see `_teardown_writer`): a racing `close()` and
-        exchange join must not both `__aexit__` the same scope — the loser
-        sees None and returns; the connection state it then observes is
-        force-closed either way."""
+        await its handle, which resolves when its single read has completed
+        and publishes the handoff fields. Idempotent; instant when none is
+        armed or it already finished. On teardown paths the transport is
+        closed first, which is what ends the parked read. The handle is taken
+        via a pop under `_scopes_lock` so a racing `close()` and exchange join
+        have one owner (handles are await-once); the loser sees None and
+        returns — the connection state it then observes is force-closed either
+        way."""
         with self._scopes_lock:
-            scope, self._watcher_scope = self._watcher_scope, None
-        if scope is None:
+            handle, self._watcher_handle = self._watcher_handle, None
+        if handle is None:
             return
-        await scope.__aexit__(None, None, None)
+        await handle
 
     async def _watch_idle(self):
-        """ONE read, dispatched by connection state when it completes. The
+        """ONE read, dispatched by connection state when it completes; the
+        spawn handle `_join_watcher` awaits resolves on exit. The
         watcher is never cancelled or woken by a signal — a parked
         `receive_some` legitimately ends only via data, EOF, or transport close
         (cancellation would leave the socket's read registration armed for a
@@ -453,7 +455,7 @@ class Connection(H1ConnectionBase):
         # `Client::parse` (L1013), which loops past 1xx informational responses.
         buffered = 0
         data = None
-        if self._watcher_scope is not None:
+        if self._watcher_handle is not None:
             # An idle watcher is armed: its parked `receive_some` is the
             # connection's single reader (F55), so the response's FIRST read is
             # its completing read — join it and take the handoff (bytes, `b""`
@@ -554,7 +556,7 @@ class Connection(H1ConnectionBase):
                 # `_start_watcher` — the semaphore is the visibility edge for a
                 # parallel waiter); `_start_watcher` no-ops if a racing
                 # close()/failure landed during the writer join.
-                await self._start_watcher()
+                self._start_watcher()
         finally:
             self._busy = False
             self._slot.release()

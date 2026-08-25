@@ -69,15 +69,30 @@ class H2ConnectionBase:
         # first in `close()`, so the pump's scope stays pump-only and its teardown
         # timing is unaffected (the pump's parked-recv close race is delicate).
         self._write_scope = self.backend.scope()
+        # The control-frame write pump is a bare task, NOT a scope child: it
+        # must never be cancelled — a cancellation landing between its buffer
+        # swap and the flush kills it with control frames (a GOAWAY reply, an
+        # RST_STREAM) in its local variable, and `close()`'s drain then finds
+        # an empty buffer and sends nothing. It is stopped by signal
+        # (`_write_stop` + `_write_evt`), flushes what remains, and `close()`
+        # joins it via this handle (`spawn_without_results` — the cancel-free
+        # seam primitive; scopes are for groups that DO get cancelled, like
+        # the body writers above).
+        self._pump_handle = None
         self._send_lock = self.backend.lock()
         # Control-frame pending-send buffer, flushed by `_write_pump` (spawned in
         # `_begin`) — h2's pending-send queue drained by its connection task.
         # `enqueue_frame` is SYNC, so bookkeeping + frame emission commit as one
         # uninterruptible step; the pump swaps the WHOLE buffer out and writes it
         # in one send, so control frames batch into single syscalls for free.
+        # All `_write_evt` transitions happen UNDER `_write_buf_lock`, paired
+        # with the buffer operation they signal: an unlocked `set()`/`clear()`
+        # pair races on the free-threaded runtime (a `set()` landing between
+        # the pump's wake and its `clear()` would be erased -> lost wakeup).
         self._write_buf = bytearray()
         self._write_buf_lock = threading.Lock()  # tiny critical section, never held across an await
         self._write_evt = self.backend.event()
+        self._write_stop = False  # close() -> the pump drains the buffer and exits
         self._transport = transport
         self._settings = settings  # SETTINGS sync (proto/settings.rs)
         self._goaway_replied = False  # sent our acknowledging GOAWAY after a peer GOAWAY (F23)
@@ -116,7 +131,7 @@ class H2ConnectionBase:
         # The control-frame write pump starts only AFTER the preface is on the wire,
         # so enqueued frames (starting with the initial WINDOW_UPDATE below) can
         # never precede it; the queue is FIFO, so wire order = enqueue order.
-        self._write_scope.spawn(self._write_pump())
+        self._pump_handle = self.backend.spawn_without_results(self._write_pump())
         # Advertise our (larger-than-default) connection recv window right after the
         # preface, before any peer data (h2 sends this initial WINDOW_UPDATE(0) as
         # part of connection setup, from `initial_connection_window_size`).
@@ -131,23 +146,32 @@ class H2ConnectionBase:
         # `__aexit__` waiting on a task that never wakes → the intermittent
         # teardown hang). The EOF also unblocks the peer's read loop. `cancel()`
         # then covers the rare case where the pump is parked elsewhere.
-        # Tear down background body writers + the control-frame write pump FIRST
-        # (they're abortable — parked on flow control / send / the write event, not a
-        # native recv poll), so the pump's scope is pump-only when we close the
-        # transport + join it (keeping that delicate race baseline).
+        # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never
+        # cancel it: a cancellation landing between the pump's buffer swap and
+        # its flush would kill it with control frames (the GOAWAY reply of the
+        # F23 clean close, an RST_STREAM) already swapped into its local — the
+        # drain below would then find an empty buffer and the frames would
+        # silently never reach the wire (that exact race flaked the
+        # GOAWAY-reply tests). The stop flag is set under the buffer lock,
+        # paired with the wake, so the pump observes it on that wake.
+        with self._write_buf_lock:
+            self._write_stop = True
+            self._write_evt.set()
+        handle, self._pump_handle = self._pump_handle, None
+        if handle is not None:
+            await handle
+        # The body writers ARE cancelled (an interrupted DATA write on a closing
+        # connection is acceptable — the connection dies with it), then joined.
         self._write_scope.cancel()
         await self._write_scope.__aexit__(None, None, None)
-        # Flush control frames the pump didn't get to before it was torn down —
-        # `resp.aclose()` immediately followed by close ENQUEUES the RST_STREAM,
-        # and whether the pump wakes before the cancel above is a scheduler race;
-        # dropping it would ship the close without ever telling the peer to stop
-        # (h2 likewise drains its pending-send queue before shutdown). Unconditional
-        # on `self.error`: h2's `State::Closing` runs `codec.shutdown` = flush THEN
-        # shutdown on every non-IO close (connection.rs L304-310), including the
-        # GOAWAY-exchanged clean close (F23), whose reply GOAWAY sits in this queue
-        # with `error` already set. Best-effort: the connection is closing
-        # regardless, so a send failure (a dead transport — h2's Io branch, which
-        # skips straight to Closed) is ignored.
+        # Flush anything enqueued after the pump exited (e.g. RST_STREAMs from
+        # writer teardown above) — h2 likewise drains its pending-send queue
+        # before shutdown. Unconditional on `self.error`: h2's `State::Closing`
+        # runs `codec.shutdown` = flush THEN shutdown on every non-IO close
+        # (connection.rs L304-310), including the GOAWAY-exchanged clean close
+        # (F23). Best-effort: the connection is closing regardless, so a send
+        # failure (a dead transport — h2's Io branch, which skips straight to
+        # Closed) is ignored.
         with self._write_buf_lock:
             pending, self._write_buf = bytes(self._write_buf), bytearray()
         if pending and self._transport is not None:
@@ -212,32 +236,47 @@ class H2ConnectionBase:
         any more (the punkreq class of bug)."""
         with self._write_buf_lock:
             self._write_buf += data
-        self._write_evt.set()
+            self._write_evt.set()
 
     async def _write_pump(self):
-        """Flush the pending-send buffer to the transport. Runs in `_write_scope`
-        (torn down first in `close()`, so the read-pump scope stays pump-only for
-        its delicate teardown). Each wake swaps out EVERYTHING accumulated since
-        the last flush and writes it as one send — control frames coalesce into
+        """Flush the pending-send buffer to the transport. Runs as a bare task
+        (`_pump_handle`) and is never cancelled (see `close()` — a cancel landing between the
+        swap and the flush destroys swapped-out control frames): `close()` sets
+        `_write_stop` + wakes it, and the pump drains the buffer to empty
+        before exiting. Each wake swaps out EVERYTHING accumulated since the
+        last flush and writes it as one send — control frames coalesce into
         single syscalls, exactly h2's poll_complete draining its pending queue.
-        A write failure fails the whole connection — same as h2, where a
-        connection-task write error is fatal."""
+        The swap and the event `clear()` happen together under the buffer lock,
+        mirroring `enqueue_frame`'s append+`set()`: an enqueue lands either
+        before the swap (its bytes taken, its wake consumed — nothing pending)
+        or after the clear (its wake survives for the next iteration) — an
+        unlocked clear could erase a wake for bytes not yet swapped (lost
+        wakeup on the free-threaded runtime). A write failure fails the whole
+        connection — same as h2, where a connection-task write error is fatal."""
         while True:
             await self._write_evt.wait()
-            self._write_evt.clear()
             with self._write_buf_lock:
                 data, self._write_buf = bytes(self._write_buf), bytearray()
-            if not data:  # spurious wake (a frame landed between swap and re-wait)
-                continue
-            try:
-                async with self._send_lock:
-                    await self._transport.send_all(data)
-            except OSError as exc:
-                self._fail(ConnectionClosedError(f"connection closed: {exc}"))
-                break
-            except Exception as exc:
-                self._fail(exc)
-                break
+                self._write_evt.clear()
+                stopping = self._write_stop
+            if data:
+                try:
+                    async with self._send_lock:
+                        await self._transport.send_all(data)
+                except OSError as exc:
+                    self._fail(ConnectionClosedError(f"connection closed: {exc}"))
+                    break
+                except Exception as exc:
+                    self._fail(exc)
+                    break
+            if stopping:
+                # Drain-then-exit: anything enqueued during the send above left
+                # the event set (its `set()` came after our `clear()`), so loop
+                # once more; exit only with the buffer empty. Frames enqueued
+                # after that are `close()`'s drain's to send.
+                with self._write_buf_lock:
+                    if not self._write_buf:
+                        break
 
     async def send_frame_or_fail(self, data):
         """Send a stream frame (HEADERS/DATA/trailers) inline; any interruption of
