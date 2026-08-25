@@ -9,7 +9,7 @@ base for building HTTP clients and servers on top of.
 
 httpunk's API mirrors hyper's wherever possible.
 
-> **Note:** httpunk is in an early, alpha stage.
+> **Warning:** httpunk is in an early stage and still work in progress.
 
 > **Note:** httpunk was built with substantial help from LLMs, under human supervision.
 
