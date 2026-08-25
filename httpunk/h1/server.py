@@ -283,6 +283,19 @@ class ServerConnection(H1ConnectionBase):
             # `Server::on_error` (role.rs L466-484), then close.
             await self._send_error(codec, _error_status(str(exc)))
             return None
+        except self.backend.broken_transport_errors:
+            # The transport died at the request boundary — an RST, or a TLS
+            # close without close_notify (which httpunk's own abortive
+            # `close_transport` produces, F33a — every httpunk client hanging
+            # up looks like this). The wire outcome is identical to the clean
+            # EOF below — the connection just ends with no request to serve —
+            # so it surfaces as a clean end-of-iteration, extending F47's
+            # contract (hyper instead surfaces an Io error from the connection
+            # future; observability-only, exactly as F47's mid-head-EOF case).
+            self._closed = True
+            self._reusable = False
+            self._close_transport()
+            return None
         if head is None:  # clean EOF between requests — client closed
             self._closed = True
             return None

@@ -827,19 +827,36 @@ async def test_close_flushes_queued_frames_even_after_connection_error():
     seen = []
 
     async def server():
+        # This server NEVER writes after the handshake — deliberately no
+        # SETTINGS-acks: the client goes ready on our SETTINGS alone and its
+        # test body closes immediately, so an ack sent from here would race the
+        # (legitimate) close and can land on an already-closed socket. The
+        # client's kernel answers that with RST, which both kills this loop
+        # short of "eof" (hanging the spin below) and may discard the
+        # already-flushed PING from our receive queue. Nothing in the client's
+        # path here needs `apply_local_settings`.
         stream, codec, frames = await _accept_handshake(listener)
+        # Record the handshake's LEFTOVER frames too: under scheduler
+        # starvation the client may run its whole lifecycle (handshake, PING
+        # flush, close) before this task's first read, so everything —
+        # including the PING under test — arrives coalesced with the preface
+        # and lands in `frames`, not in the loop below.
         for f in frames:
-            if isinstance(f, Settings) and not f.ack:
-                await stream.send_all(codec.serialize_settings_ack())
+            if not (isinstance(f, Settings) and not f.ack):
+                seen.append(f)
         while True:
-            chunk = await stream.receive_some(65536)
+            try:
+                chunk = await stream.receive_some(65536)
+            except ConnectionResetError:
+                # Belt-and-braces: should a reset race reappear, fail the
+                # assertion visibly (with `seen`) instead of hanging the spin
+                # into the suite deadline.
+                chunk = b""
             if not chunk:
                 seen.append("eof")
                 break
             for f in codec.receive(chunk):
-                if isinstance(f, Settings) and not f.ack:
-                    await stream.send_all(codec.serialize_settings_ack())
-                else:
+                if not (isinstance(f, Settings) and not f.ack):
                     seen.append(f)
 
     async with scope() as s:

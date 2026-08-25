@@ -648,3 +648,38 @@ async def test_h1_bodyless_request_with_trailers():
 
     assert seen["body"] == b""
     assert seen["trailers"].get("x-done") == b"1"
+
+
+@pytest.mark.tonio
+async def test_abrupt_client_close_ends_iteration_cleanly():
+    """A client that tears the connection down abruptly between requests — an
+    RST instead of a FIN (SO_LINGER 0; also what an abortive TLS close looks
+    like) — must end the server's `async for` cleanly, exactly like the clean
+    EOF (F47: the wire outcome is identical — the connection just ends with no
+    request to serve). The backend's broken-transport error must not escape
+    `next_request` and kill the accept loop."""
+    import socket as pysock
+    import struct
+
+    listener, host, port = await _listener()
+    server_errors, served = [], []
+
+    async def server():
+        try:
+            await _echo_server(listener, seen=served)
+        except Exception as exc:
+            server_errors.append(exc)
+
+    async with scope() as s:
+        s.spawn(server())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET /one HTTP/1.1\r\nhost: x\r\n\r\n")
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            resp += await transport.receive_some(65536)
+        # RST the connection while the server is parked in the next head-read.
+        transport.socket._sock.setsockopt(pysock.SOL_SOCKET, pysock.SO_LINGER, struct.pack("ii", 1, 0))
+        transport.close()
+        # The scope join below waits out the server task: it must finish, cleanly.
+    assert served == ["/one"]
+    assert not server_errors

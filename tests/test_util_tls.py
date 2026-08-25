@@ -70,9 +70,18 @@ async def test_https_falls_back_to_h1_when_alpn_is_http11(ca):
     # The client offers only http/1.1, so the server selects it -> h1 (the fallback).
     listener = (await open_tls_over_tcp_listeners(0, _server_ctx(ca, ("h2", "http/1.1")), host="127.0.0.1"))[0]
     host, port = listener.transport.socket.getsockname()[:2]
+    server_errors = []
 
     async def server_side():
-        await _echo(await auto.serve(await listener.accept()))
+        # Recorded, not spawned-and-forgotten: the client's context exit closes
+        # its TLS transport ABORTIVELY (no close_notify — F33a), and the server
+        # must treat that as the connection ending (clean `async for` exit, F47)
+        # rather than die on the backend's broken-transport error. A swallowed
+        # crash here once let this test pass for the wrong reason.
+        try:
+            await _echo(await auto.serve(await listener.accept()))
+        except Exception as exc:
+            server_errors.append(exc)
 
     async with scope() as s:
         s.spawn(server_side())
@@ -81,6 +90,7 @@ async def test_https_falls_back_to_h1_when_alpn_is_http11(ca):
         async with conn:
             resp = await conn.request("POST", "/", headers={"host": f"127.0.0.1:{port}"}, body=b"hey")
             assert await resp.read() == b"tls:hey"
+    assert not server_errors  # the abortive client close ended the server loop cleanly
 
 
 @pytest.mark.tonio

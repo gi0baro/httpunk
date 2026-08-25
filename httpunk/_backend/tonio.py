@@ -13,7 +13,7 @@ from tonio.colored.net.tls import open_tls_over_tcp_stream as _open_tls_over_tcp
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
 from tonio.colored.sync.channel import unbounded as _unbounded
 from tonio.colored.time import time as _now, timeout as _timeout
-from tonio.exceptions import CancelledError
+from tonio.exceptions import CancelledError, ResourceBroken
 
 
 class _TonioSemaphore:
@@ -105,6 +105,16 @@ class TonioBackend:
             transport.transport.close()
         else:
             transport.close()
+
+    # Exceptions `receive_some`/`send_all` raise when the peer tears the
+    # transport down ABRUPTLY instead of a clean EOF: an RST on plain TCP
+    # (`ConnectionError`: ConnectionResetError/BrokenPipeError), or a TLS close
+    # without close_notify (tonio wraps the SSLEOFError in `ResourceBroken`) —
+    # which httpunk's own sync `close_transport` produces by design (abortive
+    # close, F33a), so any httpunk client hanging up makes the peer see one.
+    # The h1 server maps these at the request-head boundary to a clean
+    # end-of-iteration (F47).
+    broken_transport_errors = (ConnectionError, ResourceBroken)
 
     select = staticmethod(_colored.select)
     scope = staticmethod(_colored.scope)
