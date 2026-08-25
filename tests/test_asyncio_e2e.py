@@ -101,7 +101,7 @@ async def test_h1_get_roundtrip():
 
 @pytest.mark.asyncio
 async def test_h1_idle_fin_closes_connection_promptly():
-    """The idle watcher on the asyncio backend (select-vs-stop over
+    """The idle watcher on the asyncio backend (a single parked read over
     `_AsyncioStream`): a server FIN on a PARKED keep-alive connection flips
     `closed` promptly with NO send and no error (hyper's clean idle close,
     conn.rs L471-481), and the next send_request raises with `request_unsent`

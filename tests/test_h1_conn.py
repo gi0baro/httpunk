@@ -488,11 +488,11 @@ async def test_unexpected_bytes_past_body_poison_connection():
 async def test_reused_connection_poisoned_by_idle_window_bytes():
     """Bytes a server sends on an ALREADY-IDLE connection — after the client has fully
     consumed the previous response, so NOT coalesced into its body buffer — must still
-    poison the connection: hyper's require_empty_read, both halves. Depending on timing
-    the IDLE WATCHER consumes them as they arrive, or the pre-write `receive_nowait`
-    check (the `read_buf().is_empty()` fast path, covering the watcher-join -> write
-    gap, F31 problem b) catches them at send time — either way the next request fails
-    rather than misparsing them as its response."""
+    poison the connection: hyper's require_empty_read, both halves. The idle watcher
+    consumes them as they arrive; bytes it hasn't been scheduled to see yet are caught
+    by the pre-write `receive_nowait` check, which (like hyper's single poll loop)
+    runs ahead of the write EVEN under scheduler starvation — already-delivered bytes
+    are never misparsed as the next request's response (F31, problem b)."""
     listener, host, port = await _listener()
     r1_read, junk_sent = Event(), Event()
 
