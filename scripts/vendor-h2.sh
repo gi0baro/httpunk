@@ -6,14 +6,14 @@
 #
 # Usage:
 #   scripts/vendor-h2.sh                 # vendor the pinned version
-#   H2_VERSION=0.4.16 scripts/vendor-h2.sh
+#   H2_VERSION=0.4.19 scripts/vendor-h2.sh
 #
 # The copy is kept byte-identical to upstream so `git diff` between two vendored
 # versions shows only genuine upstream changes. Modifications: drop hpack/test/, a few documented state.rs shims, and a
 # uniform pub(crate)->pub widening (see steps below and THIRD-PARTY.md).
 set -euo pipefail
 
-H2_VERSION="${H2_VERSION:-0.4.16}"
+H2_VERSION="${H2_VERSION:-0.4.19}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/crates/vendor-h2/src"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"

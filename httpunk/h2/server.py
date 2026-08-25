@@ -96,10 +96,12 @@ class ServerRequest:
         """Yield request body chunks as they arrive; each consumed chunk releases
         recv-window capacity (-> WINDOW_UPDATE), mirroring the client's read side."""
         while True:
-            chunk = await self._stream.body_recv.receive()
-            if chunk is None:  # EOF (end of stream, reset, or connection failure)
+            item = await self._stream.body_recv.receive()
+            if item is None:  # EOF (end of stream, reset, or connection failure)
                 break
-            self._manager.release_data_frame(len(chunk))  # return its buffering charge (#935)
+            chunk, budgeted = item  # h2 0.4.19 DataEvent: (payload, is_budgeted)
+            if budgeted:
+                self._manager.release_data_frame(self._stream, len(chunk))  # return its buffering charge (#935)
             await self._manager.release_capacity(self._stream, len(chunk))
             yield chunk
         if self._stream.error is not None:
@@ -323,7 +325,9 @@ class ServerConnection(H2ConnectionBase):
     and reports the last-processed stream in GOAWAY. All the read-pump / dispatch /
     SETTINGS / GOAWAY machinery is the shared `H2ConnectionBase`."""
 
-    def __init__(self, transport, *, backend=None, max_concurrent_streams, initial_window_size=None):
+    def __init__(
+        self, transport, *, backend=None, max_concurrent_streams, initial_window_size=None, data_frame_budget=None
+    ):
         self._max_concurrent_streams = max_concurrent_streams
         # Our advertised per-stream recv window, defaulting to hyper's 1 MB.
         self._initial_window_size = initial_window_size if initial_window_size is not None else _STREAM_WINDOW
@@ -345,6 +349,10 @@ class ServerConnection(H2ConnectionBase):
             self, max_concurrent_streams=max_concurrent_streams, initial_window_size=self._initial_window_size
         )
         self.streams._conn_recv_target = _CONN_WINDOW  # raised via WINDOW_UPDATE(0) in _begin
+        # DATA-framing budget: None = Auto (half the connection window, floored) —
+        # h2 0.4.19 `server::Builder::data_frame_budget` resolved at handshake
+        # (server.rs L1048-1069, L1536-1540).
+        self.streams._resolve_data_frame_budget(data_frame_budget)
         # Grant a larger-than-default per-stream recv window immediately (see the
         # client for the rationale): a client that has processed our SETTINGS uploads
         # up to the advertised window before it ACKs, so we must already accept it.
@@ -443,10 +451,12 @@ class H2Server(BaseServer[ServerRequest]):
         backend: BackendLike | None = None,
         max_concurrent_streams: int = _DEFAULT_MAX_CONCURRENT,
         initial_window_size: int | None = None,
+        data_frame_budget: int | None = None,
     ) -> None:
         self._conn = ServerConnection(
             transport,
             backend=backend,
             max_concurrent_streams=max_concurrent_streams,
             initial_window_size=initial_window_size,
+            data_frame_budget=data_frame_budget,
         )

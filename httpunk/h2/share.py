@@ -35,10 +35,12 @@ class H2ResponseBody:
         manager turns into WINDOW_UPDATE(s).
         """
         while True:
-            chunk = await self._stream.body_recv.receive()
-            if chunk is None:  # EOF sentinel (end of stream, cancel, or error)
+            item = await self._stream.body_recv.receive()
+            if item is None:  # EOF sentinel (end of stream, cancel, or error)
                 break
-            self._manager.release_data_frame(len(chunk))  # return its buffering charge (#935)
+            chunk, budgeted = item  # h2 0.4.19 DataEvent: (payload, is_budgeted)
+            if budgeted:
+                self._manager.release_data_frame(self._stream, len(chunk))  # return its buffering charge (#935)
             await self._manager.release_capacity(self._stream, len(chunk))
             yield chunk
         if self._stream.error is not None:
@@ -59,5 +61,24 @@ class H2ResponseBody:
         """
         st = self._stream
         if st.state.is_recv_end_stream():
-            return  # body fully received — nothing to cancel
+            # Body fully received — nothing to cancel on the wire: upstream's
+            # Drop-reset (`maybe_cancel`, streams.rs L1686) is a no-op after
+            # EOS. But its drop path does a SECOND, unconditional thing once
+            # the last handle is gone: `release_closed_capacity` (streams.rs
+            # L1670-1676 -> recv.rs L502-522) returns every buffered-but-unread
+            # byte's connection window (WINDOW_UPDATE(0)) and, since h2 0.4.19,
+            # the frames' framing-budget charges (`clear_recv_buffer`) — "no
+            # one can access it anymore". aclose is this driver's deterministic
+            # drop hook (no ref-counting), so the release happens here. In a
+            # full-duplex exchange with the request body still uploading this
+            # runs slightly earlier than upstream's ref==0 point — a
+            # runtime-forced divergence, and semantically safe: it credits
+            # received-and-discarded data the send half can't touch. The F22
+            # `recv_reclaimed` flag makes a straggling reader release a no-op,
+            # so nothing is ever credited twice.
+            conn_wu = self._manager._reclaim_stream_accounting(st)
+            if conn_wu:
+                conn = self._manager._conn
+                conn.enqueue_frame(conn.codec.serialize_window_update(0, conn_wu))
+            return
         await self._manager.reset_stream(st, H2Reason.CANCEL)

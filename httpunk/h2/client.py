@@ -244,7 +244,16 @@ class Connection(H2ConnectionBase):
     """The client protocol driver. Created and driven by the public
     `client.H2Connection`."""
 
-    def __init__(self, transport, *, authority=None, scheme="http", backend=None, initial_window_size=None):
+    def __init__(
+        self,
+        transport,
+        *,
+        authority=None,
+        scheme="http",
+        backend=None,
+        initial_window_size=None,
+        data_frame_budget=None,
+    ):
         # `authority`/`scheme` build the :authority/:scheme pseudo-headers for a
         # bare-path request. h2 takes :scheme from the request URI (client.rs
         # L1627); httpunk's caller supplies it here (`util.connect` passes "https"
@@ -273,6 +282,10 @@ class Connection(H2ConnectionBase):
         self._ready_evt = self.backend.event()
         self.streams = ClientStreamManager(self)
         self.streams._conn_recv_target = _CONN_WINDOW  # raised via WINDOW_UPDATE(0) in _begin
+        # DATA-framing budget: None = Auto (half the connection window, floored) —
+        # h2 0.4.19 `client::Builder::data_frame_budget` resolved at handshake
+        # (client.rs L1154-1175, L1367-1369).
+        self.streams._resolve_data_frame_budget(data_frame_budget)
         # Grant a larger-than-default per-stream recv window IMMEDIATELY, before the
         # peer ACKs our SETTINGS: the peer only sends more than the 65535 default once
         # it has processed our SETTINGS, so accepting up to the advertised window can
@@ -344,9 +357,15 @@ class H2Connection(BaseClientConnection):
         scheme: str = "http",
         backend: BackendLike | None = None,
         initial_window_size: int | None = None,
+        data_frame_budget: int | None = None,
     ) -> None:
         self._conn = Connection(
-            transport, authority=authority, scheme=scheme, backend=backend, initial_window_size=initial_window_size
+            transport,
+            authority=authority,
+            scheme=scheme,
+            backend=backend,
+            initial_window_size=initial_window_size,
+            data_frame_budget=data_frame_budget,
         )
 
     def ready(self) -> Awaitable[None]:

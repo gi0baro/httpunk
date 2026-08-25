@@ -34,14 +34,23 @@ _DEFAULT_WINDOW = 65_535
 _LOCAL_MAX_ERROR_RESETS = 1024  # h2 DEFAULT_LOCAL_RESET_COUNT_MAX
 _RESET_STREAM_MAX = 50  # h2 DEFAULT_RESET_STREAM_MAX (streams kept for late frames)
 _RESET_STREAM_SECS = 1.0  # h2 DEFAULT_RESET_STREAM_SECS (how long to keep them)
-# DATA-framing budget (h2 0.4.16 #935): flow control bounds payload BYTES, not
-# frame COUNT — a peer fragmenting data into tiny frames bloats the buffered
-# chunk queue while staying inside every window. Frames smaller than the
-# threshold consume budget (the bookkeeping overhead they impose beyond their
-# payload); larger frames earn it back, capped at the initial budget; consuming
-# a buffered small chunk returns its charge. Exhaustion is a connection error.
+# DATA-framing budget (h2 0.4.16 #935, revised in 0.4.19): flow control bounds
+# payload BYTES, not frame COUNT — a peer fragmenting data into tiny frames
+# bloats the buffered chunk queue while staying inside every window. Non-final
+# frames smaller than the threshold consume budget (the bookkeeping overhead
+# they impose beyond their payload); larger frames earn it back, capped at the
+# resolved budget; consuming a buffered small chunk returns its charge.
+# Exhaustion is a connection error. Since 0.4.19 (GHSA-4jgw-qjmp-9rmr):
+# - the budget resolves to half the connection recv window, floored at
+#   DEFAULT_DATA_FRAME_BUDGET, and is configurable (`DataFrameBudget::resolve`,
+#   proto/connection.rs L90-106);
+# - a final (END_STREAM) DATA frame is never budgeted — a stream receives at
+#   most one, so it can't create unbounded overhead (streams.rs L640-649);
+# - empty non-final frames have their own per-connection lifetime cap and do
+#   not touch the byte budget (counts.rs `record_data_frame` L97-113).
 _DATA_FRAME_OVERHEAD_THRESHOLD = 256  # h2 DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD
 _DATA_FRAME_BUDGET = _DATA_FRAME_OVERHEAD_THRESHOLD * 100  # h2 DEFAULT_DATA_FRAME_BUDGET
+_MAX_RECV_EMPTY_DATA_FRAMES = 100  # h2 0.4.19 MAX_RECV_EMPTY_DATA_FRAMES (proto/mod.rs L40)
 
 _INVALID_CONTENT_LENGTH = object()  # sentinel: content-length header failed to parse
 _UNSET = object()  # sentinel: no chunk buffered yet (send_body one-ahead lookahead)
@@ -141,8 +150,17 @@ class StreamManager:
         # Connection-level DATA-framing budget (h2 counts.rs `data_frame_budget`,
         # #935 — see the constants above). Charged in the pump (`recv_data`),
         # released by the body readers, which run on other tasks/threads -> lock.
+        # `_data_frame_budget_max` is both the starting amount and the replenish
+        # cap; the role connection re-resolves it once `_conn_recv_target` is
+        # known (h2 0.4.19 `DataFrameBudget::resolve`, see
+        # `_resolve_data_frame_budget`).
+        self._data_frame_budget_max = _DATA_FRAME_BUDGET
         self._data_frame_budget = _DATA_FRAME_BUDGET
         self._data_budget_lock = threading.Lock()
+        # Empty non-final DATA frames received over the connection's lifetime —
+        # capped separately from the byte budget (h2 0.4.19 counts.rs
+        # `num_recv_empty_data_frames`, L74-76).
+        self._num_recv_empty_data_frames = 0
 
     # ===== role hooks (mirror h2's `Peer` trait + `Dyn` role discriminant) =====
 
@@ -389,6 +407,9 @@ class StreamManager:
         (h2 recv.rs `release_closed_capacity` L493 returns `in_flight_recv_data`).
         SYNC accounting only — returns the WINDOW_UPDATE(0) increment for the
         caller to send (best-effort, after all sync bookkeeping is committed)."""
+        # The budget half of the same clear (h2 0.4.19: `clear_recv_buffer` /
+        # `release_closed_capacity` also release each budgeted frame's charge).
+        self._release_stream_budget(st)
         with self._recv_window_lock:
             n, st.recv_unreleased = st.recv_unreleased, 0
             st.recv_reclaimed = True  # F22: a later release_capacity must not re-release these
@@ -524,39 +545,77 @@ class StreamManager:
         for sid in [s for s, at in self._reset_streams.items() if now - at > _RESET_STREAM_SECS]:
             del self._reset_streams[sid]
 
-    # ===== DATA-framing budget (h2 0.4.16 counts.rs, #935) =====
+    # ===== DATA-framing budget (h2 counts.rs #935, revised 0.4.19) =====
 
-    def _record_data_frame(self, payload_len):
-        """Charge the budget for a received DATA frame: a small frame consumes
-        the overhead it imposes beyond its payload, a large frame earns budget
-        back (capped at the initial amount). Exhaustion means the peer is
+    def _resolve_data_frame_budget(self, configured=None):
+        """Resolve the connection's DATA-framing budget — h2 0.4.19
+        `DataFrameBudget::resolve` (proto/connection.rs L90-106): a configured
+        budget is used as-is; Auto is half the connection recv window, floored
+        at DEFAULT_DATA_FRAME_BUDGET. Called by the role connection once
+        `_conn_recv_target` is set (upstream resolves at handshake from
+        `initial_target_connection_window_size`)."""
+        if configured is None:
+            window = self._conn_recv_target if self._conn_recv_target is not None else _DEFAULT_WINDOW
+            configured = max(window // 2, _DATA_FRAME_BUDGET)
+        self._data_frame_budget_max = configured
+        self._data_frame_budget = configured
+
+    def _record_data_frame(self, st, payload_len):
+        """Charge the budget for a received non-final DATA frame (final frames
+        are exempt — the caller guards, h2 streams.rs L640-649): an empty frame
+        counts against its own lifetime cap and never touches the byte budget
+        (h2 0.4.19 counts.rs L97-113); a small frame consumes the overhead it
+        imposes beyond its payload; a large frame earns budget back (capped at
+        the resolved amount). Exhaustion of either means the peer is
         fragmenting pathologically -> connection ENHANCE_YOUR_CALM, same
-        escalation as the reset-flood cap (h2 `record_data_frame`)."""
+        escalation as the reset-flood cap (h2 `record_data_frame` ->
+        "too_many_data_frames", streams.rs L644-647). A small frame's charge is
+        also recorded on `st` so teardown can release what its reader never
+        consumed (see `_release_stream_budget`)."""
         with self._data_budget_lock:
-            if payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
+            if payload_len == 0:
+                self._num_recv_empty_data_frames += 1
+                if self._num_recv_empty_data_frames > _MAX_RECV_EMPTY_DATA_FRAMES:
+                    raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too_many_data_frames")
+            elif payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
                 cost = _DATA_FRAME_OVERHEAD_THRESHOLD - payload_len
                 if cost > self._data_frame_budget:
-                    raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too many small DATA frames")
+                    raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too_many_data_frames")
                 self._data_frame_budget -= cost
+                st.data_budget_charged += cost
             else:
                 self._data_frame_budget = min(
                     self._data_frame_budget + (payload_len - _DATA_FRAME_OVERHEAD_THRESHOLD),
-                    _DATA_FRAME_BUDGET,
+                    self._data_frame_budget_max,
                 )
 
-    def release_data_frame(self, payload_len):
-        """Return a consumed chunk's buffering charge — called by the body
-        readers when a buffered chunk is taken off the stream's queue (h2
-        `release_data_frame`; upstream hooks `poll_data`). Promptly-consumed
-        small messages on a long-lived connection thus never exhaust the budget;
-        only frames that PILE UP (or empty frames, which are never delivered and
-        never release) drain it."""
-        if payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
+    def release_data_frame(self, st, payload_len):
+        """Return a consumed BUDGETED chunk's buffering charge — called by the
+        body readers when a budgeted buffered chunk is taken off the stream's
+        queue (h2 `release_data_frame`, upstream hooks `poll_data` and releases
+        only `is_budgeted` events, streams.rs L1516-1528; empty frames are
+        exempt, counts.rs L120-122). Promptly-consumed small messages on a
+        long-lived connection thus never exhaust the budget; only frames that
+        PILE UP drain it. The release is clamped to the stream's outstanding
+        charge so it can never double-credit against a concurrent teardown's
+        bulk release (`recv_unreleased`'s F22 discipline; upstream needs no
+        clamp — its consume and clear paths share one store mutex)."""
+        if 0 < payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
             with self._data_budget_lock:
-                self._data_frame_budget = min(
-                    self._data_frame_budget + (_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len),
-                    _DATA_FRAME_BUDGET,
-                )
+                charge = min(_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len, st.data_budget_charged)
+                st.data_budget_charged -= charge
+                self._data_frame_budget = min(self._data_frame_budget + charge, self._data_frame_budget_max)
+
+    def _release_stream_budget(self, st):
+        """Return the budget still charged for a stream's buffered-but-unread
+        small frames — the budget half of h2 0.4.19's recv-buffer clear
+        (recv.rs `clear_recv_buffer` L959-976 / `release_closed_capacity`
+        L502, called when a stream is reset or its receiver is dropped). The
+        window half is `_reclaim_stream_accounting`, which calls this."""
+        with self._data_budget_lock:
+            charge, st.data_budget_charged = st.data_budget_charged, 0
+            if charge:
+                self._data_frame_budget = min(self._data_frame_budget + charge, self._data_frame_budget_max)
 
     # ===== SETTINGS application (h2: proto/streams/streams.rs apply_*_settings) =====
 
@@ -805,16 +864,23 @@ class StreamManager:
         padding = sz - payload_len
         if padding:
             await self.release_capacity(st, padding)
-        # DATA-framing budget (#935). An empty non-final DATA frame has no effect
-        # on the HTTP message: window accounting is done (above), so drop it
-        # without delivering (h2 recv.rs) — and since it is never delivered, its
-        # budget charge is never returned, so a flood of them drains the budget
-        # and dies with ENHANCE_YOUR_CALM (raised by `_record_data_frame`, ->
-        # pump -> GOAWAY).
-        self._record_data_frame(payload_len)
-        if payload_len == 0 and not frame.end_stream:
-            return
-        st.body_send.send(frame.data)
+        # DATA-framing budget (#935, revised h2 0.4.19). A final (END_STREAM)
+        # frame is never budgeted — a stream receives at most one, so it can't
+        # create unbounded overhead (streams.rs L640-649: `!is_end_stream`
+        # guards `record_data_frame`; recv.rs L772 `is_budgeted`). An empty
+        # non-final frame has no effect on the HTTP message: window accounting
+        # is done (above), so drop it without delivering (h2 recv.rs) — it
+        # counts against its own lifetime cap inside `_record_data_frame`, and
+        # a flood of them dies with ENHANCE_YOUR_CALM (-> pump -> GOAWAY).
+        is_budgeted = not frame.end_stream
+        if is_budgeted:
+            self._record_data_frame(st, payload_len)
+            if payload_len == 0:
+                return
+        # The queue carries (payload, is_budgeted) — the mirror of h2 0.4.19's
+        # `DataEvent` (recv.rs L72-76): the reader must know whether consuming
+        # the chunk returns a budget charge.
+        st.body_send.send((frame.data, is_budgeted))
         if frame.end_stream:
             st.state.recv_close()
             st.body_send.send(None)  # EOF

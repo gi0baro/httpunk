@@ -41,6 +41,16 @@ class Stream:
         # reclaimed at connection level if the stream is cancelled/reset/closed
         # (h2 recv.rs `in_flight_recv_data` / `release_closed_capacity`).
         self.recv_unreleased = 0
+        # Outstanding DATA-framing budget charged for this stream's buffered-but-
+        # unconsumed small budgeted frames (sum of `THRESHOLD - len` per frame).
+        # h2 0.4.19 releases the budget of undelivered frames when the recv
+        # buffer is cleared (recv.rs `clear_recv_buffer` L959-976 iterates the
+        # buffer, `release_closed_capacity` L502); our body queue can't be
+        # drained synchronously through the backend seam, so this counter
+        # carries the same information (runtime-forced re-expression). Guarded
+        # like `recv_unreleased` (F22): the reader's per-chunk release and the
+        # teardown's bulk release can never double-credit.
+        self.data_budget_charged = 0
         # Set once `_reclaim_stream_accounting` has returned this stream's in-flight recv
         # data to the connection window (on reset/abort). A later `release_capacity`
         # for the same buffered-but-unread bytes must then be a no-op, or it would
