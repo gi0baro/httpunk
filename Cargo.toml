@@ -1,6 +1,6 @@
 [package]
 name = "httpunk"
-version = "0.1.5"
+version = "0.2.0"
 description = "The Rust HTTP library for Python"
 authors = [
     "Giovanni Barillari <g@baro.dev>",
@@ -60,7 +60,7 @@ vendor-hyper-util = { path = "crates/vendor-hyper-util" }
 # THIRD-PARTY.md). Optional + gated behind the never-enabled `_audit` feature so
 # the pinned versions land in Cargo.lock for `cargo audit` / Dependabot advisory
 # coverage without pulling them (and tokio) into the build.
-h2 = { version = "=0.4.16", optional = true }
+h2 = { version = "=0.4.19", optional = true }
 hyper = { version = "=1.11.0", optional = true, default-features = false, features = ["http1", "client", "server"] }
 
 [profile.release]
