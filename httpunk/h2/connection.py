@@ -63,11 +63,17 @@ class H2ConnectionBase:
         self.backend = _backend.resolve(backend)
         self.codec = H2Codec(codec_role)
         self.error = None
-        self._scope = self.backend.scope()
-        # A SEPARATE scope for background request-body writers (client full-duplex
-        # send, F6), kept out of the read-pump's `_scope`: writers are torn down
-        # first in `close()`, so the pump's scope stays pump-only and its teardown
-        # timing is unaffected (the pump's parked-recv close race is delicate).
+        # The read pump is a bare task (`spawn_without_results`), never
+        # cancelled: every point it can park at ends NATURALLY on the transport
+        # close in `close()` — a parked `receive_some` returns EOF, an inline
+        # ack/GOAWAY send (or a wait on the send lock behind one) errors on the
+        # dead transport, and the pump's own handlers turn either into its exit
+        # paths. `close()` joins it via this handle.
+        self._read_handle = None
+        # A scope for background request-body writers (client full-duplex send,
+        # F6) — the one group that legitimately gets CANCELLED at teardown: an
+        # interrupted DATA write on a closing connection is acceptable, the
+        # connection dies with it.
         self._write_scope = self.backend.scope()
         # The control-frame write pump is a bare task, NOT a scope child: it
         # must never be cancelled — a cancellation landing between its buffer
@@ -125,7 +131,6 @@ class H2ConnectionBase:
         # Shared handshake start (h2 client.rs/server.rs `handshake`): open the
         # scope, flush the connection preface (client: 24-byte preface; server:
         # empty) + our initial SETTINGS, and spawn the read-pump.
-        await self._scope.__aenter__()
         await self._write_scope.__aenter__()
         await self.send_frame(preface + self.codec.serialize_settings(**settings))
         # The control-frame write pump starts only AFTER the preface is on the wire,
@@ -136,16 +141,17 @@ class H2ConnectionBase:
         # preface, before any peer data (h2 sends this initial WINDOW_UPDATE(0) as
         # part of connection setup, from `initial_connection_window_size`).
         await self.streams.raise_connection_window()
-        self._scope.spawn(self._read_pump())
+        self._read_handle = self.backend.spawn_without_results(self._read_pump())
 
     async def close(self):
         # Close the transport *first*: the read-pump is almost always parked in
         # `transport.receive_some`, and closing makes that return EOF so the pump
-        # exits on its own — deterministic, rather than relying on cancellation to
-        # interrupt a native socket poll (which races and can leave the scope's
-        # `__aexit__` waiting on a task that never wakes → the intermittent
-        # teardown hang). The EOF also unblocks the peer's read loop. `cancel()`
-        # then covers the rare case where the pump is parked elsewhere.
+        # exits on its own — deterministic, never via cancellation: every point
+        # the pump can park at ends naturally once the transport is closed (a
+        # parked `receive_some` returns EOF; an inline ack/GOAWAY send — or a
+        # wait on the send lock behind one — errors on the dead transport, and
+        # the pump's handlers turn either into its exit paths). The EOF also
+        # unblocks the peer's read loop.
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never
         # cancel it: a cancellation landing between the pump's buffer swap and
         # its flush would kill it with control frames (the GOAWAY reply of the
@@ -180,15 +186,14 @@ class H2ConnectionBase:
                     await self._transport.send_all(pending)
         if self._transport is not None:
             self.backend.close_transport(self._transport)
-        self._scope.cancel()
-        await self._scope.__aexit__(None, None, None)
-        # Guarantee every straggler waiter is woken. The pump normally calls `fail_all`
-        # itself on EOF, but that races the `cancel()` above — if cancellation reaches
-        # the pump before it processes the close-induced EOF, `fail_all` is skipped and a
-        # concurrent waiter (parked on a stream event) hangs forever (F44). The pump has
-        # now been joined, so this runs sequentially: it's a no-op when the pump already
-        # failed everyone (streams are popped as they're aborted), and wakes the
-        # stragglers when it didn't.
+        handle, self._read_handle = self._read_handle, None
+        if handle is not None:
+            await handle
+        # Guarantee every straggler waiter is woken. The pump calls `fail_all`
+        # itself when the close-induced EOF (or send error) reaches it, and the
+        # join above makes this run strictly after — so this is a no-op when the
+        # pump already failed everyone (streams are popped as they're aborted),
+        # and wakes any straggler a pump exit path missed (F44).
         self.streams.fail_all(self.error or ConnectionClosedError("connection closed"))
 
     async def send_frame(self, data):
