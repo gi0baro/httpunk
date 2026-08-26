@@ -178,12 +178,12 @@ class H2ConnectionBase:
         # (F23). Best-effort: the connection is closing regardless, so a send
         # failure (a dead transport — h2's Io branch, which skips straight to
         # Closed) is ignored.
-        with self._write_buf_lock:
-            pending, self._write_buf = bytes(self._write_buf), bytearray()
-        if pending and self._transport is not None:
+        if self._transport is not None:
             with contextlib.suppress(Exception):
                 async with self._send_lock:
-                    await self._transport.send_all(pending)
+                    pending = self._take_pending()
+                    if pending:
+                        await self._transport.send_all(pending)
         if self._transport is not None:
             self.backend.close_transport(self._transport)
         handle, self._read_handle = self._read_handle, None
@@ -197,8 +197,13 @@ class H2ConnectionBase:
         self.streams.fail_all(self.error or ConnectionClosedError("connection closed"))
 
     async def send_frame(self, data):
+        # Drain-then-send under the one send lock: control frames committed
+        # (enqueued) before we acquired the wire go out first, so wire order =
+        # commit order — h2's single-queue property (a GOAWAY thus follows the
+        # RSTs committed before it, like h2 flushing its pending queue). See
+        # the design note below.
         async with self._send_lock:
-            await self._transport.send_all(data)
+            await self._transport.send_all(self._take_pending() + data)
 
     # Design note (why three send paths, vs h2's single frame queue): in the h2
     # crate ALL socket I/O belongs to the one connection task — user handles only
@@ -229,6 +234,24 @@ class H2ConnectionBase:
     #   close in user-task context; `close()` drains the queue before the FIN, so
     #   flushed-before-stop still holds.
     #
+    # ORDERING INVARIANT (the property h2's single queue gives for free, restored
+    # here for the hybrid): a control frame committed to the pending buffer before
+    # a sender acquires `_send_lock` reaches the wire before that sender's bytes.
+    # Two pieces enforce it, and both are load-bearing:
+    # - inline senders (`send_frame`, `send_frame_or_fail`) drain the buffer via
+    #   `_take_pending` and write it FIRST, under the send lock they hold;
+    # - the pump swaps the buffer INSIDE `_send_lock` (`_write_pump`), so a batch
+    #   swapped out but not yet written can never coexist with an available lock
+    #   (or an inline sender slipping in between swap and flush would still
+    #   invert the order).
+    # Without it, the RST/WINDOW_UPDATE a dispatch enqueues can lose the wire
+    # race to a response committed AFTER it (h2 guarantees the reverse), which is
+    # peer-observable: the forgotten-stream RST arriving after the next stream's
+    # response flaked F17 in CI. Lock order is send -> buf everywhere; the buffer
+    # lock is a sync leaf, never held across an await. NOT covered (unchanged,
+    # matches the pre-existing hybrid semantics): two INLINE sends serialize in
+    # lock-acquisition order, not state-commit order.
+    #
     # The full-fidelity alternative — port h2's buffered-send/`reserve_capacity`
     # model and route DATA through the queue too — remains open as a future step;
     # this hybrid was chosen to keep F41's zero-buffering and the inline hot path.
@@ -242,6 +265,18 @@ class H2ConnectionBase:
         with self._write_buf_lock:
             self._write_buf += data
             self._write_evt.set()
+
+    def _take_pending(self):
+        """Swap out everything committed to the pending-send buffer. MUST be
+        called while holding `_send_lock` — writing what you take while still
+        holding it is what makes wire order equal commit order (see the design
+        note above). Deliberately does NOT clear `_write_evt`: only the pump
+        clears, in the same locked section where it observes `_write_stop` — a
+        drain that cleared here could erase `close()`'s paired stop+wake and
+        hang the pump join. The cost is one spurious empty pump wake."""
+        with self._write_buf_lock:
+            data, self._write_buf = bytes(self._write_buf), bytearray()
+        return data
 
     async def _write_pump(self):
         """Flush the pending-send buffer to the transport. Runs as a bare task
@@ -257,23 +292,32 @@ class H2ConnectionBase:
         or after the clear (its wake survives for the next iteration) — an
         unlocked clear could erase a wake for bytes not yet swapped (lost
         wakeup on the free-threaded runtime). A write failure fails the whole
-        connection — same as h2, where a connection-task write error is fatal."""
+        connection — same as h2, where a connection-task write error is fatal.
+
+        The swap happens INSIDE `_send_lock`: a batch swapped out but not yet
+        written must not coexist with an available send lock, or an inline
+        sender could slip its (later-committed) frame onto the wire ahead of
+        it — the second half of the ordering invariant (the inline senders'
+        `_take_pending` drain is the first). Lock order is send -> buf
+        everywhere; the buffer lock is a leaf, never held across an await."""
         while True:
             await self._write_evt.wait()
-            with self._write_buf_lock:
-                data, self._write_buf = bytes(self._write_buf), bytearray()
-                self._write_evt.clear()
-                stopping = self._write_stop
-            if data:
-                try:
-                    async with self._send_lock:
+            failed = None
+            async with self._send_lock:
+                with self._write_buf_lock:
+                    data, self._write_buf = bytes(self._write_buf), bytearray()
+                    self._write_evt.clear()
+                    stopping = self._write_stop
+                if data:
+                    try:
                         await self._transport.send_all(data)
-                except OSError as exc:
-                    self._fail(ConnectionClosedError(f"connection closed: {exc}"))
-                    break
-                except Exception as exc:
-                    self._fail(exc)
-                    break
+                    except OSError as exc:
+                        failed = ConnectionClosedError(f"connection closed: {exc}")
+                    except Exception as exc:
+                        failed = exc
+            if failed is not None:
+                self._fail(failed)
+                break
             if stopping:
                 # Drain-then-exit: anything enqueued during the send above left
                 # the event set (its `set()` came after our `clear()`), so loop
@@ -292,8 +336,16 @@ class H2ConnectionBase:
         connection ourselves (h2 equivalent: write errors are connection-fatal;
         partial writes are unrepresentable — the connection task resumes them).
         Cancellation while WAITING for the send lock is safe (nothing written) and
-        does not poison."""
+        does not poison.
+
+        Drains the pending control buffer first (under the lock — wire order =
+        commit order, see the design note): the RST/WINDOW_UPDATE a dispatch
+        committed before this frame can no longer lose the wire race to it
+        (the rsts=0 flake in the forgotten-stream test). An interruption then
+        also loses the drained control frames — moot, since every branch below
+        poisons the connection they belonged to."""
         async with self._send_lock:
+            data = self._take_pending() + data
             try:
                 await self._transport.send_all(data)
             except BaseException as exc:

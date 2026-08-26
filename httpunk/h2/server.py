@@ -191,7 +191,18 @@ class ServerStreamManager(StreamManager):
         if st is not None:
             if st.state.is_local_error():
                 return None  # locally reset: swallow late frames "for some time"
-            return st  # existing stream -> the shared trailers path
+            if st.state.is_closed():
+                # Completed normally but still stored — the inline-write window
+                # (`StreamManager._drop_closed_stored`): drop it and classify
+                # below exactly as if already forgotten. For a server HEADERS
+                # target the deterministic post-release answer is the
+                # decreased-id connection error (h2 recv.rs `open` L127) — a
+                # peer sending HEADERS after its own END_STREAM violates either
+                # way, and the outcome must not depend on which side of the
+                # window the frame lands on.
+                self._drop_closed_stored(st)
+            else:
+                return st  # existing stream -> the shared trailers path
         reset_at = self._reset_streams.get(sid)
         if reset_at is not None:
             if self._conn.backend.monotonic() - reset_at <= _RESET_STREAM_SECS:

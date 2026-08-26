@@ -25,7 +25,14 @@ async def _listener():
 
 async def _raw_client(host, port):
     """A byte-level transport — for wire-fidelity cases the (sequential) httpunk
-    client can't drive: pipelining, HTTP/1.0, upgrades, malformed heads."""
+    client can't drive: pipelining, HTTP/1.0, upgrades, malformed heads.
+
+    Callers must run their test body in `try/finally: transport.close(); s.cancel()`:
+    an assertion that fires while the transport is still open leaves the spawned
+    server parked in a read only our EOF can end (tonio's optimistic cancellation
+    cannot land on its pre-existing waiter), and the scope join then waits it out
+    forever — the conftest deadline turns the real failure into an opaque timeout.
+    Both calls are idempotent, so a body that already closed/cancelled is fine."""
     return await TonioBackend().connect_tcp(host, port)
 
 
@@ -248,12 +255,14 @@ async def test_server_pipelined_requests():
     async with scope() as s:
         s.spawn(_echo_server(listener, seen))
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n\r\n")
-        data = await _read_until(transport, b"GET /b -> ")
-        assert b"GET /a -> " in data
-        assert b"GET /b -> " in data
-        transport.close()
-        s.cancel()
+        try:
+            await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n\r\n")
+            data = await _read_until(transport, b"GET /b -> ")
+            assert b"GET /a -> " in data
+            assert b"GET /b -> " in data
+        finally:
+            transport.close()
+            s.cancel()
     assert seen == ["/a", "/b"]
 
 
@@ -265,11 +274,14 @@ async def test_server_http10_response_version_and_close():
     async with scope() as s:
         s.spawn(_echo_server(listener))
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /old HTTP/1.0\r\nhost: x\r\n\r\n")
-        data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
-        assert data.startswith(b"HTTP/1.0 200")
-        assert b"GET /old -> " in data
-        s.cancel()
+        try:
+            await transport.send_all(b"GET /old HTTP/1.0\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
+            assert data.startswith(b"HTTP/1.0 200")
+            assert b"GET /old -> " in data
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -287,10 +299,13 @@ async def test_server_header_read_timeout_closes_slow_head():
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n")  # partial head, never completes
-        data = await _drain_all(transport)  # server times out and closes -> EOF
-        assert data == b""  # no response sent; the connection was just closed
-        s.cancel()
+        try:
+            await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n")  # partial head, never completes
+            data = await _drain_all(transport)  # server times out and closes -> EOF
+            assert data == b""  # no response sent; the connection was just closed
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.asyncio
@@ -333,10 +348,13 @@ async def test_server_detach_hands_off_open_connection():
     async with scope() as s:
         s.spawn(serve())
         client = await _raw_client(host, port)
-        # request head + trailing bytes the client sent past it (must survive as `leftover`)
-        await client.send_all(b"GET /up HTTP/1.1\r\nhost: x\r\nupgrade: custom\r\nconnection: upgrade\r\n\r\nEXTRA")
-        data = await _read_until(client, b"OWNED")
-        s.cancel()
+        try:
+            # request head + trailing bytes the client sent past it (must survive as `leftover`)
+            await client.send_all(b"GET /up HTTP/1.1\r\nhost: x\r\nupgrade: custom\r\nconnection: upgrade\r\n\r\nEXTRA")
+            data = await _read_until(client, b"OWNED")
+        finally:
+            client.close()
+            s.cancel()
 
     assert captured["leftover"] == b"EXTRA"  # bytes past the head handed back
     assert b"101 Switching Protocols" in data and data.endswith(b"OWNED")  # socket stayed open
@@ -350,11 +368,16 @@ async def test_server_no_100_continue_for_http10():
     async with scope() as s:
         s.spawn(_echo_server(listener))
         transport = await _raw_client(host, port)
-        await transport.send_all(b"POST /x HTTP/1.0\r\nhost: x\r\ncontent-length: 3\r\nexpect: 100-continue\r\n\r\nabc")
-        data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
-        assert b"100 Continue" not in data  # F16: no interim for a 1.0 client
-        assert data.startswith(b"HTTP/1.0 200")  # the real response still arrives
-        s.cancel()
+        try:
+            await transport.send_all(
+                b"POST /x HTTP/1.0\r\nhost: x\r\ncontent-length: 3\r\nexpect: 100-continue\r\n\r\nabc"
+            )
+            data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
+            assert b"100 Continue" not in data  # F16: no interim for a 1.0 client
+            assert data.startswith(b"HTTP/1.0 200")  # the real response still arrives
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -375,14 +398,16 @@ async def test_server_http10_streamed_body_with_content_length_reuses():
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /a HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
-        r1 = await _read_until(transport, b"/a")  # head + the 2-byte length-framed body
-        assert r1.startswith(b"HTTP/1.0 200")
-        assert b"connection: keep-alive" in r1.lower()  # reusable, not close-delimited
-        await transport.send_all(b"GET /b HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
-        assert b"/b" in await _read_until(transport, b"/b")  # connection was reused
-        transport.close()
-        s.cancel()
+        try:
+            await transport.send_all(b"GET /a HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
+            r1 = await _read_until(transport, b"/a")  # head + the 2-byte length-framed body
+            assert r1.startswith(b"HTTP/1.0 200")
+            assert b"connection: keep-alive" in r1.lower()  # reusable, not close-delimited
+            await transport.send_all(b"GET /b HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
+            assert b"/b" in await _read_until(transport, b"/b")  # connection was reused
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -393,12 +418,14 @@ async def test_server_http10_keep_alive_header():
     async with scope() as s:
         s.spawn(_echo_server(listener))
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /a HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
-        data = await _read_until(transport, b"\r\n\r\n")
-        assert data.startswith(b"HTTP/1.0 200")
-        assert b"connection: keep-alive" in data.lower()
-        transport.close()
-        s.cancel()
+        try:
+            await transport.send_all(b"GET /a HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
+            data = await _read_until(transport, b"\r\n\r\n")
+            assert data.startswith(b"HTTP/1.0 200")
+            assert b"connection: keep-alive" in data.lower()
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -417,11 +444,14 @@ async def test_server_response_connection_close():
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n")
-        data = await _drain_all(transport)  # server closes despite the keep-alive request
-        assert b"connection: close" in data.lower()
-        assert b"bye" in data
-        s.cancel()
+        try:
+            await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)  # server closes despite the keep-alive request
+            assert b"connection: close" in data.lower()
+            assert b"bye" in data
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -441,10 +471,13 @@ async def test_server_unread_large_body_closes_not_drains():
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
-        await transport.send_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 1000000\r\n\r\npartial")
-        data = await _drain_all(transport)  # returns once the server closes (no hang)
-        assert b"ok" in data
-        s.cancel()
+        try:
+            await transport.send_all(b"POST / HTTP/1.1\r\nhost: x\r\ncontent-length: 1000000\r\n\r\npartial")
+            data = await _drain_all(transport)  # returns once the server closes (no hang)
+            assert b"ok" in data
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -468,13 +501,15 @@ async def test_server_upgrade_tunnel():
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /chat HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: myproto\r\n\r\n")
-        head = await _read_until(transport, b"\r\n\r\n")
-        assert head.startswith(b"HTTP/1.1 101")
-        await transport.send_all(b"ping")
-        assert await transport.receive_some() == b"echo:ping"
-        transport.close()
-        s.cancel()
+        try:
+            await transport.send_all(b"GET /chat HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: myproto\r\n\r\n")
+            head = await _read_until(transport, b"\r\n\r\n")
+            assert head.startswith(b"HTTP/1.1 101")
+            await transport.send_all(b"ping")
+            assert await transport.receive_some() == b"echo:ping"
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -673,13 +708,18 @@ async def test_abrupt_client_close_ends_iteration_cleanly():
     async with scope() as s:
         s.spawn(server())
         transport = await _raw_client(host, port)
-        await transport.send_all(b"GET /one HTTP/1.1\r\nhost: x\r\n\r\n")
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            resp += await transport.receive_some(65536)
-        # RST the connection while the server is parked in the next head-read.
-        transport.socket._sock.setsockopt(pysock.SOL_SOCKET, pysock.SO_LINGER, struct.pack("ii", 1, 0))
-        transport.close()
-        # The scope join below waits out the server task: it must finish, cleanly.
+        try:
+            await transport.send_all(b"GET /one HTTP/1.1\r\nhost: x\r\n\r\n")
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = await transport.receive_some(65536)
+                assert chunk, "connection closed before the response head"
+                resp += chunk
+            # RST the connection while the server is parked in the next head-read.
+            transport.socket._sock.setsockopt(pysock.SOL_SOCKET, pysock.SO_LINGER, struct.pack("ii", 1, 0))
+        finally:
+            # No s.cancel(): the scope join waiting out the server task — which must
+            # finish CLEANLY on its own — is the assertion under test.
+            transport.close()
     assert served == ["/one"]
     assert not server_errors

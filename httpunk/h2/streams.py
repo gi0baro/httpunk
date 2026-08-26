@@ -678,6 +678,29 @@ class StreamManager:
 
     # ===== per-frame recv dispatch (h2: proto/streams/streams.rs recv_*) =====
 
+    def _drop_closed_stored(self, st):
+        """Release a normally-completed stream observed while still stored — the
+        inline-write window: `respond`/`send_body` transition the state to Closed
+        BEFORE their awaited wire write and pop the stream only after it, so a
+        truly-parallel dispatch (free-threaded read pump) can catch it in
+        between. Upstream can't: its one connection task flushes, releases, and
+        dispatches serially under the store mutex, so by the time the peer can
+        react to the response the stream is already released. Sync, like all of
+        the lookup classification.
+
+        Deliberately NO waiter repair and NO `st.error`: a fully-closed stream
+        has its head delivered and EOF already queued on the body channel, so
+        nothing can be parked on it — and a straggling reader re-reads
+        `st.error` after EOF, so setting it would turn a completed exchange
+        into a spurious StreamResetError (the F18 repair in `reset_stream` is
+        for streams that closed ERRORED with waiters still parked, not this).
+        The reclaim is a no-op when `respond`/`aclose` already ran it (F22
+        `recv_reclaimed`), and covers the in-window case where it hasn't."""
+        conn_wu = self._reclaim_stream_accounting(st)
+        self._close_stream(st)
+        if conn_wu:
+            self._conn.enqueue_frame(self._conn.codec.serialize_window_update(0, conn_wu))
+
     def _recv_lookup(self, stream_id):
         """Resolve the target stream for an inbound HEADERS/DATA frame, or
         classify why there isn't one.
@@ -698,6 +721,20 @@ class StreamManager:
                 # Locally reset: ignore frames "for some time" (the peer may have
                 # sent trailers/data before receiving our RST_STREAM).
                 return None
+            if st.state.is_closed():
+                # Completed normally but still stored — the inline-write window
+                # (`_drop_closed_stored`). Upstream's serialized lookup can only
+                # ever see this stream as already forgotten, so give the peer
+                # exactly the forgotten answer — drop it and classify
+                # STREAM_CLOSED: the caller then RSTs once and the id enters the
+                # reset store (`reset_on_error`'s forgotten path), making the
+                # peer-visible outcome independent of which side of the window
+                # the frame lands on. (Upstream's own guard here — recv.rs
+                # recv_data L665-673 — calls it a connection error, with a TODO
+                # conceding STREAM_CLOSED; only its seriality keeps that arm
+                # unreachable for a benign peer.)
+                self._drop_closed_stored(st)
+                raise _StreamError(stream_id, int(H2Reason.STREAM_CLOSED))
             return st
         reset_at = self._reset_streams.get(stream_id)
         if reset_at is not None:

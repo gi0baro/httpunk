@@ -188,7 +188,14 @@ async def test_server_request_headers():
 
 
 async def _raw_handshake(host, port):
-    """Connect a raw client: send the preface + SETTINGS, return (transport, codec)."""
+    """Connect a raw client: send the preface + SETTINGS, return (transport, codec).
+
+    Callers must run their test body in `try/finally: transport.close(); s.cancel()`:
+    an assertion that fires while the transport is still open leaves the spawned
+    server parked in a read only our EOF can end (tonio's optimistic cancellation
+    cannot land on its pre-existing waiter), and the scope join then waits it out
+    forever — the conftest deadline turns the real failure into an opaque timeout.
+    Both calls are idempotent, so a body that already closed/cancelled is fine."""
     transport = await TonioBackend().connect_tcp(host, port)
     codec = H2Codec("client")
     await transport.send_all(PREFACE + codec.serialize_settings(enable_push=False))
@@ -248,14 +255,16 @@ async def test_server_rsts_unread_request_body_with_no_error():
     async with scope() as s:
         s.spawn(serve())
         transport, codec = await _raw_handshake(host, port)
-        # Open stream 1 with a body but never send END_STREAM (client still uploading).
-        await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/a", HeaderMap()))
-        await transport.send_all(codec.serialize_data(1, b"partial upload", end_stream=False))
-        rst = await _read_frame(transport, codec, RstStream)
-        assert rst is not None and rst.stream_id == 1
-        assert rst.error_code == H2Reason.NO_ERROR  # NO_ERROR (nginx-compat), not CANCEL
-        transport.close()
-        s.cancel()
+        try:
+            # Open stream 1 with a body but never send END_STREAM (client still uploading).
+            await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/a", HeaderMap()))
+            await transport.send_all(codec.serialize_data(1, b"partial upload", end_stream=False))
+            rst = await _read_frame(transport, codec, RstStream)
+            assert rst is not None and rst.stream_id == 1
+            assert rst.error_code == H2Reason.NO_ERROR  # NO_ERROR (nginx-compat), not CANCEL
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -268,21 +277,23 @@ async def test_server_advertises_hyper_settings_profile():
     async with scope() as s:
         s.spawn(_serve_forever(listener))
         transport, codec = await _raw_handshake(host, port)
-        frames = []
-        while not any(isinstance(f, WindowUpdate) for f in frames):  # SETTINGS then WINDOW_UPDATE(0)
-            data = await transport.receive_some(65536)
-            assert data, "connection closed before the server's preface completed"
-            frames += codec.receive(data)
-        settings = next(f for f in frames if isinstance(f, Settings) and not f.ack)
-        assert settings.max_concurrent_streams == 200
-        assert settings.initial_window_size == 1024 * 1024
-        assert settings.max_frame_size == 16 * 1024
-        assert settings.enable_push is None  # the server does not advertise ENABLE_PUSH
-        wu = next(f for f in frames if isinstance(f, WindowUpdate))
-        assert wu.stream_id == 0
-        assert wu.increment == 1024 * 1024 - 65535  # raise the 65535 default conn window to 1 MB
-        transport.close()
-        s.cancel()
+        try:
+            frames = []
+            while not any(isinstance(f, WindowUpdate) for f in frames):  # SETTINGS then WINDOW_UPDATE(0)
+                data = await transport.receive_some(65536)
+                assert data, "connection closed before the server's preface completed"
+                frames += codec.receive(data)
+            settings = next(f for f in frames if isinstance(f, Settings) and not f.ack)
+            assert settings.max_concurrent_streams == 200
+            assert settings.initial_window_size == 1024 * 1024
+            assert settings.max_frame_size == 16 * 1024
+            assert settings.enable_push is None  # the server does not advertise ENABLE_PUSH
+            wu = next(f for f in frames if isinstance(f, WindowUpdate))
+            assert wu.stream_id == 0
+            assert wu.increment == 1024 * 1024 - 65535  # raise the 65535 default conn window to 1 MB
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -294,29 +305,35 @@ async def test_forgotten_stream_frames_swallowed_after_first_rst():
     async with scope() as s:
         s.spawn(_serve_forever(listener))  # 200 (bodyless) per request
         transport, codec = await _raw_handshake(host, port)
-        # Complete stream 1 so the server closes + forgets it.
-        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/a", HeaderMap(), end_stream=True))
-        assert (await _read_frame(transport, codec, Headers)).stream_id == 1  # the 200 response
-        # Two late DATA frames on the now-forgotten stream 1, then a fresh request (stream
-        # 3) as a read barrier so we know both late frames were processed.
-        await transport.send_all(codec.serialize_data(1, b"late1", end_stream=False))
-        await transport.send_all(codec.serialize_data(1, b"late2", end_stream=False))
-        await transport.send_all(codec.serialize_request_headers(3, "GET", "http://x/b", HeaderMap(), end_stream=True))
-        rsts = 0
-        done = False
-        while not done:
-            data = await transport.receive_some(65536)
-            assert data, "connection closed unexpectedly"
-            for f in codec.receive(data):
-                if isinstance(f, Settings) and not f.ack:
-                    await transport.send_all(codec.serialize_settings_ack())
-                elif isinstance(f, RstStream) and f.stream_id == 1:
-                    rsts += 1
-                elif isinstance(f, Headers) and f.stream_id == 3:  # barrier: stream 3 served
-                    done = True
-        assert rsts == 1  # the 2nd late frame was swallowed, not answered with another RST
-        transport.close()
-        s.cancel()
+        try:
+            # Complete stream 1 so the server closes + forgets it.
+            await transport.send_all(
+                codec.serialize_request_headers(1, "GET", "http://x/a", HeaderMap(), end_stream=True)
+            )
+            assert (await _read_frame(transport, codec, Headers)).stream_id == 1  # the 200 response
+            # Two late DATA frames on the now-forgotten stream 1, then a fresh request (stream
+            # 3) as a read barrier so we know both late frames were processed.
+            await transport.send_all(codec.serialize_data(1, b"late1", end_stream=False))
+            await transport.send_all(codec.serialize_data(1, b"late2", end_stream=False))
+            await transport.send_all(
+                codec.serialize_request_headers(3, "GET", "http://x/b", HeaderMap(), end_stream=True)
+            )
+            rsts = 0
+            done = False
+            while not done:
+                data = await transport.receive_some(65536)
+                assert data, "connection closed unexpectedly"
+                for f in codec.receive(data):
+                    if isinstance(f, Settings) and not f.ack:
+                        await transport.send_all(codec.serialize_settings_ack())
+                    elif isinstance(f, RstStream) and f.stream_id == 1:
+                        rsts += 1
+                    elif isinstance(f, Headers) and f.stream_id == 3:  # barrier: stream 3 served
+                        done = True
+            assert rsts == 1  # the 2nd late frame was swallowed, not answered with another RST
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -336,17 +353,19 @@ async def test_server_goaway_on_remote_reset_flood():
     async with scope() as s:
         s.spawn(serve())
         transport, codec = await _raw_handshake(host, port)
-        sid = 1
-        with contextlib.suppress(Exception):  # server may GOAWAY + close mid-flood
-            for _ in range(30):  # well past the cap of 20
-                await transport.send_all(codec.serialize_request_headers(sid, "GET", "http://x/p", HeaderMap()))
-                await transport.send_all(codec.serialize_rst_stream(sid, int(H2Reason.CANCEL)))
-                sid += 2
-        ga = await _read_frame(transport, codec, GoAway)
-        assert ga is not None
-        assert ga.error_code == H2Reason.ENHANCE_YOUR_CALM
-        transport.close()
-        s.cancel()
+        try:
+            sid = 1
+            with contextlib.suppress(Exception):  # server may GOAWAY + close mid-flood
+                for _ in range(30):  # well past the cap of 20
+                    await transport.send_all(codec.serialize_request_headers(sid, "GET", "http://x/p", HeaderMap()))
+                    await transport.send_all(codec.serialize_rst_stream(sid, int(H2Reason.CANCEL)))
+                    sid += 2
+            ga = await _read_frame(transport, codec, GoAway)
+            assert ga is not None
+            assert ga.error_code == H2Reason.ENHANCE_YOUR_CALM
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -357,12 +376,14 @@ async def test_server_goaway_on_idle_stream_data():
     async with scope() as s:
         s.spawn(_serve_forever(listener))
         transport, codec = await _raw_handshake(host, port)
-        await transport.send_all(codec.serialize_data(5, b"x", end_stream=False))  # idle stream 5
-        ga = await _read_goaway(transport, codec)
-        assert ga is not None
-        assert ga.error_code == H2Reason.PROTOCOL_ERROR
-        transport.close()
-        s.cancel()
+        try:
+            await transport.send_all(codec.serialize_data(5, b"x", end_stream=False))  # idle stream 5
+            ga = await _read_goaway(transport, codec)
+            assert ga is not None
+            assert ga.error_code == H2Reason.PROTOCOL_ERROR
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -389,31 +410,33 @@ async def test_server_swallows_late_headers_on_reset_stream():
     async with scope() as s:
         s.spawn(serve())
         transport, codec = await _raw_handshake(host, port)
-        # stream 1: declare content-length 5 but send 10 bytes -> the server RSTs stream 1.
-        await transport.send_all(
-            codec.serialize_request_headers(1, "POST", "http://x/a", HeaderMap([("content-length", "5")]))
-        )
-        await transport.send_all(codec.serialize_data(1, b"0123456789", end_stream=False))
-        # A late HEADERS on the now-reset stream 1 (the client hadn't seen the RST):
-        # must be swallowed, not treated as a decreased-id connection error.
-        await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/a", end_stream=True))
-        # A fresh request on stream 3 must still be served (connection alive).
-        await transport.send_all(codec.serialize_request_headers(3, "GET", "http://x/b", end_stream=True))
+        try:
+            # stream 1: declare content-length 5 but send 10 bytes -> the server RSTs stream 1.
+            await transport.send_all(
+                codec.serialize_request_headers(1, "POST", "http://x/a", HeaderMap([("content-length", "5")]))
+            )
+            await transport.send_all(codec.serialize_data(1, b"0123456789", end_stream=False))
+            # A late HEADERS on the now-reset stream 1 (the client hadn't seen the RST):
+            # must be swallowed, not treated as a decreased-id connection error.
+            await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/a", end_stream=True))
+            # A fresh request on stream 3 must still be served (connection alive).
+            await transport.send_all(codec.serialize_request_headers(3, "GET", "http://x/b", end_stream=True))
 
-        status, goaway = None, None
-        while status is None and goaway is None:
-            data = await transport.receive_some(65536)
-            if not data:
-                break
-            for f in codec.receive(data):
-                if isinstance(f, Settings) and not f.ack:
-                    await transport.send_all(codec.serialize_settings_ack())
-                elif isinstance(f, Headers) and f.stream_id == 3:
-                    status = f.status
-                elif isinstance(f, GoAway):
-                    goaway = f
-        transport.close()
-        s.cancel()
+            status, goaway = None, None
+            while status is None and goaway is None:
+                data = await transport.receive_some(65536)
+                if not data:
+                    break
+                for f in codec.receive(data):
+                    if isinstance(f, Settings) and not f.ack:
+                        await transport.send_all(codec.serialize_settings_ack())
+                    elif isinstance(f, Headers) and f.stream_id == 3:
+                        status = f.status
+                    elif isinstance(f, GoAway):
+                        goaway = f
+        finally:
+            transport.close()
+            s.cancel()
 
     assert goaway is None, "connection torn down instead of swallowing the late HEADERS"
     assert status == 200
@@ -426,12 +449,14 @@ async def test_server_goaway_on_rst_stream_zero():
     async with scope() as s:
         s.spawn(_serve_forever(listener))
         transport, codec = await _raw_handshake(host, port)
-        await transport.send_all(codec.serialize_rst_stream(0, H2Reason.CANCEL))
-        ga = await _read_goaway(transport, codec)
-        assert ga is not None
-        assert ga.error_code == H2Reason.PROTOCOL_ERROR
-        transport.close()
-        s.cancel()
+        try:
+            await transport.send_all(codec.serialize_rst_stream(0, H2Reason.CANCEL))
+            ga = await _read_goaway(transport, codec)
+            assert ga is not None
+            assert ga.error_code == H2Reason.PROTOCOL_ERROR
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -639,18 +664,21 @@ async def test_server_closes_after_goaway_reply_when_idle(last_id):
     async with scope() as s:
         s.spawn(_serve_and_report(listener, done))
         transport, codec = await _raw_handshake(host, port)
-        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
-        seen = []
-        while not any(isinstance(f, Headers) for f in seen):  # full response for stream 1
-            data = await transport.receive_some(65536)
-            assert data
-            for f in codec.receive(data):
-                if isinstance(f, Settings) and not f.ack:
-                    await transport.send_all(codec.serialize_settings_ack())
-                seen.append(f)
-        await transport.send_all(codec.serialize_go_away(last_id, H2Reason.NO_ERROR))
-        await _assert_goaway_then_eof(transport, codec, done, seen=seen)
-        s.cancel()
+        try:
+            await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
+            seen = []
+            while not any(isinstance(f, Headers) for f in seen):  # full response for stream 1
+                data = await transport.receive_some(65536)
+                assert data
+                for f in codec.receive(data):
+                    if isinstance(f, Settings) and not f.ack:
+                        await transport.send_all(codec.serialize_settings_ack())
+                    seen.append(f)
+            await transport.send_all(codec.serialize_go_away(last_id, H2Reason.NO_ERROR))
+            await _assert_goaway_then_eof(transport, codec, done, seen=seen)
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -661,11 +689,14 @@ async def test_server_closes_after_goaway_reply_no_streams_ever():
     async with scope() as s:
         s.spawn(_serve_and_report(listener, done))
         transport, codec = await _raw_handshake(host, port)
-        seen = []
-        await _settle_handshake(transport, codec, seen)
-        await transport.send_all(codec.serialize_go_away(0, H2Reason.NO_ERROR))
-        await _assert_goaway_then_eof(transport, codec, done, seen=seen)
-        s.cancel()
+        try:
+            seen = []
+            await _settle_handshake(transport, codec, seen)
+            await transport.send_all(codec.serialize_go_away(0, H2Reason.NO_ERROR))
+            await _assert_goaway_then_eof(transport, codec, done, seen=seen)
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -679,17 +710,20 @@ async def test_server_closes_after_goaway_received_mid_request():
     async with scope() as s:
         s.spawn(_serve_and_report(listener, done))
         transport, codec = await _raw_handshake(host, port)
-        seen = []
-        await _settle_handshake(transport, codec, seen)
-        # Request body still pending (no END_STREAM) when the GOAWAY lands...
-        await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/", end_stream=False))
-        await transport.send_all(codec.serialize_go_away(1, H2Reason.NO_ERROR))
-        # ...then finish it; after this the client is silent.
-        await transport.send_all(codec.serialize_data(1, b"x", end_stream=True))
-        seen = await _assert_goaway_then_eof(transport, codec, done, seen=seen)
-        # Stream 1 was <= last_stream_id, so it was served before the close.
-        assert any(isinstance(f, Headers) and f.stream_id == 1 and f.status == 200 for f in seen)
-        s.cancel()
+        try:
+            seen = []
+            await _settle_handshake(transport, codec, seen)
+            # Request body still pending (no END_STREAM) when the GOAWAY lands...
+            await transport.send_all(codec.serialize_request_headers(1, "POST", "http://x/", end_stream=False))
+            await transport.send_all(codec.serialize_go_away(1, H2Reason.NO_ERROR))
+            # ...then finish it; after this the client is silent.
+            await transport.send_all(codec.serialize_data(1, b"x", end_stream=True))
+            seen = await _assert_goaway_then_eof(transport, codec, done, seen=seen)
+            # Stream 1 was <= last_stream_id, so it was served before the close.
+            assert any(isinstance(f, Headers) and f.stream_id == 1 and f.status == 200 for f in seen)
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -702,18 +736,21 @@ async def test_server_keeps_serving_after_phase1_goaway():
     async with scope() as s:
         s.spawn(_serve_and_report(listener, done))
         transport, codec = await _raw_handshake(host, port)
-        await transport.send_all(codec.serialize_go_away(2**31 - 1, H2Reason.NO_ERROR))
-        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
-        seen = []
-        while not any(isinstance(f, Headers) for f in seen):
-            data = await transport.receive_some(65536)
-            assert data, "server closed after a phase-1 GOAWAY"
-            for f in codec.receive(data):
-                if isinstance(f, Settings) and not f.ack:
-                    await transport.send_all(codec.serialize_settings_ack())
-                seen.append(f)
-        assert not any(isinstance(f, GoAway) for f in seen)
-        assert not done.is_set()
-        transport.close()
-        await done.wait()  # the server sees our FIN and exits cleanly
-        s.cancel()
+        try:
+            await transport.send_all(codec.serialize_go_away(2**31 - 1, H2Reason.NO_ERROR))
+            await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
+            seen = []
+            while not any(isinstance(f, Headers) for f in seen):
+                data = await transport.receive_some(65536)
+                assert data, "server closed after a phase-1 GOAWAY"
+                for f in codec.receive(data):
+                    if isinstance(f, Settings) and not f.ack:
+                        await transport.send_all(codec.serialize_settings_ack())
+                    seen.append(f)
+            assert not any(isinstance(f, GoAway) for f in seen)
+            assert not done.is_set()
+            transport.close()
+            await done.wait()  # the server sees our FIN and exits cleanly
+        finally:
+            transport.close()
+            s.cancel()
