@@ -502,7 +502,9 @@ async def test_server_upgrade_tunnel():
         s.spawn(serve())
         transport = await _raw_client(host, port)
         try:
-            await transport.send_all(b"GET /chat HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: myproto\r\n\r\n")
+            await transport.send_all(
+                b"GET /chat HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: myproto\r\n\r\n"
+            )
             head = await _read_until(transport, b"\r\n\r\n")
             assert head.startswith(b"HTTP/1.1 101")
             await transport.send_all(b"ping")

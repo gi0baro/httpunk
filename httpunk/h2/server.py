@@ -37,6 +37,7 @@ from ..exceptions import (
     ConnectionClosedError,
     H2ProtocolError,
     H2Reason,
+    fresh_exc,
 )
 from ..http import HeaderMap
 from .connection import PREFACE, H2ConnectionBase
@@ -105,7 +106,7 @@ class ServerRequest:
             await self._manager.release_capacity(self._stream, len(chunk))
             yield chunk
         if self._stream.error is not None:
-            raise self._stream.error
+            raise fresh_exc(self._stream.error) from self._stream.error  # a copy per raise (exceptions.fresh_exc)
 
     def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())

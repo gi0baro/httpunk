@@ -23,7 +23,7 @@ from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
-from ..exceptions import ConnectionClosedError, H2ProtocolError, H2Reason
+from ..exceptions import ConnectionClosedError, H2ProtocolError, H2Reason, fresh_exc
 from ..types import Response
 from .connection import PREFACE, H2ConnectionBase
 from .settings import LocalSettings, Settings
@@ -119,12 +119,16 @@ class ClientStreamManager(StreamManager):
         # 9113 §8.2.2) — same early-validation rationale as the trailers check
         # in `send_request` (#925): a caller error, the connection stays usable.
         self.check_send_headers(headers)
+        # All the stored-error raises below raise a COPY per consumer — many streams
+        # surface the one stored `_conn.error`/`_goaway`, and a shared raised
+        # instance would accumulate every caller's frames (exceptions.fresh_exc).
         if self._goaway is not None:
-            raise self._goaway
+            raise fresh_exc(self._goaway) from self._goaway
         await self._acquire_stream_slot()  # blocks on the limit; increments the count
         if self._conn.error is not None or self._goaway is not None:
             self._release_count()
-            raise self._conn.error or self._goaway
+            src = self._conn.error or self._goaway
+            raise fresh_exc(src) from src
         async with self._new_stream_lock:
             stream_id = self._next_id
             if stream_id > _MAX_STREAM_ID:
@@ -152,8 +156,9 @@ class ClientStreamManager(StreamManager):
         # missed it. Re-check and abort our own stream (idempotent) so a caller
         # doesn't wait forever on a response head that will never arrive.
         if self._conn.error is not None or self._goaway is not None:
-            self._abort_stream(st, self._conn.error or self._goaway)
-            raise self._conn.error or self._goaway
+            src = self._conn.error or self._goaway
+            self._abort_stream(st, src)
+            raise fresh_exc(src) from src
         return st
 
     # ===== MAX_CONCURRENT_STREAMS (h2: proto/streams/counts.rs) =====
@@ -186,9 +191,9 @@ class ClientStreamManager(StreamManager):
             # to free a slot, which may never happen (F20). `_on_go_away`/`_on_fail`
             # set `_slot_evt` to wake us for this re-check.
             if self._goaway is not None:
-                raise self._goaway
+                raise fresh_exc(self._goaway) from self._goaway
             if self._conn.error is not None:
-                raise self._conn.error
+                raise fresh_exc(self._conn.error) from self._conn.error
             await self._slot_evt.wait()
 
     def _release_count(self):
@@ -214,9 +219,9 @@ class ClientStreamManager(StreamManager):
             # existing conn_error (streams.rs L879). Also keeps this consistent with
             # `open_stream`, which checks `_goaway` first (F20).
             if self._goaway is not None:
-                raise self._goaway
+                raise fresh_exc(self._goaway) from self._goaway
             if self._conn.error is not None:
-                raise self._conn.error
+                raise fresh_exc(self._conn.error) from self._conn.error
             # Non-reserving: just observe capacity (a racy read is fine — we don't
             # increment; a concurrent open re-applies the gate under the lock).
             if self._can_open():
@@ -310,7 +315,7 @@ class Connection(H2ConnectionBase):
         await self._begin(PREFACE, settings)
         await self._ready_evt.wait()
         if self.error is not None:
-            raise self.error
+            raise fresh_exc(self.error) from self.error  # a copy per raise (exceptions.fresh_exc)
 
     def _signal_ready(self):
         self._ready_evt.set()
@@ -439,7 +444,10 @@ class H2Connection(BaseClientConnection):
         # bug is a scheduling race where `send_request` re-checks only after the
         # connection has failed, which a quiet loopback never reproduces.)
         if stream.status is None:  # woken by a reset/failure, not a real response head
-            raise stream.error or self._conn.error or ConnectionClosedError("connection closed before response")
+            src = stream.error or self._conn.error
+            if src is not None:
+                raise fresh_exc(src) from src
+            raise ConnectionClosedError("connection closed before response")
         return Response(stream.status, stream.headers, H2ResponseBody(stream, self._conn.streams))
 
     def _resolve(self, target):

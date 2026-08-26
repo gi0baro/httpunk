@@ -26,7 +26,7 @@ import threading
 
 from .._common import aiter_body
 from .._httpunk import H2FlowControl
-from ..exceptions import H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError
+from ..exceptions import H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError, fresh_exc
 from .settings import PeerSettings
 
 
@@ -314,9 +314,9 @@ class StreamManager:
             # error to the parked sender). `_abort_stream`/`reset_stream`/
             # `recv_reset` set window_evt to wake us for this re-check.
             if st.error is not None:
-                raise st.error
+                raise fresh_exc(st.error) from st.error  # a copy per raise (exceptions.fresh_exc)
             if self._conn.error is not None:
-                raise self._conn.error
+                raise fresh_exc(self._conn.error) from self._conn.error
             if st.state.is_closed():
                 raise StreamResetError(st.id, int(H2Reason.CANCEL))
             with self._send_window_lock:

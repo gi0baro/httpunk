@@ -10,6 +10,7 @@ Cross-reference: `h2 ...` comments cite hyperium/h2 v0.4.15.
 """
 
 from .._httpunk import H2Reason
+from ..exceptions import fresh_exc
 
 
 class H2ResponseBody:
@@ -44,7 +45,10 @@ class H2ResponseBody:
             await self._manager.release_capacity(self._stream, len(chunk))
             yield chunk
         if self._stream.error is not None:
-            raise self._stream.error
+            # A copy per raise — many readers may surface the one stored stream/conn
+            # error, and a shared raised instance would accumulate every consumer's
+            # frames onto its traceback (exceptions.fresh_exc).
+            raise fresh_exc(self._stream.error) from self._stream.error
 
     async def aclose(self):
         """Cancel the stream if its body wasn't fully read (sends RST_STREAM).

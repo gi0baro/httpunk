@@ -20,6 +20,8 @@ import errno as _errno
 import ssl as _ssl
 import time as _time
 
+from ..exceptions import fresh_exc as _fresh_exc
+
 
 _READ_HIGH_WATER = 2**16  # 64 KiB — pause reading past this (matches StreamReader's default limit)
 
@@ -65,7 +67,12 @@ class _AsyncioStream(asyncio.Protocol):
         return True
 
     def connection_lost(self, exc):
-        self._error = exc
+        # Store the error PRISTINE (no traceback) and only ever raise copies of
+        # it (below): this object outlives the failure, and a stored exception
+        # instance re-raised through the caller's stack would accumulate those
+        # frames onto its `__traceback__` — a refcount-invisible cycle pinning
+        # everything the frames reference until a gen-2 GC (exceptions.fresh_exc).
+        self._error = exc.with_traceback(None) if exc is not None else None
         self._eof = True
         self._conn_lost = True  # writes to a dead socket must now raise (F32)
         self._wake_reader()
@@ -74,7 +81,7 @@ class _AsyncioStream(asyncio.Protocol):
             if exc is None:
                 self._drain_waiter.set_result(None)
             else:
-                self._drain_waiter.set_exception(exc)
+                self._drain_waiter.set_exception(_fresh_exc(exc))
 
     def pause_writing(self):
         self._writing_paused = True
@@ -94,7 +101,9 @@ class _AsyncioStream(asyncio.Protocol):
             return self._take(max_bytes)
         if self._eof:
             if self._error is not None:
-                raise self._error
+                # A fresh copy per raise — never the stored instance (see
+                # connection_lost / exceptions.fresh_exc).
+                raise _fresh_exc(self._error) from self._error
             return b""
         if self._read_waiter is not None:
             # Single-reader contract: a second concurrent receive_some would overwrite
@@ -110,7 +119,7 @@ class _AsyncioStream(asyncio.Protocol):
         if self._buffer:
             return self._take(max_bytes)
         if self._error is not None:
-            raise self._error
+            raise _fresh_exc(self._error) from self._error
         return b""
 
     async def send_all(self, data):
@@ -119,7 +128,9 @@ class _AsyncioStream(asyncio.Protocol):
         # EPIPE/ECONNRESET — drivers detect a dead peer via that failure. Surface the
         # real error, or EPIPE if the close carried none (a clean peer FIN).
         if self._conn_lost:
-            raise self._error or BrokenPipeError(_errno.EPIPE, "connection lost")
+            if self._error is not None:
+                raise _fresh_exc(self._error) from self._error
+            raise BrokenPipeError(_errno.EPIPE, "connection lost")
         self._transport.write(data)
         if self._writing_paused:  # transport buffer over high-water — wait for resume (drain)
             if self._drain_waiter is None:

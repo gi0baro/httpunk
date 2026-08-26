@@ -34,7 +34,7 @@ from .._httpunk import (
     H2FrameWindowUpdate as WindowUpdate,
     H2StreamError,
 )
-from ..exceptions import ConnectionClosedError, GoAwayError, H2Error, H2Reason
+from ..exceptions import ConnectionClosedError, GoAwayError, H2Error, H2Reason, fresh_exc
 from .settings import Action
 from .streams import _StreamError
 
@@ -511,6 +511,12 @@ class H2ConnectionBase:
     def _fail(self, exc):
         # h2: proto/connection.rs `handle_poll2_result` (L430) -> the connection
         # error fans out to every stream via streams.rs `Streams::handle_error` (L362).
+        # Store/fan out a stripped COPY (h2 clones an Arc'd error the same way):
+        # some callers keep propagating the caught instance after this, which would
+        # accumulate their frames onto a stored traceback (exceptions.fresh_exc).
+        # Sharing the one copy across conn + streams is fine — raise sites raise
+        # copies of it, so its traceback never grows.
+        exc = fresh_exc(exc)
         self.error = exc
         self.streams.fail_all(exc)
         self._signal_ready()  # unblock connect() if the handshake never completed (client); no-op (server)

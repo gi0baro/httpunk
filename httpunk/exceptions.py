@@ -30,6 +30,8 @@ may have begun.
 
 from __future__ import annotations
 
+import copy as _copy
+
 from ._httpunk import (
     ConnectionClosedError as ConnectionClosedError,
     H2Error as H2Error,
@@ -49,6 +51,34 @@ def _reason(code):
         return code  # unknown/experimental error code — keep the raw int
 
 
+def fresh_exc(exc: BaseException) -> BaseException:
+    """A fresh, traceback-free copy of `exc`, for storing or re-raising a saved
+    connection/stream error.
+
+    Runtime-forced divergence from hyper: hyper shares a connection's fatal error
+    by cloning an `Arc<Error>`; a Python exception instance instead accumulates
+    every propagation's frames onto its `__traceback__`, and a traceback's frames
+    keep their locals alive — so a caught exception stored on a long-lived object
+    (conn, stream, backend transport) and re-raised as the same shared instance
+    pins the entire frame graph of every propagation in a reference cycle only
+    cyclic GC can free (observed as stalled-until-gen-2-GC connections downstream).
+    The rule throughout httpunk: **store copies, raise copies** — store
+    `fresh_exc(exc)` (or strip a consumed-once hand-off in place), and re-raise
+    stored errors as `raise fresh_exc(err) from err`, so no stored instance ever
+    carries frames.
+
+    Copies via `copy.copy`: `BaseException.__reduce__` rebuilds from type + args
+    and restores `__dict__` extras (e.g. `request_unsent`); `GoAwayError` /
+    `StreamResetError` define `__reduce__` because their args don't roundtrip
+    through their constructors. The copy carries no `__traceback__` / `__cause__` /
+    `__context__`. An uncopyable exception is returned as-is — degraded (shared
+    instance) but functional."""
+    try:
+        return _copy.copy(exc)
+    except Exception:
+        return exc
+
+
 class GoAwayError(H2Error):
     """The peer sent GOAWAY. Streams with id > `last_stream_id` were not
     processed and are safe to retry on a new connection."""
@@ -63,6 +93,11 @@ class GoAwayError(H2Error):
         self.debug_data = debug_data
         super().__init__(f"GOAWAY(last_stream_id={last_stream_id}, error_code={self.error_code!r})")
 
+    def __reduce__(self):
+        # `args` holds the formatted message, not the constructor params — rebuild
+        # from the real params so `copy.copy`/pickle (and `fresh_exc`) work.
+        return (type(self), (self.last_stream_id, int(self.error_code), self.debug_data), self.__dict__)
+
 
 class StreamResetError(H2Error):
     """The peer sent RST_STREAM for this stream."""
@@ -74,3 +109,7 @@ class StreamResetError(H2Error):
         self.stream_id = stream_id
         self.error_code = _reason(error_code)
         super().__init__(f"RST_STREAM(stream_id={stream_id}, error_code={self.error_code!r})")
+
+    def __reduce__(self):
+        # See GoAwayError.__reduce__.
+        return (type(self), (self.stream_id, int(self.error_code)), self.__dict__)

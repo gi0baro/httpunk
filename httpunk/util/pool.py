@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .. import _backend
+from ..exceptions import fresh_exc
 
 
 class Canceled(Exception):  # noqa: N818 - `Canceled` is hyper-util's exact name (singleton.rs)
@@ -89,7 +90,9 @@ class Singleton:
             except BaseException as exc:
                 with self._lock:
                     self._state = "empty"  # ditch the round so the next get() retries
-                    self._error = exc
+                    # A stripped copy — the caught instance keeps propagating below
+                    # and this pool object is long-lived (exceptions.fresh_exc).
+                    self._error = fresh_exc(exc)
                 ready.set()
                 raise
             with self._lock:

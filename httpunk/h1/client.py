@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
 from .._httpunk import H1BodyDecoder, H1Codec
-from ..exceptions import ConnectionClosedError
+from ..exceptions import ConnectionClosedError, fresh_exc
 from ..http import HeaderMap
 from ..types import Response
 from .connection import H1ConnectionBase
@@ -226,7 +226,11 @@ class Connection(H1ConnectionBase):
             data = await transport.receive_some(65536)
         except Exception as exc:
             if self._exchange_active:
-                self._watcher_error = exc  # surfaced by _read_head's first read
+                # Consumed-once hand-off (nulled at the `_read_head` take, so raising
+                # the instance there is safe) — but strip the watcher frames now: while
+                # parked here it would otherwise pin this conn/transport in a cycle
+                # (exceptions.fresh_exc). Surfaced by _read_head's first read.
+                self._watcher_error = exc.with_traceback(None)
             elif not self._closed:
                 self._fail(exc)
             return
@@ -248,7 +252,7 @@ class Connection(H1ConnectionBase):
         await self._acquire()
         self._slot.release()
         if self.error is not None:
-            raise self.error
+            raise fresh_exc(self.error) from self.error  # a copy per raise (exceptions.fresh_exc)
         if self._closed:
             raise ConnectionClosedError("connection closed")
 
@@ -271,9 +275,11 @@ class Connection(H1ConnectionBase):
         if self._closed or self.error is not None:
             self._busy = False
             self._slot.release()
-            exc = self.error or ConnectionClosedError("connection closed")
+            # The flag rides the raised copy, not the stored error: it holds for
+            # THIS give-back, while a stored flag would leak onto unrelated raises.
+            exc = fresh_exc(self.error) if self.error is not None else ConnectionClosedError("connection closed")
             exc.request_unsent = True
-            raise exc
+            raise exc from self.error
         # `require_empty_read`'s buffered-bytes fast path at send time (conn.rs
         # L463-465; regression test client_read_bytes_before_writing_request):
         # a server may not send anything before the client's next request, and
@@ -291,8 +297,9 @@ class Connection(H1ConnectionBase):
             self.poison_unexpected(len(pending))  # records the error AND closes
             self._busy = False
             self._slot.release()
-            self.error.request_unsent = True
-            raise self.error
+            exc = fresh_exc(self.error)
+            exc.request_unsent = True
+            raise exc from self.error
         # The exchange starts NOW: the watcher is not stopped (its parked read
         # is never cancelled — see `_watch_idle`); this sync flag redirects its
         # completing read from the idle rules to the exchange, whose `_read_head`
@@ -438,7 +445,7 @@ class Connection(H1ConnectionBase):
             # for `_read_head`, so DEFER — record it and surface it only if no head
             # arrives (EOF). Do NOT signal `body_failed`, or we'd race away that buffered
             # response (F11).
-            write_error.append(exc)
+            write_error.append(exc.with_traceback(None))  # stored past this frame — strip (exceptions.fresh_exc)
         except Exception as exc:
             # A BODY-ITERABLE / framing error (the caller's body generator raised, or a
             # length mismatch): the request can't complete and no valid response is
@@ -447,7 +454,7 @@ class Connection(H1ConnectionBase):
             # on `receive_some` until the server times out (F12). The transport is closed
             # by `send_request`'s outer `_fail` once the writer is joined — closing it
             # here (inside the writer's scope) wedges that join.
-            write_error.append(exc)
+            write_error.append(exc.with_traceback(None))  # stored past this frame — strip (exceptions.fresh_exc)
             body_failed.set()
 
     async def _read_head(self, codec, write_error=None):
@@ -477,15 +484,19 @@ class Connection(H1ConnectionBase):
                 # dispatches are legitimate). Surface the recorded verdict —
                 # the unexpected-bytes poison (hyper `new_unexpected_message`)
                 # or the clean close — not a generic error that would mask it.
-                raise self.error or ConnectionClosedError("connection closed")
+                if self.error is not None:
+                    raise fresh_exc(self.error) from self.error
+                raise ConnectionClosedError("connection closed")
         while True:
             if data is None:
                 data = await self.transport.receive_some(65536)
             if not data:
                 # EOF before a full head. If the body write also failed (server
-                # closed both directions), surface that as the cause.
+                # closed both directions), surface that as the cause. A copy — the
+                # instance stays in `write_error`, whose frames would join the
+                # raise's traceback (exceptions.fresh_exc).
                 if write_error:
-                    raise write_error[0]
+                    raise fresh_exc(write_error[0]) from write_error[0]
                 raise ConnectionClosedError("connection closed before the response head")
             buffered += len(data)
             head = codec.receive_head(data)
@@ -509,7 +520,7 @@ class Connection(H1ConnectionBase):
         # NOT fire this (F11 — an early response may be buffered), so the normal path
         # always lets `_read_head` win the race.
         await body_failed.wait()
-        raise write_error[0]
+        raise fresh_exc(write_error[0]) from write_error[0]
 
     def poison_unexpected(self, nbytes):
         """The server sent `nbytes` unsolicited bytes outside a response — an
@@ -577,7 +588,10 @@ class Connection(H1ConnectionBase):
         # inside an exchange (slot held, watcher joined at send_request entry)
         # or from the watcher itself.
         if self.error is None and not isinstance(exc, ConnectionClosedError):
-            self.error = exc
+            # A stripped COPY: the caught instance keeps propagating to the caller
+            # and would accumulate every frame above onto a stored traceback
+            # (exceptions.fresh_exc).
+            self.error = fresh_exc(exc)
         self._closed = True
         self._close_transport()
 
