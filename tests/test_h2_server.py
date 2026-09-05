@@ -339,6 +339,146 @@ async def test_forgotten_stream_frames_swallowed_after_first_rst():
 
 
 @pytest.mark.tonio
+async def test_server_settings_options_override_hyper_profile():
+    """hyper `http2::Builder` options reach the wire: `max_frame_size`,
+    `max_header_list_size`, `initial_window_size` in our SETTINGS, and
+    `initial_connection_window_size` as the initial WINDOW_UPDATE(0) increment."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(
+                transport,
+                max_frame_size=32_768,
+                max_header_list_size=65_536,
+                initial_window_size=512 * 1024,
+                initial_connection_window_size=2 * 1024 * 1024,
+            ) as server:
+                async for req in server:
+                    await req.respond(200)
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            frames = []
+            while not any(isinstance(f, WindowUpdate) for f in frames):
+                data = await transport.receive_some(65536)
+                assert data, "connection closed before the server's preface completed"
+                frames += codec.receive(data)
+            settings = next(f for f in frames if isinstance(f, Settings) and not f.ack)
+            assert settings.max_frame_size == 32_768
+            assert settings.max_header_list_size == 65_536
+            assert settings.initial_window_size == 512 * 1024
+            wu = next(f for f in frames if isinstance(f, WindowUpdate))
+            assert (wu.stream_id, wu.increment) == (0, 2 * 1024 * 1024 - 65535)
+        finally:
+            transport.close()
+            s.cancel()
+
+
+def test_server_max_frame_size_out_of_range_rejected_at_construction():
+    """The RFC 9113 §6.5.2 range h2's `set_max_frame_size` asserts is checked up front."""
+    with pytest.raises(ValueError, match="max_frame_size"):
+        H2Server(object(), max_frame_size=100)
+    with pytest.raises(ValueError, match="max_frame_size"):
+        H2Server(object(), max_frame_size=1 << 24)
+
+
+@pytest.mark.tonio
+async def test_server_max_pending_accept_reset_streams_option():
+    """`max_pending_accept_reset_streams` (hyper; h2 default 20) sets the Rapid-Reset cap."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport, max_pending_accept_reset_streams=3):
+                await Event().wait()  # never accept a request
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            sid = 1
+            with contextlib.suppress(Exception):
+                for _ in range(6):  # past the cap of 3, well under h2's default 20
+                    await transport.send_all(codec.serialize_request_headers(sid, "GET", "http://x/p", HeaderMap()))
+                    await transport.send_all(codec.serialize_rst_stream(sid, int(H2Reason.CANCEL)))
+                    sid += 2
+            ga = await _read_frame(transport, codec, GoAway)
+            assert ga is not None and ga.error_code == H2Reason.ENHANCE_YOUR_CALM
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_max_local_error_reset_streams_option():
+    """`max_local_error_reset_streams` (hyper default 1024) caps library-initiated error
+    resets before GOAWAY(ENHANCE_YOUR_CALM). Each request HEADERS carrying a
+    connection-specific field is malformed -> RST_STREAM(PROTOCOL_ERROR); the cap of 1
+    lets one through and GOAWAYs on the second."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport, max_local_error_reset_streams=1) as server:
+                async for req in server:
+                    await req.respond(200)
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            bad = HeaderMap({"connection": "keep-alive"})
+            await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/p", bad, end_stream=True))
+            rst = await _read_frame(transport, codec, RstStream)
+            assert rst is not None and (rst.stream_id, rst.error_code) == (1, H2Reason.PROTOCOL_ERROR)
+            await transport.send_all(codec.serialize_request_headers(3, "GET", "http://x/p", bad, end_stream=True))
+            ga = await _read_frame(transport, codec, GoAway)
+            assert ga is not None and ga.error_code == H2Reason.ENHANCE_YOUR_CALM
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_response_date_header_option():
+    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L484),
+    gated by `auto_date_header`; an app-supplied `Date` is kept."""
+    listener, host, port = await _listener()
+
+    async def serve(**opts):
+        transport = await listener.accept()
+        async with H2Server(transport, **opts) as server:
+            async for req in server:
+                hdrs = {"date": "Mon, 01 Jan 2024 00:00:00 GMT"} if req.path == "/mine" else None
+                await req.respond(204, headers=hdrs)
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("GET", "/")
+            assert resp.headers.get("date") is not None
+            await resp.read()
+            resp = await conn.request("GET", "/mine")
+            assert resp.headers["date"] == b"Mon, 01 Jan 2024 00:00:00 GMT"
+            await resp.read()
+        s.cancel()
+
+    async with scope() as s:
+        s.spawn(serve(auto_date_header=False))
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("GET", "/")
+            assert resp.headers.get("date") is None
+            await resp.read()
+        s.cancel()
+
+
+@pytest.mark.tonio
 async def test_server_goaway_on_remote_reset_flood():
     """Rapid Reset (CVE-2023-44487): a flood of HEADERS+RST_STREAM on streams the app
     never accepts. Reset pending-accept streams stop counting as concurrent, so

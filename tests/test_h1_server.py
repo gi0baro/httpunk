@@ -620,6 +620,138 @@ async def test_server_oversized_head_rejected_with_431():
     assert stub.closed
 
 
+# ----- hyper `http1::Builder` options (FR-5 parity pass) -----
+
+
+@pytest.mark.tonio
+async def test_server_keep_alive_false_answers_one_request_with_close():
+    """`keep_alive=False` = hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive`
+    on the still-Busy connection (`KA::Disabled`): the first response is `Connection: close`
+    and the connection closes after it; a pipelined second request is never answered."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport, keep_alive=False) as server:
+            async for req in server:
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)  # the server closes after the first response
+            assert data.count(b"HTTP/1.1 200") == 1
+            assert b"connection: close" in data.lower()
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_max_buf_size_option():
+    """`max_buf_size` caps a still-incomplete head (431 + close past it, hyper io.rs
+    `max_buf_size`); values below hyper's MINIMUM_MAX_BUFFER_SIZE (8192) are rejected
+    like hyper's `assert!`."""
+    stub = _StubTransport(b"GET / HTTP/1.1\r\nx: " + b"a" * 9_000)  # < the 400 KB default, > 8192
+    conn = ServerConnection(stub, max_buf_size=8192)
+    await conn.start()
+    assert await conn.next_request() is None
+    assert stub.sent.startswith(b"HTTP/1.1 431")
+    assert stub.closed
+    with pytest.raises(ValueError, match="max_buf_size"):
+        ServerConnection(_StubTransport(b""), max_buf_size=100)
+
+
+@pytest.mark.tonio
+async def test_server_max_headers_option():
+    """`max_headers` (hyper default 100): a head with more header lines parses as
+    `TooLarge` (httparse TooManyHeaders) -> auto 431 + close."""
+    head = b"GET / HTTP/1.1\r\nhost: x\r\na: 1\r\nb: 2\r\n\r\n"  # 3 headers
+    stub = _StubTransport(head)
+    conn = ServerConnection(stub, max_headers=2)
+    await conn.start()
+    assert await conn.next_request() is None
+    assert stub.sent.startswith(b"HTTP/1.1 431")
+    assert stub.closed
+    # The default (100) accepts it.
+    conn = ServerConnection(_StubTransport(head))
+    await conn.start()
+    req = await conn.next_request()
+    assert req is not None and req.headers["b"] == b"2"
+
+
+@pytest.mark.tonio
+async def test_server_ignore_invalid_headers_option():
+    """`ignore_invalid_headers` (httparse `ignore_invalid_headers_in_requests`): a malformed
+    header line is skipped instead of failing the head with 400."""
+    head = b"GET / HTTP/1.1\r\nbad header: v\r\nhost: x\r\n\r\n"  # space in the field name
+    stub = _StubTransport(head)
+    conn = ServerConnection(stub)
+    await conn.start()
+    assert await conn.next_request() is None
+    assert stub.sent.startswith(b"HTTP/1.1 400")  # default: rejected
+    conn = ServerConnection(_StubTransport(head), ignore_invalid_headers=True)
+    await conn.start()
+    req = await conn.next_request()
+    assert req is not None
+    assert req.headers["host"] == b"x"
+    assert len(req.headers) == 1  # the bad line was dropped, not mangled into a header
+
+
+@pytest.mark.tonio
+async def test_server_auto_date_header_and_title_case_options():
+    """`auto_date_header=False` omits `Date` (hyper `http1::Builder::auto_date_header`);
+    `title_case_headers=True` writes `Content-Type:` / `Date:` (hyper `title_case_headers`)."""
+    stub = _StubTransport(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(stub, auto_date_header=False)
+    await conn.start()
+    req = await conn.next_request()
+    await req.respond(200, headers={"content-type": "text/plain"}, body=b"ok")
+    assert b"\r\ndate:" not in stub.sent.lower()
+    assert b"\r\ncontent-type: text/plain\r\n" in stub.sent  # lowercase by default
+
+    stub = _StubTransport(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(stub, title_case_headers=True)
+    await conn.start()
+    req = await conn.next_request()
+    await req.respond(200, headers={"content-type": "text/plain"}, body=b"ok")
+    assert b"\r\nContent-Type: text/plain\r\n" in stub.sent
+    assert b"\r\nDate: " in stub.sent
+
+
+def test_response_date_is_refreshed_at_encode_time_per_thread():
+    """hyper refreshes its per-thread `Date` cache only in `Server::parse` and copies it in
+    `Server::encode`. Under a work-stealing runtime the encode may run on a thread whose
+    cache was last refreshed long ago, so httpunk refreshes at encode too: a response
+    encoded >1s after this thread's last refresh must NOT carry the old value."""
+    import threading
+    import time
+    from email.utils import parsedate_to_datetime
+
+    from httpunk._httpunk import H1Codec, http_date
+
+    seen = {}
+
+    def worker():
+        codec = H1Codec()
+        codec.receive_request_head(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")  # parse: refreshes this thread's cache
+        seen["at_parse"] = http_date()
+        time.sleep(1.2)  # no parse on this thread meanwhile
+        head = codec.serialize_response(200, HeaderMap(), content_length=0)
+        seen["in_response"] = next(line for line in head.split(b"\r\n") if line.lower().startswith(b"date:"))[
+            5:
+        ].strip()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert seen["in_response"] != seen["at_parse"]
+    delta = parsedate_to_datetime(seen["in_response"].decode()) - parsedate_to_datetime(seen["at_parse"].decode())
+    assert delta.total_seconds() >= 1
+
+
 @pytest.mark.tonio
 async def test_h2_preface_closes_silently_without_response():
     """An h1 server that receives the HTTP/2 prior-knowledge preface closes silently

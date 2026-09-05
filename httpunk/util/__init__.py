@@ -1,7 +1,7 @@
 """httpunk.util — composable HTTP utilities above the codec, mirroring the
 **non-legacy** surface of `hyper-util`:
 - `connect(url, ...)` — client connect + ALPN negotiation (≈ `client::pool::negotiate`).
-- `auto.serve(transport, ...)` — an auto h1-or-h2 server (≈ `server::conn::auto`).
+- `auto.Builder` / `auto.serve(transport, ...)` — an auto h1-or-h2 server (≈ `server::conn::auto`).
 - `GracefulShutdown` — a shutdown coordinator (≈ `server::graceful`).
 - `pool.{Singleton,Cache,Map}` — composable connection pools (≈ `client::pool::{singleton,cache,map}`).
 - `proxy.{Matcher,Intercept}` — proxy selection (≈ `client::proxy::matcher`, vendored in Rust).

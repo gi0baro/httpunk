@@ -47,22 +47,41 @@ struct State {
     encoder: Option<BodyEncoder>,
 }
 
-/// A synchronous HTTP/1 client codec.
+/// A synchronous HTTP/1 codec (client + server roles).
 #[pyclass(module = "httpunk._httpunk", name = "H1Codec", frozen)]
 pub struct H1Codec {
     inner: Mutex<State>,
+    /// Server-role parse/encode options (hyper `server::conn::http1::Builder`):
+    /// `max_headers` (None = hyper's default 100), `ignore_invalid_headers`
+    /// (httparse `ignore_invalid_headers_in_requests`), `title_case_headers`,
+    /// `date_header` (`auto_date_header`). Immutable per codec; the driver builds
+    /// one codec per request from the connection's configuration.
+    max_headers: Option<usize>,
+    ignore_invalid_headers: bool,
+    title_case_headers: bool,
+    date_header: bool,
 }
 
 #[pymethods]
 impl H1Codec {
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (*, max_headers=None, ignore_invalid_headers=false, title_case_headers=false, date_header=true))]
+    fn new(
+        max_headers: Option<usize>,
+        ignore_invalid_headers: bool,
+        title_case_headers: bool,
+        date_header: bool,
+    ) -> Self {
         H1Codec {
             inner: Mutex::new(State {
                 buf: BytesMut::new(),
                 req_method: None,
                 encoder: None,
             }),
+            max_headers,
+            ignore_invalid_headers,
+            title_case_headers,
+            date_header,
         }
     }
 
@@ -199,7 +218,7 @@ impl H1Codec {
     fn receive_request_head(&self, py: Python<'_>, data: &[u8]) -> PyResult<Option<Py<PyAny>>> {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
-        match parse_request(&mut st.buf)
+        match parse_request(&mut st.buf, self.max_headers, self.ignore_invalid_headers)
             .map_err(|e| PyValueError::new_err(format!("malformed HTTP/1 request: {e}")))?
         {
             Some(head) => {
@@ -234,7 +253,7 @@ impl H1Codec {
     /// `receive_request_head` for bodyless-ness (HEAD/204/304), `keep_alive` to
     /// decide `Connection: close`, and `http10` to set the response version
     /// (an unknown-length 1.0 body is close-delimited, not chunked). Writes a
-    /// `Date` header.
+    /// `Date` header unless the codec was built with `date_header=False`.
     #[pyo3(signature = (status, headers=None, *, keep_alive=true, http10=false, content_length=None, chunked=false))]
     #[allow(clippy::too_many_arguments)] // faithful mirror of hyper's Encode fields
     fn serialize_response(
@@ -254,8 +273,17 @@ impl H1Codec {
             content_length.map(Some)
         };
         let req_method = self.inner.lock().unwrap().req_method.clone();
-        let (dst, encoder) = encode_response(status, fields, body, req_method, keep_alive, http10)
-            .map_err(|e| value_err("failed to encode response", e))?;
+        let (dst, encoder) = encode_response(
+            status,
+            fields,
+            body,
+            req_method,
+            keep_alive,
+            http10,
+            self.title_case_headers,
+            self.date_header,
+        )
+        .map_err(|e| value_err("failed to encode response", e))?;
         self.inner.lock().unwrap().encoder = Some(encoder);
         Ok(PyBytes::new(py, &dst).unbind())
     }

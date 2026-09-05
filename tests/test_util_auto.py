@@ -1,5 +1,5 @@
-"""`httpunk.util.auto.serve` — sniff an accepted transport and serve it as h1 or
-h2. Unit tests drive a scripted transport (protocol detection + lossless prewind);
+"""`httpunk.util.auto` (`Builder` + the `serve` shortcut) — sniff an accepted transport
+and serve it as h1 or h2. Unit tests drive a scripted transport (protocol detection + lossless prewind);
 end-to-end loopback tests prove httpunk's own clients round-trip through the picked
 server (the replayed preface / request line parses correctly).
 """
@@ -87,6 +87,75 @@ async def test_only_forces_protocol_without_sniffing():
 async def test_rejects_bad_only():
     with pytest.raises(ValueError, match="only must be"):
         await auto.serve(_ScriptedTransport(b""), only="h3")
+
+
+# ----- unit: Builder (hyper-util `auto::Builder`) -----
+
+
+@pytest.mark.tonio
+async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picked():
+    builder = auto.Builder()
+    # Chain across both sub-builders like hyper-util's http1()/http2() crossover.
+    builder.http1().header_read_timeout(5.0).keep_alive(False).max_headers(50).max_buf_size(16384).auto_date_header(
+        False
+    ).title_case_headers(True).ignore_invalid_headers(True).http2().max_concurrent_streams(
+        7
+    ).initial_stream_window_size(123456).data_frame_budget(4096).initial_connection_window_size(
+        2_000_000
+    ).max_frame_size(32768).max_header_list_size(65536).max_pending_accept_reset_streams(
+        5
+    ).max_local_error_reset_streams(None).auto_date_header(False)
+
+    h1 = await builder.serve_connection(_ScriptedTransport(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n"))
+    assert isinstance(h1, H1Server)
+    assert h1._conn._header_read_timeout == 5.0
+    assert h1._conn._keep_alive_enabled is False
+    assert h1._conn._max_buf_size == 16384
+    assert h1._conn._codec_options == {
+        "max_headers": 50,
+        "ignore_invalid_headers": True,
+        "title_case_headers": True,
+        "date_header": False,
+    }
+
+    h2 = await builder.serve_connection(_ScriptedTransport(PREFACE))
+    assert isinstance(h2, H2Server)
+    assert h2._conn._max_concurrent_streams == 7
+    assert h2._conn._initial_window_size == 123456
+    assert h2._conn._initial_connection_window_size == 2_000_000
+    assert h2._conn._max_frame_size == 32768
+    assert h2._conn._max_header_list_size == 65536
+    assert h2._conn.streams._max_pending_accept_reset_streams == 5
+    assert h2._conn.streams._max_local_error_resets is None  # None = no limit (hyper semantics)
+    assert h2._conn._auto_date_header is False
+
+
+@pytest.mark.tonio
+async def test_builder_none_restores_defaults_and_header_read_timeout_none_disables():
+    builder = auto.Builder()
+    builder.http2().max_concurrent_streams(7).max_concurrent_streams(None)  # None -> server default
+    builder.http1().header_read_timeout(None)  # None -> disabled (hyper Into<Option<Duration>>)
+    h2 = await builder.serve_connection(_ScriptedTransport(PREFACE))
+    assert h2._conn._max_concurrent_streams == H2Server(_ScriptedTransport(b""))._conn._max_concurrent_streams
+    h1 = await builder.serve_connection(_ScriptedTransport(b"GET / HTTP/1.1\r\n\r\n"))
+    assert h1._conn._header_read_timeout is None
+
+
+@pytest.mark.tonio
+async def test_builder_only_forces_without_sniffing_and_refuses_double_force():
+    t = _ScriptedTransport(PREFACE)
+    assert isinstance(await auto.Builder().http1_only().serve_connection(t), H1Server)
+    assert t._data == PREFACE  # nothing consumed for detection
+    assert isinstance(await auto.Builder().http2_only().serve_connection(_ScriptedTransport(b"")), H2Server)
+    with pytest.raises(RuntimeError, match="already forced"):
+        auto.Builder().http1_only().http2_only()
+
+
+@pytest.mark.tonio
+async def test_builder_serve_connection_from_sub_builders():
+    # hyper-util: both Http1Builder and Http2Builder expose serve_connection.
+    assert isinstance(await auto.Builder().http1().serve_connection(_ScriptedTransport(PREFACE)), H2Server)
+    assert isinstance(await auto.Builder().http2().serve_connection(_ScriptedTransport(b"GET /")), H1Server)
 
 
 # ----- unit: prewound transport replay -----

@@ -52,7 +52,10 @@ _CONTINUE = b"HTTP/1.1 100 Continue\r\n\r\n"
 # Max bytes of an incomplete request head we'll buffer before rejecting it as
 # `Parse::TooLarge` (auto 431 + close) — hyper's `DEFAULT_MAX_BUFFER_SIZE`
 # (io.rs: 8192 + 4096*100). Bounds per-connection memory against a slow/oversized head.
-_MAX_HEAD_SIZE = 8192 + 4096 * 100
+# hyper `http1::Builder::max_buf_size`: default io.rs DEFAULT_MAX_BUFFER_SIZE; a value below
+# MINIMUM_MAX_BUFFER_SIZE (= INIT_BUFFER_SIZE, 8192) is rejected (hyper `assert!`s).
+_DEFAULT_MAX_BUF_SIZE = 8192 + 4096 * 100
+_MIN_MAX_BUF_SIZE = 8192
 _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L249)
 # The HTTP/2 connection preface (client prior-knowledge). An h1 server that sees it
 # closes silently with a version error rather than writing a 400 (hyper `on_parse_error`
@@ -201,9 +204,37 @@ class ServerConnection(H1ConnectionBase):
     then writes the response; reuses the connection on keep-alive. The accepting
     analogue of the client `Connection`, over the shared `H1ConnectionBase`."""
 
-    def __init__(self, transport, *, backend=None, header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT):
+    def __init__(
+        self,
+        transport,
+        *,
+        backend=None,
+        header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT,
+        keep_alive=True,
+        max_headers=None,
+        max_buf_size=_DEFAULT_MAX_BUF_SIZE,
+        auto_date_header=True,
+        title_case_headers=False,
+        ignore_invalid_headers=False,
+    ):
         super().__init__(transport, backend=backend)
         self._reusable = True  # keep-alive: may we read another request after this one?
+        # hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive()` on a Busy (not yet
+        # idle) connection = `KA::Disabled` (http1.rs L463, conn.rs L876): the first response
+        # is encoded `Connection: close` and the connection closes after it — exactly the
+        # graceful-shutdown path, applied from the start. Reading the first request is unaffected.
+        self._keep_alive_enabled = keep_alive
+        if max_buf_size < _MIN_MAX_BUF_SIZE:
+            raise ValueError("the max_buf_size cannot be smaller than the minimum that h1 specifies.")
+        self._max_buf_size = max_buf_size  # cap on a still-incomplete head (hyper io.rs `max_buf_size`)
+        # Per-request codec options (hyper `http1::Builder`): `max_headers` (None = hyper's
+        # 100), `ignore_invalid_headers`, `title_case_headers`, `auto_date_header`.
+        self._codec_options = {
+            "max_headers": max_headers,
+            "ignore_invalid_headers": ignore_invalid_headers,
+            "title_case_headers": title_case_headers,
+            "date_header": auto_date_header,
+        }
         self._codec = None  # current request/response codec
         self._current = None  # current ServerRequest (for body draining)
         self._head_raw = b""  # raw bytes of the in-progress head read (h2-preface check, F49)
@@ -269,7 +300,7 @@ class ServerConnection(H1ConnectionBase):
             leftover = self._current._decoder.take_buffered()
         self._current = None
 
-        codec = H1Codec()
+        codec = H1Codec(**self._codec_options)
         try:
             head = await self._read_request_head(codec, leftover)
         except ValueError as exc:
@@ -425,7 +456,7 @@ class ServerConnection(H1ConnectionBase):
             # once the buffered bytes reach the limit it's `Parse::TooLarge` -> auto 431
             # + close. Without this a slow/never-terminating head stream is unbounded
             # memory per connection (F14). `_error_status` maps "TooLarge" -> 431.
-            if buffered >= _MAX_HEAD_SIZE:
+            if buffered >= self._max_buf_size:
                 raise ValueError("message head is too large (Parse::TooLarge)")
 
     def _read_or_shutdown(self, n):
@@ -507,7 +538,7 @@ class ServerConnection(H1ConnectionBase):
         # enforce_version (conn.rs L682-698). Without this, the `_reusable = keep_alive`
         # below would overwrite the `False` graceful_shutdown() set and keep the
         # connection alive.
-        if self._shutdown_evt.is_set():
+        if self._shutdown_evt.is_set() or not self._keep_alive_enabled:
             keep_alive = False
         if not is_switch:
             # A switch keeps the app's `Connection: upgrade` verbatim; otherwise
@@ -574,6 +605,28 @@ class H1Server(BaseServer[ServerRequest]):
         transport: Any,
         *,
         backend: BackendLike | None = None,
-        header_read_timeout: float = _DEFAULT_HEADER_READ_TIMEOUT,
+        header_read_timeout: float | None = _DEFAULT_HEADER_READ_TIMEOUT,
+        keep_alive: bool = True,
+        max_headers: int | None = None,
+        max_buf_size: int = _DEFAULT_MAX_BUF_SIZE,
+        auto_date_header: bool = True,
+        title_case_headers: bool = False,
+        ignore_invalid_headers: bool = False,
     ) -> None:
-        self._conn = ServerConnection(transport, backend=backend, header_read_timeout=header_read_timeout)
+        """Options mirror hyper `server::conn::http1::Builder` (defaults are hyper's):
+        `header_read_timeout` (30s; None disables), `keep_alive` (False: answer one
+        request with `Connection: close` and close), `max_headers` (None = 100),
+        `max_buf_size` (cap on an incomplete head, >= 8192), `auto_date_header`,
+        `title_case_headers`, `ignore_invalid_headers` (skip malformed request header
+        lines instead of rejecting with 400)."""
+        self._conn = ServerConnection(
+            transport,
+            backend=backend,
+            header_read_timeout=header_read_timeout,
+            keep_alive=keep_alive,
+            max_headers=max_headers,
+            max_buf_size=max_buf_size,
+            auto_date_header=auto_date_header,
+            title_case_headers=title_case_headers,
+            ignore_invalid_headers=ignore_invalid_headers,
+        )

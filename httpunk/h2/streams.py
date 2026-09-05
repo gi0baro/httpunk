@@ -147,6 +147,9 @@ class StreamManager:
         # Count of streams we've reset due to peer-caused errors; too many means
         # the peer is misbehaving -> escalate to GOAWAY (h2 local_max_error_reset).
         self._local_error_resets = 0
+        # Cap on library-initiated error resets before GOAWAY(ENHANCE_YOUR_CALM); None =
+        # no limit (h2 `max_local_error_reset_streams(None)`). The server overrides it.
+        self._max_local_error_resets = _LOCAL_MAX_ERROR_RESETS
         # Connection-level DATA-framing budget (h2 counts.rs `data_frame_budget`,
         # #935 — see the constants above). Charged in the pump (`recv_data`),
         # released by the body readers, which run on other tasks/threads -> lock.
@@ -503,7 +506,7 @@ class StreamManager:
         # replies; upstream caps at 1024 and, via the reset store below, goes silent for
         # ~1s per id (F17 — the Rapid-Reset-adjacent amplification defence).
         self._local_error_resets += 1
-        if self._local_error_resets > _LOCAL_MAX_ERROR_RESETS:
+        if self._max_local_error_resets is not None and self._local_error_resets > self._max_local_error_resets:
             raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too many stream resets")
         st = self._streams.get(stream_id)
         if st is not None:

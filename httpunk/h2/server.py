@@ -33,6 +33,7 @@ from collections.abc import AsyncIterator, Awaitable
 from typing import TYPE_CHECKING, Any
 
 from .._common import BaseServer, read_all
+from .._httpunk import http_date
 from ..exceptions import (
     ConnectionClosedError,
     H2ProtocolError,
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
 
 _DEFAULT_MAX_CONCURRENT = 200  # hyper server SETTINGS_MAX_CONCURRENT_STREAMS (proto/h2/server.rs)
 _REMOTE_RESET_MAX = 20  # h2 proto/mod.rs DEFAULT_REMOTE_RESET_STREAM_MAX (Rapid-Reset cap)
+_LOCAL_ERROR_RESET_MAX = 1024  # hyper proto/h2/server.rs DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS
+_MIN_MAX_FRAME_SIZE = 16_384  # RFC 9113 §6.5.2 SETTINGS_MAX_FRAME_SIZE range (h2 frame/settings.rs asserts)
+_MAX_MAX_FRAME_SIZE = (1 << 24) - 1
 # hyper's HTTP/2 server profile (hyper `proto/h2/server.rs`): a 1 MB per-stream recv
 # window and 1 MB connection recv window (vs the 65535 default), 16 KB max frame size,
 # 16 KB max header-list size. We ship the hyper stack's tuned profile, not bare-h2
@@ -136,8 +140,9 @@ class ServerStreamManager(StreamManager):
     count in `Counts`. All flow control / reset / SETTINGS logic is the shared
     `StreamManager`; only the role hooks + the response send live here."""
 
-    def __init__(self, conn, *, max_concurrent_streams, initial_window_size):
+    def __init__(self, conn, *, max_concurrent_streams, initial_window_size, max_pending_accept_reset_streams):
         super().__init__(conn)
+        self._max_pending_accept_reset_streams = max_pending_accept_reset_streams
         # Highest client stream id we've *seen* (h2 recv `next_stream_id`): a new
         # stream must be a larger odd id. Distinct from `_last_processed_id`, the
         # GOAWAY last-stream-id.
@@ -264,7 +269,7 @@ class ServerStreamManager(StreamManager):
         # connection GOAWAY(ENHANCE_YOUR_CALM). Reset-then-accept traffic decrements
         # the count in `next_request`, so only a genuine flood trips it.
         if st.id in self._pending_accept:
-            if len(self._remote_reset_pending) >= _REMOTE_RESET_MAX:
+            if len(self._remote_reset_pending) >= self._max_pending_accept_reset_streams:
                 raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too_many_resets")
             self._remote_reset_pending.add(st.id)
 
@@ -296,6 +301,11 @@ class ServerStreamManager(StreamManager):
         if st.state.is_closed():
             raise ConnectionClosedError("stream already closed")
         hdrs = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
+        # hyper's h2 server inserts `Date` when the app didn't set one (proto/h2/server.rs
+        # L484 `entry(DATE).or_insert_with(date::update_and_header_value)`), gated by
+        # `auto_date_header`. Same cached value the h1 encoder writes.
+        if self._conn._auto_date_header and hdrs.get("date") is None:
+            hdrs["date"] = http_date()
         # Same RFC 9113 §8.2.2 rejection as the client's request/trailer paths
         # (h2 send.rs `send_headers` -> `check_headers`): checked BEFORE the
         # state transition, so a rejected call leaves the stream untouched and
@@ -341,11 +351,36 @@ class ServerConnection(H2ConnectionBase):
     SETTINGS / GOAWAY machinery is the shared `H2ConnectionBase`."""
 
     def __init__(
-        self, transport, *, backend=None, max_concurrent_streams, initial_window_size=None, data_frame_budget=None
+        self,
+        transport,
+        *,
+        backend=None,
+        max_concurrent_streams,
+        initial_window_size=None,
+        data_frame_budget=None,
+        initial_connection_window_size=None,
+        max_frame_size=None,
+        max_header_list_size=None,
+        max_pending_accept_reset_streams=None,
+        max_local_error_reset_streams=_LOCAL_ERROR_RESET_MAX,
+        auto_date_header=True,
     ):
         self._max_concurrent_streams = max_concurrent_streams
-        # Our advertised per-stream recv window, defaulting to hyper's 1 MB.
+        # Our advertised windows / frame / header-list profile, defaulting to hyper's
+        # (proto/h2/server.rs L36-40: 1 MB stream + connection windows, 16 KB frames,
+        # 16 KB header list). `None` = hyper's default (its builders take `Into<Option<_>>`).
         self._initial_window_size = initial_window_size if initial_window_size is not None else _STREAM_WINDOW
+        self._initial_connection_window_size = (
+            initial_connection_window_size if initial_connection_window_size is not None else _CONN_WINDOW
+        )
+        self._max_frame_size = max_frame_size if max_frame_size is not None else _MAX_FRAME_SIZE
+        if not _MIN_MAX_FRAME_SIZE <= self._max_frame_size <= _MAX_MAX_FRAME_SIZE:
+            # Fail at construction, not at the first SETTINGS write (h2 frame/settings.rs
+            # `set_max_frame_size` asserts the RFC range).
+            raise ValueError(f"max_frame_size must be in [{_MIN_MAX_FRAME_SIZE}, {_MAX_MAX_FRAME_SIZE}]")
+        self._max_header_list_size = max_header_list_size if max_header_list_size is not None else _MAX_HEADER_LIST_SIZE
+        # hyper `http2::Builder::auto_date_header` (proto/h2/server.rs `date_header`, default true).
+        self._auto_date_header = auto_date_header
         self._preface_buf = b""
         self._preface_ok = False
         super().__init__(
@@ -355,15 +390,23 @@ class ServerConnection(H2ConnectionBase):
             settings=Settings(
                 LocalSettings(
                     initial_window_size=self._initial_window_size,
-                    max_frame_size=_MAX_FRAME_SIZE,
-                    max_header_list_size=_MAX_HEADER_LIST_SIZE,
+                    max_frame_size=self._max_frame_size,
+                    max_header_list_size=self._max_header_list_size,
                 )
             ),
         )
         self.streams = ServerStreamManager(
-            self, max_concurrent_streams=max_concurrent_streams, initial_window_size=self._initial_window_size
+            self,
+            max_concurrent_streams=max_concurrent_streams,
+            initial_window_size=self._initial_window_size,
+            # hyper `max_pending_accept_reset_streams`: None = h2's default (20).
+            max_pending_accept_reset_streams=(
+                max_pending_accept_reset_streams if max_pending_accept_reset_streams is not None else _REMOTE_RESET_MAX
+            ),
         )
-        self.streams._conn_recv_target = _CONN_WINDOW  # raised via WINDOW_UPDATE(0) in _begin
+        # hyper `max_local_error_reset_streams`: default Some(1024); None = NO limit (not advised).
+        self.streams._max_local_error_resets = max_local_error_reset_streams
+        self.streams._conn_recv_target = self._initial_connection_window_size  # raised via WINDOW_UPDATE(0) in _begin
         # DATA-framing budget: None = Auto (half the connection window, floored) —
         # h2 0.4.19 `server::Builder::data_frame_budget` resolved at handshake
         # (server.rs L1048-1069, L1536-1540).
@@ -384,8 +427,8 @@ class ServerConnection(H2ConnectionBase):
         settings = {
             "max_concurrent_streams": self._max_concurrent_streams,
             "initial_window_size": self._initial_window_size,
-            "max_frame_size": _MAX_FRAME_SIZE,
-            "max_header_list_size": _MAX_HEADER_LIST_SIZE,
+            "max_frame_size": self._max_frame_size,
+            "max_header_list_size": self._max_header_list_size,
         }
         await self._begin(b"", settings)
 
@@ -467,11 +510,30 @@ class H2Server(BaseServer[ServerRequest]):
         max_concurrent_streams: int = _DEFAULT_MAX_CONCURRENT,
         initial_window_size: int | None = None,
         data_frame_budget: int | None = None,
+        initial_connection_window_size: int | None = None,
+        max_frame_size: int | None = None,
+        max_header_list_size: int | None = None,
+        max_pending_accept_reset_streams: int | None = None,
+        max_local_error_reset_streams: int | None = _LOCAL_ERROR_RESET_MAX,
+        auto_date_header: bool = True,
     ) -> None:
+        """Options mirror hyper `server::conn::http2::Builder` (defaults are hyper's; `None`
+        = default unless noted): `max_concurrent_streams` (200), `initial_window_size`
+        (hyper `initial_stream_window_size`, 1 MB), `initial_connection_window_size` (1 MB),
+        `max_frame_size` (16 KB, RFC range enforced), `max_header_list_size` (16 KB),
+        `max_pending_accept_reset_streams` (h2's 20), `max_local_error_reset_streams`
+        (1024; None = NO limit), `auto_date_header`; plus h2's own
+        `data_frame_budget` (None = Auto)."""
         self._conn = ServerConnection(
             transport,
             backend=backend,
             max_concurrent_streams=max_concurrent_streams,
             initial_window_size=initial_window_size,
             data_frame_budget=data_frame_budget,
+            initial_connection_window_size=initial_connection_window_size,
+            max_frame_size=max_frame_size,
+            max_header_list_size=max_header_list_size,
+            max_pending_accept_reset_streams=max_pending_accept_reset_streams,
+            max_local_error_reset_streams=max_local_error_reset_streams,
+            auto_date_header=auto_date_header,
         )

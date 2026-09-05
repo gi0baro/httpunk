@@ -102,11 +102,25 @@ class HeaderMap:
 # HTTP/1 codec  (src/py/h1/codec.rs)
 # ===========================================================================
 
+def http_date() -> bytes:
+    """The current `Date` header value (IMF-fixdate) from hyper's cached per-second clock."""
+
 class H1Codec:
     """A synchronous, zero-I/O HTTP/1 codec over the vendored hyper h1 core.
     Drives head parse/encode + body-frame encode for one request/response."""
 
-    def __init__(self) -> None: ...
+    def __init__(
+        self,
+        *,
+        max_headers: int | None = ...,
+        ignore_invalid_headers: bool = ...,
+        title_case_headers: bool = ...,
+        date_header: bool = ...,
+    ) -> None:
+        """Server-role options (hyper `server::conn::http1::Builder`): `max_headers`
+        (None = hyper's 100), `ignore_invalid_headers`, `title_case_headers`,
+        `date_header` (`auto_date_header`). Client-role calls ignore them."""
+
     def serialize_request(
         self,
         method: str,

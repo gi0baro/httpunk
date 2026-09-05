@@ -320,6 +320,25 @@ async with server:
         await request.respond(200, body=b"ok")
 ```
 
+To configure per-protocol options, use `auto.Builder` (hyper-util's `auto::Builder`): `http1()` /
+`http2()` return sub-builders whose setters chain, `http1_only()` / `http2_only()` force a protocol,
+and `serve_connection(transport, cancel=None)` sniffs and builds. `serve()` is the default-options
+shortcut over it.
+
+```python
+builder = auto.Builder(backend=Backend.asyncio)
+builder.http1().header_read_timeout(5.0).http2().max_concurrent_streams(200)
+server = await builder.serve_connection(transport)
+```
+
+The option set mirrors hyper's server builders, with hyper's defaults. HTTP/1
+(`http1::Builder`): `header_read_timeout`, `keep_alive`, `max_headers`, `max_buf_size`,
+`auto_date_header`, `title_case_headers`, `ignore_invalid_headers`. HTTP/2 (`http2::Builder`):
+`max_concurrent_streams`, `initial_stream_window_size`, `initial_connection_window_size`,
+`max_frame_size`, `max_header_list_size`, `max_pending_accept_reset_streams`,
+`max_local_error_reset_streams`, `auto_date_header`, plus h2's `data_frame_budget`. The same
+keywords are accepted by `H1Server(...)` / `H2Server(...)` directly.
+
 #### Connection pools
 
 `httpunk.util.pool` provides three composable pools. A *connector* is an async callable

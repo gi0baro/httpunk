@@ -234,19 +234,27 @@ pub fn parse_response(
 
 /// Parse a request head from `buf` (server side; hyper role.rs `Server::parse`
 /// L137). `Ok(None)` = need more bytes; on `Ok(Some(_))` the head is consumed
-/// (leftover = the request body bytes).
-pub fn parse_request(buf: &mut BytesMut) -> Result<Option<ParsedRequest>, String> {
+/// (leftover = the request body bytes). `max_headers` / `ignore_invalid_headers`
+/// are hyper's `http1::Builder::max_headers` (None = hyper's default of 100) and
+/// `ignore_invalid_headers` (httparse `ignore_invalid_headers_in_requests`).
+pub fn parse_request(
+    buf: &mut BytesMut,
+    max_headers: Option<usize>,
+    ignore_invalid_headers: bool,
+) -> Result<Option<ParsedRequest>, String> {
     if buf.is_empty() {
         return Ok(None);
     }
     let mut cached_headers: Option<HeaderMap> = None;
     let mut method: Option<Method> = None;
     let mut on_informational = None;
+    let mut parser_config = httparse::ParserConfig::default();
+    parser_config.ignore_invalid_headers_in_requests(ignore_invalid_headers);
     let ctx = ParseContext {
         cached_headers: &mut cached_headers,
         req_method: &mut method,
-        h1_parser_config: httparse::ParserConfig::default(),
-        h1_max_headers: None,
+        h1_parser_config: parser_config,
+        h1_max_headers: max_headers,
         preserve_header_case: false,
         h09_responses: false,
         on_informational: &mut on_informational,
@@ -277,8 +285,9 @@ pub fn parse_request(buf: &mut BytesMut) -> Result<Option<ParsedRequest>, String
 /// uses it). `keep_alive` decides whether `Connection: close` is written.
 /// `http10` sets the response version to HTTP/1.0 (status line + no-chunked
 /// gating — an unknown-length 1.0 body is close-delimited, role.rs L907-910); the
-/// driver derives it from the request. The `Date` header is written like hyper's
-/// server (common/date.rs).
+/// driver derives it from the request. `date_header` writes the `Date` header like
+/// hyper's server (common/date.rs; `http1::Builder::auto_date_header`, default on);
+/// `title_case_headers` is `http1::Builder::title_case_headers`.
 pub fn encode_response(
     status: u16,
     headers: HeaderMap,
@@ -286,6 +295,8 @@ pub fn encode_response(
     req_method: Option<Method>,
     keep_alive: bool,
     http10: bool,
+    title_case_headers: bool,
+    date_header: bool,
 ) -> Result<(Vec<u8>, BodyEncoder), String> {
     let status = StatusCode::from_u16(status).map_err(|e| format!("{e}"))?;
     let mut head = MessageHead {
@@ -309,12 +320,34 @@ pub fn encode_response(
         body: body_len,
         keep_alive,
         req_method: &mut req_method,
-        title_case_headers: false,
-        date_header: true,
+        title_case_headers,
+        date_header,
     };
+    // Refresh the per-thread `Date` cache HERE, not only at request parse. hyper refreshes
+    // it in `Server::parse` (role.rs L506) and `Server::encode` merely copies it (L976),
+    // which is fresh when parse and encode of one exchange run on the same thread. Under
+    // a work-stealing runtime (tonio) the head is parsed on one OS thread and the
+    // response encoded on another whose cache was last refreshed by ITS last parse —
+    // arbitrarily long ago on a quiet server. `update()` is one clock read (the same
+    // cost hyper pays per parse), so pay it per response and never emit a stale Date.
+    // Runtime-forced divergence from upstream; the h2 path (`date_header_value`) does the same.
+    if date_header {
+        crate::common::date::update();
+    }
     let mut dst = Vec::new();
     let encoder = Server::encode(enc, &mut dst).map_err(|e| format!("{e}"))?;
     Ok((dst, BodyEncoder(encoder)))
+}
+
+/// The current `Date` header value, from hyper's per-thread once-a-second cache
+/// (common/date.rs `update` + `extend`) — so the h2 server's `Date` (hyper
+/// proto/h2/server.rs L484 `or_insert_with(date::update_and_header_value)`) is the
+/// same bytes the h1 encoder writes.
+pub fn date_header_value() -> Vec<u8> {
+    crate::common::date::update();
+    let mut out = Vec::with_capacity(crate::common::date::DATE_VALUE_LENGTH);
+    crate::common::date::extend(&mut out);
+    out
 }
 
 /// A synchronous `MemRead` over an in-memory buffer, so the vendored `Decoder`

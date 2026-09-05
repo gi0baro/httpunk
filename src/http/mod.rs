@@ -280,7 +280,16 @@ impl HeaderMap {
 }
 
 /// Register the `http`-crate wrappers on the extension module.
+/// The current `Date` header value (RFC 9110 IMF-fixdate), from hyper's cached
+/// per-second clock — the same bytes the h1 response encoder writes, for the h2
+/// server's `Date` (hyper proto/h2/server.rs L484).
+#[pyfunction]
+fn http_date(py: Python<'_>) -> Py<PyBytes> {
+    PyBytes::new(py, &vendor_hyper::date_header_value()).unbind()
+}
+
 pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<HeaderMap>()?;
+    m.add_function(wrap_pyfunction!(http_date, m)?)?;
     Ok(())
 }
