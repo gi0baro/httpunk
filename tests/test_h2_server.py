@@ -8,20 +8,21 @@ import contextlib
 
 import pytest
 from _client import open_h2
-from tonio.colored import Event, scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import H2Reason, Version
 from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2Codec,
+    H2FrameData as Data,
     H2FrameGoAway as GoAway,
     H2FrameHeaders as Headers,
     H2FrameRstStream as RstStream,
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
 )
-from httpunk.exceptions import StreamResetError
+from httpunk.exceptions import ConnectionClosedError, StreamResetError
 from httpunk.h2 import H2Server
 from httpunk.h2.connection import PREFACE
 from httpunk.http import HeaderMap
@@ -609,6 +610,152 @@ async def test_server_respond_with_trailers():
             assert await resp.read() == b"recovered"
         s.cancel()
     assert len(rejected) == 1
+
+
+# ----- post-END_STREAM reset observation (FR-1; h2 `poll_reset` / `ensure_reason`) -----
+
+
+@pytest.mark.tonio
+async def test_server_reset_received_after_end_stream_then_respond_fails_with_reason():
+    """A RST_STREAM arriving after the request's END_STREAM (a GET the client cancels)
+    is observable via `reset_received()` with the peer's reason, and a later `respond()`
+    fails with that same reason — hyper's first `poll_reset` window (server.rs L458)."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server:
+                async for req in server:
+                    seen.append(await req.reset_received())
+                    try:
+                        await req.respond(200, body=b"too late")
+                    except StreamResetError as exc:
+                        seen.append(exc.error_code)
+                    done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            await transport.send_all(
+                codec.serialize_request_headers(1, "GET", "http://x/p", HeaderMap(), end_stream=True)
+            )
+            await transport.send_all(codec.serialize_rst_stream(1, int(H2Reason.CANCEL)))
+            await done.wait()
+            assert seen == [H2Reason.CANCEL, H2Reason.CANCEL]
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_chunk():
+    """hyper's second `poll_reset` window (`PipeToSendStream::poll`, proto/h2/mod.rs L148):
+    a reset arriving while the response body is parked on the app's NEXT chunk fails
+    `respond()` at once with the peer's reason — the app is not left parked forever."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server:
+                async for req in server:
+
+                    async def body():
+                        yield b"first"
+                        await Event().wait()  # the app has nothing more to say (yet)
+
+                    try:
+                        await req.respond(200, body=body())
+                    except StreamResetError as exc:
+                        seen.append(exc.error_code)
+                    done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            await transport.send_all(
+                codec.serialize_request_headers(1, "GET", "http://x/p", HeaderMap(), end_stream=True)
+            )
+            assert await _read_frame(transport, codec, Headers) is not None
+            first = await _read_frame(transport, codec, Data)  # streamed chunks are NOT held back
+            assert first is not None and first.data == b"first" and not first.end_stream
+            await transport.send_all(codec.serialize_rst_stream(1, int(H2Reason.INTERNAL_ERROR)))
+            await done.wait()  # would hit the conftest deadline if the sender stayed parked
+            assert seen == [H2Reason.INTERNAL_ERROR]  # the PEER'S reason, not a synthesized CANCEL
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_send_stream_reports_peer_reset_reason():
+    """Through the push handle a post-END_STREAM reset surfaces on the next `send_data`
+    as `StreamResetError` carrying the peer's reason (h2 `ensure_reason`)."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server:
+                async for req in server:
+                    stream = await req.send_response(200)
+                    try:
+                        while True:
+                            await stream.send_data(b"tick")
+                            await sleep(0.005)
+                    except StreamResetError as exc:
+                        seen.append(exc.error_code)
+                    done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            await transport.send_all(
+                codec.serialize_request_headers(1, "GET", "http://x/p", HeaderMap(), end_stream=True)
+            )
+            assert await _read_frame(transport, codec, Data) is not None
+            await transport.send_all(codec.serialize_rst_stream(1, int(H2Reason.ENHANCE_YOUR_CALM)))
+            await done.wait()
+            assert seen == [H2Reason.ENHANCE_YOUR_CALM]
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_reset_received_raises_on_connection_loss():
+    """No reason to report when the connection dies under the request: `reset_received()`
+    raises the connection error instead (h2 `ensure_reason` -> `Err` for non-reset closures)."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        with contextlib.suppress(Exception):
+            async with H2Server(transport) as server:
+                async for req in server:
+                    try:
+                        seen.append(await req.reset_received())
+                    except ConnectionClosedError as exc:
+                        seen.append(type(exc))
+                    done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/p", HeaderMap(), end_stream=True))
+        assert await _read_frame(transport, codec, Settings) is not None  # the request was accepted
+        transport.close()  # client vanishes
+        await done.wait()
+        assert seen == [ConnectionClosedError]
+        s.cancel()
 
 
 @pytest.mark.tonio

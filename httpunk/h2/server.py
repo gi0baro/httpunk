@@ -38,6 +38,7 @@ from ..exceptions import (
     ConnectionClosedError,
     H2ProtocolError,
     H2Reason,
+    _reason,
     fresh_exc,
 )
 from ..http import HeaderMap
@@ -146,6 +147,23 @@ class ServerRequest:
         been sent. Only this stream is affected (h2 `SendResponse` drop / `send_reset`)."""
         reason = int(H2Reason.INTERNAL_ERROR) if error_code is None else int(error_code)
         return self._manager.reset_stream(self._stream, reason)
+
+    async def reset_received(self) -> H2Reason | int:
+        """Wait until the client abandons this request and return the reason of its
+        RST_STREAM (or of a GOAWAY that dropped the stream) — the coroutine form of h2
+        `SendResponse::poll_reset` / `SendStream::poll_reset` (state.rs `ensure_reason`).
+        Observable even after the request body's END_STREAM was received, which is the
+        common case (a GET, or a fully uploaded body): the body reader saw a complete
+        message, and only this tells the handler the client is gone. Never resolves for a
+        request that completes normally (hyper's `poll_reset` stays Pending), so a host
+        races it against its own completion (ASGI `http.disconnect`). If the connection
+        died with no reason (transport error / EOF) the connection error is raised."""
+        st = self._stream
+        await st.reset_evt.wait()
+        if st.reset_reason is not None:
+            return _reason(st.reset_reason)
+        err = st.error or self._manager._conn.error or ConnectionClosedError("connection closed")
+        raise fresh_exc(err) from err
 
     def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, path={self.path!r})"
@@ -384,7 +402,14 @@ class ServerStreamManager(StreamManager):
         # state transition = state.rs `send_open` (sending response HEADERS on the
         # recv-opened stream). With `end_stream` the response is complete here.
         if st.state.is_closed():
-            raise ConnectionClosedError("stream already closed")
+            # hyper's first `poll_reset` window (proto/h2/server.rs L458): the peer reset
+            # (or the connection died) while the handler was still computing -> the
+            # request is aborted with the peer's reason (`Error::new_h2(reason)`).
+            raise (
+                self._send_stopped_error(st)
+                if st.reset_evt.is_set()
+                else ConnectionClosedError("stream already closed")
+            )
         hdrs = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
         # hyper's h2 server inserts `Date` when the app didn't set one (proto/h2/server.rs
         # L484 `entry(DATE).or_insert_with(date::update_and_header_value)`), gated by

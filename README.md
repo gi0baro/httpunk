@@ -204,7 +204,11 @@ headers=None, body=None, trailers=None)` — `trailers` are sent after the body 
 chunked trailers, declared in a `Trailer` header; an HTTP/2 trailing HEADERS frame), like the
 client's `Request.trailers`. On HTTP/2 you can also abort a single stream with
 `request.reset()` instead of responding (e.g. when a handler fails) — the connection and its
-other streams keep running.
+other streams keep running — and `await request.reset_received()` resolves with the reason
+when the *client* abandons the request (`RST_STREAM`, even after it finished sending), the
+signal a long-running or streaming handler races against its own completion to stop early.
+A reset also fails an in-flight `respond()` / `send_data` with `StreamResetError` carrying the
+client's reason, including while the body is waiting on the app's next chunk.
 
 For push-style producers (an ASGI `send()` loop, a server-sent-events endpoint) use
 `request.send_response(status, *, headers=None, end_stream=False)`: it writes the head now and

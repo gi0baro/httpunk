@@ -26,7 +26,7 @@ import threading
 
 from .._common import aiter_body
 from .._httpunk import H2FlowControl
-from ..exceptions import H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError, fresh_exc
+from ..exceptions import GoAwayError, H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError, fresh_exc
 from .settings import PeerSettings
 
 
@@ -54,6 +54,20 @@ _MAX_RECV_EMPTY_DATA_FRAMES = 100  # h2 0.4.19 MAX_RECV_EMPTY_DATA_FRAMES (proto
 
 _INVALID_CONTENT_LENGTH = object()  # sentinel: content-length header failed to parse
 _UNSET = object()  # sentinel: no chunk buffered yet (send_body one-ahead lookahead)
+_END = object()  # sentinel: the async body is exhausted (`_iter_body_or_reset`)
+_RESET = object()  # sentinel: the stream's reset event won the race (`_iter_body_or_reset`)
+
+
+async def _next_chunk(it):
+    try:
+        return await it.__anext__()
+    except StopAsyncIteration:
+        return _END
+
+
+async def _await_reset(evt):
+    await evt.wait()
+    return _RESET
 
 
 def _is_informational(status):
@@ -212,8 +226,23 @@ class StreamManager:
         # bodyless request that still ends on a trailing HEADERS frame) — skip the
         # chunk loop then, since `aiter_body(None)` is not valid.
         pending = _UNSET
-        if body is not None:
-            async for chunk in aiter_body(body):
+        if body is not None and hasattr(body, "__aiter__"):
+            # A streaming body is sent chunk-by-chunk AS IT ARRIVES, never held back:
+            # hyper's `PipeToSendStream` sends each polled chunk with END_STREAM =
+            # `body.is_end_stream()`, which a streaming body only reports once exhausted
+            # (proto/h2/mod.rs), so the stream ends on an empty END_STREAM DATA frame (or
+            # the trailers). Holding one chunk back to spare that frame would delay every
+            # chunk until the next one exists — an SSE event would sit unsent until the
+            # following event — and a peer reset while parked on the app's next chunk is
+            # what `_iter_body_or_reset` fails fast on.
+            async for chunk in self._iter_body_or_reset(st, body):
+                await self._send_data(st, bytes(chunk), end_stream=False)
+            pending = b""
+        elif body is not None:
+            # `bytes` / a sync iterable can't park: hold one chunk back so END_STREAM rides
+            # the final DATA frame (hyper knows a `Full` body `is_end_stream` after its one
+            # chunk, and a sync iterable's next chunk is known immediately).
+            async for chunk in aiter_body(body):  # yields without suspending for these shapes
                 if pending is not _UNSET:
                     await self._send_data(st, pending, end_stream=False)
                 pending = bytes(chunk)
@@ -232,6 +261,28 @@ class StreamManager:
             await self._send_data(st, pending, end_stream=True)
         self._finish_send(st)
 
+    async def _iter_body_or_reset(self, st, body):
+        """An ASYNC body's chunks, failing fast on a peer reset. hyper's
+        `PipeToSendStream::poll` (proto/h2/mod.rs L148) polls `poll_reset` on EVERY
+        iteration while it waits for the body's next chunk, so a peer that abandons the
+        stream fails the send at once — not after the app finally produces a chunk (an
+        SSE / long-poll body may park for minutes). Only an async body can park, so only
+        it pays the per-chunk race (`send_body` sends `bytes` / sync iterables directly).
+        The loser that gets cancelled is either an Event wait or the app's own `__anext__`
+        step — never one of our transport reads or writes (those happen outside the race)."""
+        it = body.__aiter__()
+        reset_evt = st.reset_evt
+        select = self._conn.backend.select
+        while True:
+            if reset_evt.is_set():
+                raise self._send_stopped_error(st)
+            result = await select(_next_chunk(it), _await_reset(reset_evt))
+            if result is _RESET:
+                raise self._send_stopped_error(st)
+            if result is _END:
+                return
+            yield result
+
     def _finish_send(self, st):
         """Close the send half after the END_STREAM frame went out (final DATA or
         trailers). h2 send.rs closes the send half only while it is still streaming. A
@@ -249,8 +300,14 @@ class StreamManager:
     def _send_stopped_error(self, st):
         """The error to raise when the send half stopped streaming underneath a
         sender (peer reset / connection failure), mirroring h2 `send_data`'s
-        Inactive/UnexpectedFrameType errors."""
-        return st.error or self._conn.error or StreamResetError(st.id, int(H2Reason.CANCEL))
+        Inactive/UnexpectedFrameType errors. A peer reset reports the PEER'S reason
+        (`reset_reason`, set for post-END_STREAM resets too — h2 `ensure_reason`), not a
+        synthesized CANCEL; CANCEL is only the last resort for a closure with no reason."""
+        if st.error is not None:
+            return st.error
+        if st.reset_reason is not None:
+            return StreamResetError(st.id, st.reset_reason)
+        return self._conn.error or StreamResetError(st.id, int(H2Reason.CANCEL))
 
     @staticmethod
     def check_send_headers(fields):
@@ -325,7 +382,7 @@ class StreamManager:
             if self._conn.error is not None:
                 raise fresh_exc(self._conn.error) from self._conn.error
             if st.state.is_closed():
-                raise StreamResetError(st.id, int(H2Reason.CANCEL))
+                raise self._send_stopped_error(st)
             with self._send_window_lock:
                 window = self._send_window(st)
                 if window > 0:
@@ -987,6 +1044,14 @@ class StreamManager:
             st.error = StreamResetError(frame.stream_id, frame.error_code)
             st.headers_evt.set()  # unblock a caller still awaiting the response head
             st.body_send.send(None)  # unblock the response-body reader (it re-raises st.error)
+        # The SEND side observes every reset, post-END_STREAM included (h2 `ensure_reason`
+        # returns the reason for `Closed(ErrorAfterEndStream(Reset))` too, state.rs L465).
+        # hyper consumes it in two windows: while the handler is still computing
+        # (`H2Stream::poll2` -> `poll_reset`, proto/h2/server.rs L458) and while it waits
+        # for the body's next chunk (`PipeToSendStream::poll`, proto/h2/mod.rs L148) —
+        # see `send_body` / `send_response_head` / `ServerRequest.reset_received`.
+        st.reset_reason = frame.error_code
+        st.reset_evt.set()
         st.window_evt.set()  # wake a request-body sender parked on flow control (state is now Closed)
         # Reclaim the connection window consumed by this stream's unread data
         # (h2 recv.rs `release_closed_capacity` on `transition_after`). All sync —
@@ -1033,6 +1098,12 @@ class StreamManager:
         st.headers_evt.set()
         st.body_send.send(None)
         st.window_evt.set()  # unblock a sender parked on flow control (it re-checks st.error)
+        # Send-side observation (h2 `ensure_reason`): a GOAWAY that dropped this stream
+        # yields its reason (`Closed(Error::GoAway(.., reason, ..))`, state.rs L466); any
+        # other connection failure has no reason — `reset_received` raises the error.
+        if isinstance(exc, GoAwayError):
+            st.reset_reason = int(exc.error_code)
+        st.reset_evt.set()
         if self._streams.pop(st.id, None) is not None:
             self._release_slot(st)
             self._on_stream_gone()  # no-op during `fail_all` (`_conn.error` already set)

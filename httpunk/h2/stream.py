@@ -36,6 +36,15 @@ class Stream:
         self.window_evt = backend.event()  # send window grew
         self.body_send, self.body_recv = backend.queue()
         self.error = None
+        # The peer abandoned the stream (RST_STREAM, or a GOAWAY that dropped it), or the
+        # connection died — observable by the SEND side independently of `error`, which
+        # the body READER checks and which stays unset once END_STREAM was received
+        # (the received message stood). h2 state.rs `ensure_reason` behind
+        # `SendResponse::poll_reset` / `SendStream::poll_reset`: `reset_reason` is the
+        # RST_STREAM / GOAWAY reason (int) when there is one, None for other closures
+        # (a connection error — `error` / the connection's error carries it).
+        self.reset_evt = backend.event()
+        self.reset_reason = None
         self.holds_slot = False  # whether this stream holds a MAX_CONCURRENT permit
         # Bytes received but not yet released to the peer (via WINDOW_UPDATE);
         # reclaimed at connection level if the stream is cancelled/reset/closed
