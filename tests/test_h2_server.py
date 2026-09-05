@@ -11,7 +11,7 @@ from _client import open_h2
 from tonio.colored import Event, scope
 from tonio.colored.net import open_tcp_listeners
 
-from httpunk import H2Reason
+from httpunk import H2Reason, Version
 from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2Codec,
@@ -167,6 +167,7 @@ async def test_server_request_headers():
             async for req in server:
                 seen["authority"] = req.authority
                 seen["scheme"] = req.scheme
+                seen["version"] = req.version
                 seen["x-custom"] = req.headers.get("x-custom")
                 await req.respond(204)
 
@@ -177,6 +178,7 @@ async def test_server_request_headers():
             assert resp.status == 204
             assert await resp.read() == b""
         s.cancel()
+    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1676)
 
     assert seen["scheme"] == "http"
     assert seen["authority"] == f"{host}:{port}"

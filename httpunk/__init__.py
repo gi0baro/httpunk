@@ -16,4 +16,4 @@ from .exceptions import (
 from .h1 import H1Connection as H1Connection, H1Server as H1Server
 from .h2 import H2Connection as H2Connection, H2Server as H2Server
 from .http import HeaderMap as HeaderMap
-from .types import Request as Request, Response as Response
+from .types import Request as Request, Response as Response, Version as Version

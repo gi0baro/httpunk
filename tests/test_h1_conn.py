@@ -7,7 +7,7 @@ from _client import open_h1
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
-from httpunk import HTTPunkError
+from httpunk import HTTPunkError, Version
 
 
 async def _read_request(stream):
@@ -69,6 +69,7 @@ async def test_get_content_length():
             # client::conn::http1; it is not auto-added).
             r = await conn.request("GET", "/thing", headers={"host": f"{host}:{port}"})
             assert r.status == 200
+            assert r.version is Version.HTTP_11  # a 1.1 peer
             assert r.headers["content-type"] == b"text/plain"
             assert await r.read() == b"hello"
         await done.wait()
@@ -442,7 +443,9 @@ async def test_http10_keepalive_peer_downgrades_next_request():
     async with scope() as s:
         s.spawn(_serve(listener, [r10, r10], requests, done))
         async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
+            resp = await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})
+            assert resp.version is Version.HTTP_10  # the peer's version is public (hyper `Response::version()`)
+            assert await resp.read() == b"ok"
             assert await (await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})).read() == b"ok"
         await done.wait()
         s.cancel()

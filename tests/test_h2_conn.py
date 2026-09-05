@@ -8,6 +8,7 @@ from _client import open_h2
 from tonio.colored import scope
 from tonio.colored.net import open_tcp_listeners
 
+from httpunk import Version
 from httpunk._httpunk import (
     H2Codec,
     H2FrameData as Data,
@@ -85,5 +86,6 @@ async def test_h2c_get_loopback():
         s.cancel()
 
     assert resp.status == 200
+    assert resp.version is Version.HTTP_2  # h2 stamps HTTP_2 on every response (hyper `Response::version`)
     assert body == b"hello h2"
     assert resp.headers["content-type"] == b"text/plain"

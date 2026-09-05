@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
 from ..exceptions import ConnectionClosedError, H2ProtocolError, H2Reason, fresh_exc
-from ..types import Response
+from ..types import Response, Version
 from .connection import PREFACE, H2ConnectionBase
 from .settings import LocalSettings, Settings
 from .share import H2ResponseBody
@@ -448,7 +448,10 @@ class H2Connection(BaseClientConnection):
             if src is not None:
                 raise fresh_exc(src) from src
             raise ConnectionClosedError("connection closed before response")
-        return Response(stream.status, stream.headers, H2ResponseBody(stream, self._conn.streams))
+        # h2 stamps every response `Version::HTTP_2` (h2 client.rs L1722).
+        return Response(
+            stream.status, stream.headers, H2ResponseBody(stream, self._conn.streams), version=Version.HTTP_2
+        )
 
     def _resolve(self, target):
         # An absolute URL passes through; a bare path is resolved against the

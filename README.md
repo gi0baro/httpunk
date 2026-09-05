@@ -147,6 +147,7 @@ async for chunk in resp.aiter_bytes():
     ...
 
 resp.trailers                     # a HeaderMap of trailing headers, or None
+resp.version                      # httpunk.Version.HTTP_2 / HTTP_11 / HTTP_10 (≈ http::Version)
 ```
 
 A response can be used as an async context manager to guarantee release (cancelling the body

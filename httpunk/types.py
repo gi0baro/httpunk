@@ -10,6 +10,7 @@ Cross-reference: the `http` crate's `Request` / `Response` / `HeaderMap`.
 
 from __future__ import annotations
 
+import enum
 from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,20 @@ if TYPE_CHECKING:
 # Public annotation aliases, reused across the client/server facades.
 HeadersInput = HeaderMap | Mapping[str, str] | Iterable[tuple[str, str]] | None
 Body = bytes | Iterable[bytes] | AsyncIterator[bytes] | None
+
+
+class Version(enum.Enum):
+    """The HTTP version a message was received in (≈ `http::Version`, same member
+    names). Every message carries one: h2 stamps `HTTP_2` on requests and responses
+    (h2 server.rs L1676 / client.rs L1722), the h1 parser sets `HTTP_10` / `HTTP_11`
+    (hyper role.rs L191-195)."""
+
+    HTTP_10 = "HTTP/1.0"
+    HTTP_11 = "HTTP/1.1"
+    HTTP_2 = "HTTP/2"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class Request:
@@ -74,9 +89,10 @@ class Response:
     reset). Use as an async context manager to guarantee release.
     """
 
-    def __init__(self, status: int, headers: HeaderMap, body: Any) -> None:
+    def __init__(self, status: int, headers: HeaderMap, body: Any, *, version: Version = Version.HTTP_11) -> None:
         self.status = status
         self.headers = headers  # httpunk.http.HeaderMap
+        self.version = version  # hyper `Response::version()`; default = `http::Response::default()`'s HTTP_11
         self._body = body
 
     @property

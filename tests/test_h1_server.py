@@ -9,6 +9,7 @@ from _client import open_h1
 from tonio.colored import scope
 from tonio.colored.net import open_tcp_listeners
 
+from httpunk import Version
 from httpunk._backend.asyncio import AsyncioBackend
 from httpunk._backend.tonio import TonioBackend
 from httpunk.exceptions import ConnectionClosedError
@@ -279,6 +280,34 @@ async def test_server_http10_response_version_and_close():
             data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
             assert data.startswith(b"HTTP/1.0 200")
             assert b"GET /old -> " in data
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_request_exposes_http_version():
+    """`ServerRequest.version` is public — the request's version is part of the message
+    (hyper `Request::version()`): HTTP_10 for an HTTP/1.0 request, HTTP_11 for 1.1."""
+    listener, host, port = await _listener()
+    seen = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                seen.append((req.target, req.version))
+                await req.respond(200, body=b"ok")
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET /eleven HTTP/1.1\r\nhost: x\r\n\r\nGET /ten HTTP/1.0\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)  # the 1.0 request (no keep-alive) ends the connection
+            assert data.startswith(b"HTTP/1.1 200")
+            assert b"HTTP/1.0 200" in data
+            assert seen == [("/eleven", Version.HTTP_11), ("/ten", Version.HTTP_10)]
         finally:
             transport.close()
             s.cancel()

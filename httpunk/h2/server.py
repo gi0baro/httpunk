@@ -40,6 +40,7 @@ from ..exceptions import (
     fresh_exc,
 )
 from ..http import HeaderMap
+from ..types import Version
 from .connection import PREFACE, H2ConnectionBase
 from .settings import LocalSettings, Settings
 from .stream import Stream
@@ -76,6 +77,7 @@ class ServerRequest:
     path: str | None  # the :path pseudo-header
     target: str | None  # alias of path, symmetric with the client's Request.target
     headers: HeaderMap
+    version: Version  # always HTTP_2 (h2 stamps it on every request, server.rs L1676)
 
     def __init__(self, stream, manager, *, method, scheme, authority, path, headers):
         self.method = method  # str, e.g. "GET"
@@ -84,6 +86,7 @@ class ServerRequest:
         self.path = path  # str | None (the :path pseudo-header)
         self.target = path  # alias, symmetric with the client's Request.target
         self.headers = headers  # httpunk.http.HeaderMap
+        self.version = Version.HTTP_2
         self._stream = stream
         self._manager = manager
 

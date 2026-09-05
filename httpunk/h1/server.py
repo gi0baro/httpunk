@@ -34,6 +34,7 @@ from .._common import BaseServer, read_all
 from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import ConnectionClosedError
 from ..http import HeaderMap
+from ..types import Version
 from .connection import H1ConnectionBase
 from .share import H1Upgraded
 
@@ -93,6 +94,7 @@ class ServerRequest:
     trailers: HeaderMap | None  # chunked trailers, populated once the body is read
     keep_alive: bool
     is_upgrade: bool
+    version: Version  # HTTP_10 or HTTP_11 (hyper `Request::version()`)
     content_length: int | None  # declared request Content-Length (None if chunked)
     upgraded: H1Upgraded | None  # the raw tunnel once a CONNECT/Upgrade is answered
 
@@ -114,6 +116,7 @@ class ServerRequest:
         self.target = target  # str — the request-target (origin/absolute/authority form)
         self.path = target  # alias
         self.headers = headers  # httpunk.http.HeaderMap
+        self.version = Version.HTTP_10 if http10 else Version.HTTP_11  # hyper `Request::version()`
         self.trailers = None  # chunked trailers, populated once the body is read
         self.keep_alive = keep_alive
         self.is_upgrade = is_upgrade
@@ -123,7 +126,7 @@ class ServerRequest:
         self.upgraded = None
         self._conn = conn
         self._decoder = decoder
-        self._http10 = http10
+        self._http10 = http10  # the driver's 1.0-specific negotiation keys off the codec flag
         self._expect_continue = expect_continue
         self._continue_sent = False
         self._body_done = decoder.is_complete

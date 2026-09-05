@@ -20,7 +20,7 @@ from .._common import BaseClientConnection
 from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import ConnectionClosedError, fresh_exc
 from ..http import HeaderMap
-from ..types import Response
+from ..types import Response, Version
 from .connection import H1ConnectionBase
 from .share import H1ResponseBody, H1Upgraded
 
@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 # hyper's `DEFAULT_MAX_BUFFER_SIZE` (io.rs: 8192 + 4096*100), the same cap the
 # server role applies to request heads (`h1/server.py` `_MAX_HEAD_SIZE`).
 _MAX_HEAD_SIZE = 8192 + 4096 * 100
+
+
+def _version_of(head):
+    """The parsed head's version as the public `Version` (hyper role.rs L191-195)."""
+    return Version.HTTP_10 if head.http10 else Version.HTTP_11
 
 
 class Connection(H1ConnectionBase):
@@ -402,7 +407,7 @@ class Connection(H1ConnectionBase):
                 self._busy = False
                 self._slot.release()
                 body = H1ResponseBody(self, None, keep_alive=False, upgraded=upgraded)
-                return Response(resp_head.status, resp_head.headers, body)
+                return Response(resp_head.status, resp_head.headers, body, version=_version_of(resp_head))
             decoder = H1BodyDecoder(resp_head.body_kind, resp_head.content_length or 0)
             decoder.feed(codec.take_body())  # body bytes already read alongside the head
             # The response's own keep-alive contribution; `release_slot` ANDs it with
@@ -416,7 +421,7 @@ class Connection(H1ConnectionBase):
             body = H1ResponseBody(self, decoder, keep_alive=resp_keep_alive)
             if body._needs_eager_finish:
                 await body._finish()
-            return Response(resp_head.status, resp_head.headers, body)
+            return Response(resp_head.status, resp_head.headers, body, version=_version_of(resp_head))
         except BaseException as exc:
             self._fail(exc)  # sync poison BEFORE the teardown suspension (see release_slot)
             try:
