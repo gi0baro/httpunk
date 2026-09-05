@@ -230,11 +230,15 @@ class StreamManager:
             await self._send_data(st, b"", end_stream=True)
         else:
             await self._send_data(st, pending, end_stream=True)
-        # h2 send.rs closes the send half only while it is still streaming. A peer
-        # RST_STREAM (or connection failure) landing between our final DATA and
-        # here transitions the state to Closed, and the vendored `send_close()`
-        # PANICS on a non-streaming state — with PyO3 `panic = "abort"` that aborts
-        # the whole process. If the stream died under us, surface the reset instead.
+        self._finish_send(st)
+
+    def _finish_send(self, st):
+        """Close the send half after the END_STREAM frame went out (final DATA or
+        trailers). h2 send.rs closes the send half only while it is still streaming. A
+        peer RST_STREAM (or connection failure) landing between our final frame and here
+        transitions the state to Closed, and the vendored `send_close()` PANICS on a
+        non-streaming state — with PyO3 `panic = "abort"` that aborts the whole process.
+        If the stream died under us, surface the reset instead."""
         if st.state.is_send_streaming():
             st.state.send_close()
             self._close_stream(st)  # may already be recv-closed (fully done)

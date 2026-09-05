@@ -133,7 +133,11 @@ class ServerRequest:
         self._expect_continue = expect_continue
         self._continue_sent = False
         self._body_done = decoder.is_complete
-        self._responded = False
+        self._responded = False  # the response head was sent (or the request detached)
+        self._response_done = False  # the response is complete: body ended, connection state settled
+        # Head-time decisions applied at completion (`ServerConnection._finish_response`).
+        self._keep_alive_decision = False
+        self._is_switch = False
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield request body chunks, pulling transport bytes on demand (decoded
@@ -172,12 +176,29 @@ class ServerRequest:
         return read_all(self.aiter_bytes())
 
     async def respond(self, status: int, *, headers: HeadersInput = None, body: Body = None) -> None:
-        """Send the response head (+ body). `body` is None, `bytes`, or a
-        (sync/async) iterable of `bytes`. hyper: `Server::encode`."""
+        """Send the whole response: head + body. `body` is None, `bytes`, or a
+        (sync/async) iterable of `bytes`. hyper: `Server::encode` + the dispatcher
+        polling the response `Body`. The pull convenience over `send_response`: same
+        head-time negotiation and completion, plus head+small-body write coalescing."""
         if self._responded:
             raise RuntimeError("response already sent for this request")
         self._responded = True
         await self._conn.send_response(self, status, headers, body)
+
+    async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
+        """Push-style response: send the head now and return a `SendStream` to write
+        the body with (`send_data` / `send_trailers` / `send_reset`). `end_stream=True`
+        = a bodyless response (hyper: a `Body` that `is_end_stream()` at encode time —
+        `content-length: 0` unless HEAD/204/304); `False` = a body of unknown length
+        follows (chunked on 1.1, close-delimited on 1.0), unless the headers carry a
+        `content-length`, which the encoder honours (hyper `set_length`'s
+        `existing_con_len`). hyper's h1 has no push API; this is the h1 twin of h2's
+        `SendResponse::send_response -> SendStream`, over the same codec calls
+        `respond()` makes, so the wire behaviour is hyper's either way."""
+        if self._responded:
+            raise RuntimeError("response already sent for this request")
+        self._responded = True
+        return await self._conn.send_response_head(self, status, headers, end_stream=end_stream)
 
     def detach(self) -> bytes:
         """Take over the raw connection for a protocol upgrade (WebSocket, or a custom protocol):
@@ -191,12 +212,82 @@ class ServerRequest:
         if self._responded:
             raise RuntimeError("cannot detach: a response was already sent for this request")
         self._responded = True
+        self._response_done = True
         leftover = self._decoder.take_buffered()
         self._conn._detach()
         return leftover
 
     def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, target={self.target!r})"
+
+
+class SendStream:
+    """The body half of a push-style h1 response (returned by
+    `ServerRequest.send_response`): the h1 twin of h2's `SendStream`, over the codec's
+    body-framing calls (`serialize_data` / `serialize_end` / `serialize_trailers`).
+    Every write is awaited for backpressure (`send_all`). One response at a time per
+    connection, so a `SendStream` is single-owner and not thread-safe."""
+
+    def __init__(self, conn, req, codec):
+        self._conn = conn
+        self._req = req
+        self._codec = codec
+        self._done = False
+
+    async def send_data(self, chunk: bytes, end_stream: bool = False) -> None:
+        """Write one body chunk; `end_stream=True` finishes the body (the chunked
+        terminator for a chunked body). On a bodyless framing (HEAD / 204 / 304 — the
+        encoder `body_is_eof`) chunks are DISCARDED, not an error: hyper never polls the
+        body then, so an app that produces one anyway (ASGI allows it) is harmless."""
+        self._check_open()
+        codec = self._codec
+        if codec.body_is_eof():
+            buf = codec.serialize_end() if end_stream else b""
+        else:
+            buf = codec.serialize_data(bytes(chunk))
+            if end_stream:
+                buf += codec.serialize_end()  # one write: last chunk + terminator (hyper flushes them together)
+        if end_stream:
+            self._done = True
+        if buf:
+            await self._write(buf)
+        if end_stream:
+            self._conn._finish_response(self._req)
+
+    async def send_trailers(self, trailers: HeadersInput) -> None:
+        """Finish a chunked body with a trailer block (hyper `Server::encode` allow-lists
+        the fields named in the response's `Trailer` header; others are dropped, and a
+        non-chunked body gets a bare terminator — `Encoder::encode_trailers`)."""
+        self._check_open()
+        hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
+        self._done = True
+        await self._write(self._codec.serialize_trailers(hdrs))
+        self._conn._finish_response(self._req)
+
+    async def send_reset(self, reason: int | None = None) -> None:
+        """Abort the response. HTTP/1 has no per-stream reset frame, so this is what
+        hyper does when a response `Body` errors mid-stream: the connection is closed
+        (`Writing::Closed`), and the client sees a truncated body. `reason` is accepted
+        for symmetry with h2's `SendStream.send_reset` and ignored."""
+        if self._done:
+            return
+        self._done = True
+        self._req._response_done = True
+        self._conn._reusable = False
+        self._conn._closed = True
+        self._conn._close_transport()
+
+    def _check_open(self):
+        if self._done:
+            raise RuntimeError("response body already complete")
+
+    async def _write(self, data):
+        try:
+            await self._conn.write(data)
+        except BaseException as exc:
+            self._done = True
+            self._req._response_done = True
+            self._conn._fail_response(exc)
 
 
 class ServerConnection(H1ConnectionBase):
@@ -287,11 +378,12 @@ class ServerConnection(H1ConnectionBase):
             return None
         leftover = b""
         if self._current is not None:
-            if not self._current._responded:
+            if not self._current._response_done:
                 # hyper serializes structurally (the dispatcher won't read the next
-                # head until the response is written, dispatch.rs L628-633). Surface
-                # the out-of-order use rather than mis-pairing responses.
-                raise RuntimeError("respond to the current request before reading the next")
+                # head until the response is fully written, dispatch.rs L628-633 /
+                # `try_keep_alive`). Surface the out-of-order use — no response, or a
+                # push-style body still open — rather than mis-pairing responses.
+                raise RuntimeError("respond to the current request (and finish its body) before reading the next")
             if not self._current._body_done and not self._drain_unread_body(self._current):
                 return None  # body not cheaply drainable — connection closed (see below)
             # Carry any pipelined bytes (the start of the next request, buffered
@@ -501,12 +593,73 @@ class ServerConnection(H1ConnectionBase):
         self._close_transport()
 
     async def send_response(self, req, status, headers, body):
+        """The pull path (`ServerRequest.respond`): head + whole body, with the
+        head+small-body write coalescing of `_send_head_and_body`. Shares head-time
+        negotiation (`_prepare_head`) and completion (`_finish_response`) with the push
+        path, so the two cannot drift; only the write batching differs."""
+        head, is_switch, keep_alive = self._prepare_head(req, status, headers, *self._body_framing(body))
+        req._keep_alive_decision = keep_alive
+        req._is_switch = is_switch
+        try:
+            await self._send_head_and_body(self._codec, head, body)
+        except BaseException as exc:
+            req._response_done = True
+            self._fail_response(exc)
+        self._finish_response(req)
+
+    async def send_response_head(self, req, status, headers, *, end_stream):
+        """The push path (`ServerRequest.send_response`): write the head now, return
+        the `SendStream`. `end_stream` maps onto hyper's two encode inputs the same way a
+        pull body does: True = no body (`_body_framing(None)`), False = a body of unknown
+        length (streamed -> chunked, or length if the headers carry `content-length`)."""
+        content_length, chunked = self._body_framing(None) if end_stream else (None, True)
+        head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
+        req._keep_alive_decision = keep_alive
+        req._is_switch = is_switch
+        stream = SendStream(self, req, self._codec)
+        if end_stream:
+            stream._done = True
+            # Same as `_send_head_and_body(body=None)`: the framing's (empty) terminator.
+            head += self._codec.serialize_end()
+        try:
+            await self.write(head)
+        except BaseException as exc:
+            req._response_done = True
+            self._fail_response(exc)
+        if end_stream:
+            self._finish_response(req)
+        return stream
+
+    def _fail_response(self, exc):
+        # A failed response write poisons the connection (hyper `Writing::Closed` -> close).
+        self._reusable = False
+        self._closed = True
+        self._close_transport()
+        raise ConnectionClosedError("failed to send response") from exc
+
+    def _finish_response(self, req):
+        """Completion, shared by both paths: the response is fully on the wire — apply
+        the head-time reuse decision (hyper `try_keep_alive` after `Writing::KeepAlive`),
+        or hand off the tunnel for a protocol switch."""
+        req._response_done = True
+        if req._is_switch:
+            # Hand the raw connection (plus any bytes already buffered past the
+            # request head — the start of the tunnel) to the caller and detach.
+            req.upgraded = H1Upgraded(self.transport, req._decoder.take_buffered())
+            self._detach()
+            return
+        self._reusable = req._keep_alive_decision
+        if not self._reusable:
+            self._closed = True
+            self._close_transport()
+
+    def _prepare_head(self, req, status, headers, content_length, chunked):
         # hyper: role.rs `Server::encode` (L364) writes the status line + headers
         # (incl. Date) + returns the body Encoder; the driver reimplements the
         # keep-alive/version negotiation hyper does in conn.rs
-        # (`enforce_version`/`fix_keep_alive`, L656-702) before that call.
+        # (`enforce_version`/`fix_keep_alive`, L656-702) before that call. Returns
+        # `(head_bytes, is_switch, keep_alive)`; the caller writes the head.
         hdrs = headers if headers is None or isinstance(headers, HeaderMap) else HeaderMap(headers)
-        content_length, chunked = self._body_framing(body)
         http10 = req._http10
         # A protocol switch turns the connection into a raw tunnel (Server::encode
         # L378-384 forces is_last): no reuse, and we hand the transport to the caller.
@@ -553,22 +706,10 @@ class ServerConnection(H1ConnectionBase):
                 content_length=content_length,
                 chunked=chunked,
             )
-            await self._send_head_and_body(self._codec, head, body)
         except BaseException as exc:
-            self._reusable = False
-            self._closed = True
-            self._close_transport()
-            raise ConnectionClosedError("failed to send response") from exc
-        if is_switch:
-            # Hand the raw connection (plus any bytes already buffered past the
-            # request head — the start of the tunnel) to the caller and detach.
-            req.upgraded = H1Upgraded(self.transport, req._decoder.take_buffered())
-            self._detach()
-            return
-        self._reusable = keep_alive
-        if not self._reusable:
-            self._closed = True
-            self._close_transport()
+            req._response_done = True
+            self._fail_response(exc)
+        return head, is_switch, keep_alive
 
     @staticmethod
     def _negotiate_connection_header(hdrs, keep_alive, http10, resp_close):

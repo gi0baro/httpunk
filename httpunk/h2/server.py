@@ -119,9 +119,21 @@ class ServerRequest:
         return read_all(self.aiter_bytes())
 
     def respond(self, status: int, *, headers: HeadersInput = None, body: Body = None) -> Awaitable[None]:
-        """Send the response: HEADERS (+ body, flow-control-gated). `body` is None,
-        `bytes`, or a (sync/async) iterable of `bytes`. h2: `SendResponse`."""
+        """Send the whole response: HEADERS (+ body, flow-control-gated). `body` is
+        None, `bytes`, or a (sync/async) iterable of `bytes`. The pull convenience over
+        `send_response` (h2: `SendResponse::send_response` + hyper's `PipeToSendStream`)."""
         return self._manager.send_response(self._stream, status, headers, body)
+
+    async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
+        """Push-style response: send HEADERS now and return a `SendStream` to write the
+        body with (`send_data` / `send_trailers` / `send_reset`). `end_stream=True` ends
+        the stream on the HEADERS frame (a bodyless response). h2:
+        `SendResponse::send_response(response, end_of_stream) -> SendStream`."""
+        await self._manager.send_response_head(self._stream, status, headers, end_stream=end_stream)
+        stream = SendStream(self._manager, self._stream)
+        if end_stream:
+            stream._done = True
+        return stream
 
     def reset(self, error_code: int | None = None) -> Awaitable[None]:
         """Abort this stream with RST_STREAM instead of a normal response — e.g. when a
@@ -132,6 +144,57 @@ class ServerRequest:
 
     def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, path={self.path!r})"
+
+
+class SendStream:
+    """The body half of a push-style response (returned by `ServerRequest.send_response`)
+    — h2 share.rs `SendStream`: `send_data(data, end_of_stream)`, `send_trailers`,
+    `send_reset`. Every DATA write is flow-control-gated (awaited for backpressure), and
+    END_STREAM rides the final frame the caller marks."""
+
+    def __init__(self, manager, stream):
+        self._manager = manager
+        self._stream = stream
+        self._done = False
+
+    async def send_data(self, chunk: bytes, end_stream: bool = False) -> None:
+        """Send one DATA frame's worth of body (split to the peer's max frame size and
+        gated on the send window); `end_stream=True` marks the last frame END_STREAM and
+        closes the send half (h2 `SendStream::send_data`). An empty chunk is sent as an
+        empty DATA frame, as h2 does."""
+        self._check_open()
+        if end_stream:
+            self._done = True
+        await self._manager._send_data(self._stream, bytes(chunk), end_stream)
+        if end_stream:
+            self._manager._finish_send(self._stream)
+            await self._manager._after_response(self._stream)
+
+    async def send_trailers(self, trailers: HeadersInput) -> None:
+        """End the stream with a trailing HEADERS frame (h2 `SendStream::send_trailers`);
+        connection-specific fields are rejected as for any HEADERS block (RFC 9113
+        §8.2.2, h2 `check_headers`)."""
+        self._check_open()
+        hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
+        self._manager.check_send_headers(hdrs)
+        self._done = True
+        await self._manager._send_trailers(self._stream, hdrs)
+        self._manager._finish_send(self._stream)
+        await self._manager._after_response(self._stream)
+
+    async def send_reset(self, reason: int | None = None) -> None:
+        """Abort the stream with RST_STREAM (h2 `SendStream::send_reset`); defaults to
+        CANCEL — "the stream is no longer needed" (RFC 9113 §7). A no-op once the
+        response is complete or the stream is already closed."""
+        if self._done:
+            return
+        self._done = True
+        code = int(H2Reason.CANCEL) if reason is None else int(reason)
+        await self._manager.reset_stream(self._stream, code)
+
+    def _check_open(self):
+        if self._done:
+            raise RuntimeError("response body already complete")
 
 
 class ServerStreamManager(StreamManager):
@@ -296,8 +359,18 @@ class ServerStreamManager(StreamManager):
     # ===== sending responses (h2 server.rs SendResponse::send_response) =====
 
     async def send_response(self, st, status, headers, body):
-        # h2: server.rs `SendResponse::send_response` (L1236); state transition =
-        # state.rs `send_open` (sending response HEADERS on the recv-opened stream).
+        """The pull path (`ServerRequest.respond`): HEADERS + the whole body. Built on the
+        push primitives — `send_response_head`, the inherited `send_body` (which ends on
+        `_finish_send`), `_after_response` — so the two paths cannot drift."""
+        await self.send_response_head(st, status, headers, end_stream=body is None)
+        if body is not None:
+            await self.send_body(st, body)  # END_STREAM on the final DATA, then `_finish_send`
+            await self._after_response(st)
+
+    async def send_response_head(self, st, status, headers, *, end_stream):
+        # h2: server.rs `SendResponse::send_response(response, end_of_stream)` (L1236);
+        # state transition = state.rs `send_open` (sending response HEADERS on the
+        # recv-opened stream). With `end_stream` the response is complete here.
         if st.state.is_closed():
             raise ConnectionClosedError("stream already closed")
         hdrs = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
@@ -311,15 +384,15 @@ class ServerStreamManager(StreamManager):
         # state transition, so a rejected call leaves the stream untouched and
         # still able to send a valid response.
         self.check_send_headers(hdrs)
-        end_stream = body is None
         st.state.send_open(eos=end_stream)  # send response HEADERS
         await self._conn.send_frame_or_fail(
             self._conn.codec.serialize_response_headers(st.id, status, hdrs, end_stream=end_stream)
         )
         if end_stream:
             self._close_stream(st)  # bodyless response — HEADERS closed the send half
-        else:
-            await self.send_body(st, body)  # inherited: END_STREAM on the final DATA, then close
+            await self._after_response(st)
+
+    async def _after_response(self, st):
         # h2 drops the request's RecvStream/SendStream once the response is sent.
         # If the app never consumed the request body, that drop (a) RST_STREAM(
         # NO_ERROR)s while the client is still sending so it stops — the nginx-compat

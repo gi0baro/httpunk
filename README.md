@@ -198,11 +198,29 @@ async with H1Server(transport, backend=Backend.asyncio) as server:
         await request.respond(200, headers={"content-type": "text/plain"}, body=body)
 ```
 
-Each `request` carries `method`, `target`/`path`, `headers`, and a streamable body
+Each `request` carries `method`, `target`/`path`, `headers`, `version`, and a streamable body
 (`request.read()` / `request.aiter_bytes()`). Answer it with `request.respond(status, *,
 headers=None, body=None)`. On HTTP/2 you can also abort a single stream with
 `request.reset()` instead of responding (e.g. when a handler fails) — the connection and its
 other streams keep running.
+
+For push-style producers (an ASGI `send()` loop, a server-sent-events endpoint) use
+`request.send_response(status, *, headers=None, end_stream=False)`: it writes the head now and
+returns a `SendStream` — h2's `SendResponse`/`SendStream` shape, identical on both protocols:
+
+```python
+stream = await request.send_response(200, headers={"content-type": "text/event-stream"})
+await stream.send_data(b"data: 1\n\n")            # each write awaits backpressure
+await stream.send_data(b"data: 2\n\n", end_stream=True)
+# stream.send_trailers({...}) ends the body with trailers; stream.send_reset() aborts it
+```
+
+`end_stream=True` on `send_response` is a bodyless response. Framing follows hyper: a
+`content-length` you set is honoured, otherwise the body is chunked (HTTP/1.1) or
+close-delimited (HTTP/1.0); on HEAD/204/304 body chunks are discarded, as hyper never polls
+that body. `send_reset` is `RST_STREAM(CANCEL)` on HTTP/2; HTTP/1 has no per-request reset, so
+there it closes the connection (what hyper does when a response body errors). `respond()` is
+the pull convenience built on the same path.
 
 HTTP/1 serves one request/response at a time (the loop won't yield the next until the current
 one is answered); HTTP/2 multiplexes, so for concurrent handling you would spawn a task per

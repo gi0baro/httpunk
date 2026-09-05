@@ -752,6 +752,179 @@ def test_response_date_is_refreshed_at_encode_time_per_thread():
     assert delta.total_seconds() >= 1
 
 
+# ----- push-style responses: `send_response` -> `SendStream` (FR-3) -----
+
+
+@pytest.mark.tonio
+async def test_server_push_response_streams_chunked_and_keeps_alive():
+    """`send_response` + `send_data` writes a chunked body (unknown length, 1.1) with the
+    same head negotiation as `respond()`: Date added, keep-alive kept, the connection
+    reused for the next request."""
+    listener, host, port = await _listener()
+    seen = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                seen.append(req.target)
+                stream = await req.send_response(200, headers={"content-type": "text/plain"})
+                await stream.send_data(b"one ")
+                await stream.send_data(b"two", end_stream=True)
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            for path in ("/a", "/b"):
+                r = await conn.request("GET", path, headers={"host": "x"})
+                assert r.status == 200
+                assert r.headers["transfer-encoding"] == b"chunked"
+                assert r.headers.get("date") is not None
+                assert await r.read() == b"one two"
+        s.cancel()
+    assert seen == ["/a", "/b"]  # both on the one (kept-alive) connection
+
+
+@pytest.mark.tonio
+async def test_server_push_content_length_frames_by_length_not_chunked():
+    """An app-supplied `content-length` on a push response frames the body by length
+    (hyper `set_length` -> `existing_con_len`), never chunked."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200, headers={"content-length": "8"})
+                await stream.send_data(b"abcd")
+                await stream.send_data(b"efgh", end_stream=True)
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            r = await conn.request("GET", "/", headers={"host": "x"})
+            assert r.headers.get("transfer-encoding") is None
+            assert r.headers["content-length"] == b"8"
+            assert await r.read() == b"abcdefgh"
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_push_bodyless_end_stream_and_head_discards_chunks():
+    """`send_response(..., end_stream=True)` is a bodyless response (then `send_data`
+    is a misuse). For HEAD the encoder is EOF: hyper never polls the body, so pushed
+    chunks are DISCARDED, and the app's `content-length` still goes on the wire."""
+    listener, host, port = await _listener()
+    misuse = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                if req.method == "HEAD":
+                    stream = await req.send_response(200, headers={"content-length": "5"})
+                    await stream.send_data(b"hello", end_stream=True)  # discarded on the wire
+                else:
+                    stream = await req.send_response(204, end_stream=True)
+                    try:
+                        await stream.send_data(b"nope")
+                    except RuntimeError as exc:
+                        misuse.append(str(exc))
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"HEAD /x HTTP/1.1\r\nhost: x\r\n\r\nGET /y HTTP/1.1\r\nhost: x\r\n\r\n")
+            data = b""
+            while b"HTTP/1.1 204" not in data or not data.endswith(b"\r\n\r\n"):  # both heads, the 204 complete
+                chunk = await transport.receive_some(65536)
+                assert chunk, "server closed before both responses arrived"
+                data += chunk
+            head_resp, _, rest = data.partition(b"HTTP/1.1 204")
+            assert head_resp.startswith(b"HTTP/1.1 200")
+            assert b"\r\ncontent-length: 5\r\n" in head_resp
+            assert b"hello" not in head_resp  # no body bytes for HEAD
+            assert head_resp.endswith(b"\r\n\r\n")  # the 204 followed the HEAD head directly
+        finally:
+            transport.close()
+            s.cancel()
+    assert misuse == ["response body already complete"]
+
+
+@pytest.mark.tonio
+async def test_server_push_send_reset_truncates_body_and_closes():
+    """h1 has no reset frame: `send_reset` closes the connection mid-body (hyper's
+    behaviour when a response `Body` errors), so the client sees a truncated chunked
+    body — no `0\\r\\n\\r\\n` terminator."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200)
+                await stream.send_data(b"partial")
+                await stream.send_reset()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)  # returns only because the server closed
+            assert data.startswith(b"HTTP/1.1 200")
+            assert b"7\r\npartial\r\n" in data
+            assert not data.endswith(b"0\r\n\r\n")
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_push_http10_without_content_length_is_close_delimited():
+    """HTTP/1.0 + unknown length = close-delimited (hyper role.rs L907-910): raw body
+    bytes, no chunking, and the connection closes after the body."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200)
+                await stream.send_data(b"old ")
+                await stream.send_data(b"school", end_stream=True)
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET / HTTP/1.0\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)
+            assert data.startswith(b"HTTP/1.0 200")
+            assert b"chunked" not in data.lower()
+            assert data.endswith(b"\r\n\r\nold school")
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_next_request_refuses_while_push_body_is_open():
+    """hyper's dispatcher reads the next head only after the response is fully written;
+    reading it while a push body is still open is a misuse, not a mis-paired response."""
+    stub = _StubTransport(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    stream = await req.send_response(200)
+    with pytest.raises(RuntimeError, match="finish its body"):
+        await conn.next_request()
+    await stream.send_data(b"done", end_stream=True)
+    nxt = await conn.next_request()
+    assert nxt is not None and nxt.target == "/b"
+
+
 @pytest.mark.tonio
 async def test_h2_preface_closes_silently_without_response():
     """An h1 server that receives the HTTP/2 prior-knowledge preface closes silently

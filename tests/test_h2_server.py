@@ -21,6 +21,7 @@ from httpunk._httpunk import (
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
 )
+from httpunk.exceptions import StreamResetError
 from httpunk.h2 import H2Server
 from httpunk.h2.connection import PREFACE
 from httpunk.http import HeaderMap
@@ -475,6 +476,99 @@ async def test_server_response_date_header_option():
             resp = await conn.request("GET", "/")
             assert resp.headers.get("date") is None
             await resp.read()
+        s.cancel()
+
+
+# ----- push-style responses: `send_response` -> `SendStream` (h2 `SendResponse`/`SendStream`) -----
+
+
+@pytest.mark.tonio
+async def test_server_push_response_streams_data_frames():
+    """`send_response` + `send_data(..., end_stream=True)`: HEADERS (with Date) then DATA
+    frames, END_STREAM on the last; the connection keeps multiplexing afterwards."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H2Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200, headers={"x-path": req.path})
+                await stream.send_data(b"a" * 10)
+                await stream.send_data(b"b" * 5, end_stream=True)
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h2(host, port) as conn:
+            for path in ("/1", "/2"):
+                resp = await conn.request("GET", path)
+                assert resp.status == 200
+                assert resp.headers["x-path"] == path.encode()
+                assert resp.headers.get("date") is not None
+                assert await resp.read() == b"a" * 10 + b"b" * 5
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_push_bodyless_and_trailers():
+    """`end_stream=True` on `send_response` ends the stream on HEADERS (then `send_data`
+    is a misuse); `send_trailers` ends a body with a trailing HEADERS frame."""
+    listener, host, port = await _listener()
+    misuse = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H2Server(transport) as server:
+            async for req in server:
+                if req.path == "/empty":
+                    stream = await req.send_response(204, end_stream=True)
+                    try:
+                        await stream.send_data(b"nope")
+                    except RuntimeError as exc:
+                        misuse.append(str(exc))
+                else:
+                    stream = await req.send_response(200)
+                    await stream.send_data(b"payload")
+                    await stream.send_trailers({"x-checksum": "abc"})
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("GET", "/empty")
+            assert resp.status == 204
+            assert await resp.read() == b""
+            resp = await conn.request("GET", "/trailers")
+            assert await resp.read() == b"payload"
+            assert resp.trailers["x-checksum"] == b"abc"
+        s.cancel()
+    assert misuse == ["response body already complete"]
+
+
+@pytest.mark.tonio
+async def test_server_push_send_reset_cancels_stream():
+    """`send_reset()` mid-body is RST_STREAM(CANCEL) (h2 `SendStream::send_reset`): the
+    client's body read fails with that reason; the connection stays usable."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H2Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200)
+                if req.path == "/abort":
+                    await stream.send_data(b"partial")
+                    await stream.send_reset()
+                else:
+                    await stream.send_data(b"ok", end_stream=True)
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("GET", "/abort")
+            with pytest.raises(StreamResetError) as exc:
+                await resp.read()
+            assert exc.value.error_code == H2Reason.CANCEL
+            resp = await conn.request("GET", "/fine")  # same connection still serves
+            assert await resp.read() == b"ok"
         s.cancel()
 
 
