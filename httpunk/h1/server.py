@@ -214,9 +214,10 @@ class ServerRequest:
 
         Raises `ConnectionClosedError` if the client closed its side before or while the
         response is written (hyper: `IncompleteMessage`). With an async body that is
-        raised at once even while the body is parked on its next chunk; the producer is
-        then still parked inside its own await — close or wake whatever it awaits (a
-        channel, an event, an upstream body) and it is finished and closed for you."""
+        raised at once even while the body is parked on its next chunk: the producer is
+        cancelled at that await (hyper drops the body future) and has unwound — its
+        cleanup ran — before this raises. Cancelling the task awaiting `respond()`
+        cancels the producer the same way."""
         if self._responded:
             raise RuntimeError("response already sent for this request")
         self._responded = True
@@ -520,20 +521,30 @@ class ServerConnection(H1ConnectionBase):
         """Stream an ASYNC response body and fail fast on a client FIN. hyper polls the
         connection (so `mid_message_detect_eof`) while the body's next chunk is pending,
         so a parked producer (SSE, long poll) does not hold a dead exchange. Same shape as
-        the h2 manager's `_send_async_body`: ONE bare pump task per response writes inline;
-        this caller waits once for "pump done" or "peer closed". On the FIN it fails the
-        response at once (the pump exits at its next write — the transport is closed — and
-        closes the generator); a per-chunk `select` measured 4-5x slower."""
+        the h2 manager's `_send_async_body`: ONE pump task per response; this caller waits
+        once for "pump done" or "peer closed". On the FIN the pump is CANCELLED (hyper
+        drops the body future) at its suspension — the app's `await`, or, h1 having no
+        write pump, possibly inside a chunk write: harmless, this connection is closed
+        right below and a truncated body is what the client gets regardless (hyper:
+        `IncompleteMessage`, io dropped). Also cancelled if this task is cancelled or
+        unwinds: neither backend cancels scope children on a body exception, and joining
+        a parked pump would hang. (A per-chunk `select` measured 4-5x slower.)"""
         self._arm_watcher(req)  # the FIN is consumable now: make sure a read is parked
         done, box = self.backend.event(), []
-        handle = self.backend.spawn_without_results(self._pump_async_body(body, trailers, done, box))
-        winner = await self.backend.select(
-            event_result(done, PUMP_DONE), event_result(req._peer_closed_evt, PUMP_ABANDONED)
-        )
-        if winner is PUMP_ABANDONED and not done.is_set():
+        abandoned = False
+        async with self.backend.scope() as scope:
+            scope.spawn(self._pump_async_body(body, trailers, done, box))
+            try:
+                winner = await self.backend.select(
+                    event_result(done, PUMP_DONE), event_result(req._peer_closed_evt, PUMP_ABANDONED)
+                )
+                abandoned = winner is PUMP_ABANDONED and not done.is_set()
+            finally:
+                if not done.is_set():
+                    scope.cancel()  # leave with the pump gone, whatever ended the wait
+        if abandoned:
             req._response_done = True
-            self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))  # closes the transport; the pump then fails
-        await handle  # finished: join exactly once
+            self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))
         if box:
             req._response_done = True
             self._fail_response(box[0])

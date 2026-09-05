@@ -665,8 +665,11 @@ async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_ch
                 async for req in server:
 
                     async def body():
-                        yield b"first"
-                        await Event().wait()  # the app has nothing more to say (yet)
+                        try:
+                            yield b"first"
+                            await Event().wait()  # the app has nothing more to say (yet)
+                        finally:
+                            seen.append("producer unwound")  # hyper drops the body future: cleanup runs
 
                     try:
                         await req.respond(200, body=body())
@@ -686,7 +689,9 @@ async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_ch
             assert first is not None and first.data == b"first" and not first.end_stream
             await transport.send_all(codec.serialize_rst_stream(1, int(H2Reason.INTERNAL_ERROR)))
             await done.wait()  # would hit the conftest deadline if the sender stayed parked
-            assert seen == [H2Reason.INTERNAL_ERROR]  # the PEER'S reason, not a synthesized CANCEL
+            # The producer was cancelled at its await and unwound BEFORE respond() raised the
+            # PEER'S reason (not a synthesized CANCEL).
+            assert seen == ["producer unwound", H2Reason.INTERNAL_ERROR]
         finally:
             transport.close()
             s.cancel()

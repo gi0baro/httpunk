@@ -215,9 +215,9 @@ in-flight `respond()` / `send_data` fail with `ConnectionClosedError`, and the a
 `H1Server(half_close=True)` turns that off, as hyper's `half_close` does.
 
 When `respond()` fails this way while streaming an async body, the failure is raised at once
-even if the body is parked waiting for its next chunk. The producer itself is still inside its
-own `await` at that point: close or wake whatever it is waiting on (a channel, an event, an
-upstream body) from your error path, and httpunk finishes and closes the generator for you.
+even if the body is parked waiting for its next chunk: the producer is cancelled at that
+`await` (as hyper drops the body future), its `finally` blocks run, and only then does
+`respond()` raise. Cancelling the task that awaits `respond()` cancels the producer the same way.
 
 For push-style producers (an ASGI `send()` loop, a server-sent-events endpoint) use
 `request.send_response(status, *, headers=None, end_stream=False)`: it writes the head now and

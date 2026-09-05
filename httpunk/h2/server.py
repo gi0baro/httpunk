@@ -132,9 +132,10 @@ class ServerRequest:
 
         Raises `StreamResetError` with the client's reason if it reset the stream (also
         after its own END_STREAM, the cancelled-GET case). With an async body that is
-        raised at once even while the body is parked on its next chunk; the producer is
-        then still parked inside its own await — close or wake whatever it awaits (a
-        channel, an event, an upstream body) and it is finished and closed for you."""
+        raised at once even while the body is parked on its next chunk: the producer is
+        cancelled at that await (hyper drops the body future) and has unwound — its
+        cleanup ran — before this raises. Cancelling the task awaiting `respond()`
+        cancels the producer the same way."""
         return self._manager.send_response(self._stream, status, headers, body, trailers)
 
     async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:

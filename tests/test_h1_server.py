@@ -1066,8 +1066,11 @@ async def test_server_streamed_response_fails_fast_on_peer_close():
             async for req in server:
 
                 async def body():
-                    yield b"first"
-                    await Event().wait()  # nothing more to say (yet)
+                    try:
+                        yield b"first"
+                        await Event().wait()  # nothing more to say (yet)
+                    finally:
+                        seen.append("producer unwound")  # hyper drops the body future: cleanup runs
 
                 try:
                     await req.respond(200, body=body())
@@ -1084,7 +1087,7 @@ async def test_server_streamed_response_fails_fast_on_peer_close():
         transport.close()
         await done.wait()  # would hit the conftest deadline if the sender stayed parked
         s.cancel()
-    assert seen == ["failed"]
+    assert seen == ["producer unwound", "failed"]  # cancelled + unwound BEFORE respond() raised
 
 
 @pytest.mark.tonio

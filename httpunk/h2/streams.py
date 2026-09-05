@@ -243,26 +243,34 @@ class StreamManager:
         (proto/h2/mod.rs), which polls `poll_reset` while it waits for the body's next
         chunk, so a parked producer (SSE, long poll) does not hold the exchange.
 
-        The body is pumped by ONE bare task per response, iterating and writing inline
-        (`_pump_async_body`), while this caller waits once for "pump done" or "stream
-        reset". On a reset it raises with the peer's reason at once; the pump is left to
-        finish the app's parked step, fail at its next write (the stream is closed) and
-        close the generator. hyper drops the body future instead, but a parked coroutine
-        cannot be dropped — cancellation lands only at its next suspension, so this is the
-        same observable behaviour at zero per-chunk cost (a per-chunk `select` measured
-        4-5x slower). Chunks are sent AS THEY ARRIVE, never held back: a streaming `Body`
-        reports `is_end_stream()` only once exhausted, so hyper ends it on an empty
-        END_STREAM DATA frame (or the trailers); holding one back would delay every chunk
-        until the next one exists (an SSE event sitting unsent until the following one)."""
+        ONE pump task per response iterates the body and QUEUES each chunk
+        (`_pump_async_body`); this caller waits once for "pump done" or "stream reset". On
+        a reset the pump is CANCELLED — hyper dropping the body future. The CancelledError
+        lands at the pump's current suspension, which can only be the app's own `await`
+        inside its generator or the flow-control wait: DATA is queued for the write pump,
+        never written by this task (`enqueue_data`), so no write can be interrupted. The
+        producer unwinds at once, its cleanup runs, nothing is left parked; the scope exit
+        performs the cancel and waits for the unwind. (A per-chunk `select` measured 4-5x
+        slower; a bare, un-joined pump leaked a producer parked on a source the app never
+        woke.) The same cancel fires if THIS task is cancelled or unwinds — neither backend
+        cancels scope children on a body exception, and joining a parked pump would hang.
+        Chunks are sent AS THEY ARRIVE, never held back: a streaming `Body` reports
+        `is_end_stream()` only once exhausted, so hyper ends it on an empty END_STREAM DATA
+        frame (or the trailers); holding one back would delay every chunk until the next
+        one exists (an SSE event sitting unsent until the following one)."""
         backend = self._conn.backend
         done, box = backend.event(), []
-        handle = backend.spawn_without_results(self._pump_async_body(st, body, trailers, done, box))
-        winner = await backend.select(event_result(done, PUMP_DONE), event_result(st.reset_evt, PUMP_ABANDONED))
-        if winner is PUMP_ABANDONED and not done.is_set():
-            raise self._send_stopped_error(
-                st
-            )  # the pump exits at its next write; not joined (it may be parked in the app)
-        await handle  # finished: join exactly once
+        abandoned = False
+        async with backend.scope() as scope:
+            scope.spawn(self._pump_async_body(st, body, trailers, done, box))
+            try:
+                winner = await backend.select(event_result(done, PUMP_DONE), event_result(st.reset_evt, PUMP_ABANDONED))
+                abandoned = winner is PUMP_ABANDONED and not done.is_set()
+            finally:
+                if not done.is_set():
+                    scope.cancel()  # leave with the pump gone, whatever ended the wait
+        if abandoned:
+            raise self._send_stopped_error(st)
         if box:
             raise box[0]
         self._finish_send(st)
