@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable
 from typing import TYPE_CHECKING, Any
 
-from .._common import BaseServer, BodyInterruptedError, iter_async_body_or_event, read_all
+from .._common import PUMP_ABANDONED, PUMP_DONE, BaseServer, aclose_body, event_result, read_all
 from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import ConnectionClosedError
 from ..http import HeaderMap
@@ -145,7 +145,7 @@ class ServerRequest:
         # mid-message — set by the connection's mid-message watcher (hyper
         # `mid_message_detect_eof` -> `close_read` + `IncompleteMessage`).
         self._peer_closed = False
-        self._peer_closed_evt = conn.backend.event()
+        self._peer_closed_evt = None  # created by `_arm_watcher` — a plain exchange never needs it
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield request body chunks, pulling transport bytes on demand (decoded
@@ -179,9 +179,6 @@ class ServerRequest:
             raise
         self.trailers = self._decoder.take_trailers()
         self._body_done = True
-        # The request is now mid-message (body consumed, response not complete): hyper's
-        # `poll_read` falls through to `poll_read_keep_alive` -> `mid_message_detect_eof`.
-        self._conn._arm_watcher(self)
 
     def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())
@@ -198,6 +195,7 @@ class ServerRequest:
         with `IncompleteMessage` and the service future is dropped. httpunk cannot drop
         the app's coroutine, so the same observation is exposed instead; the in-flight
         `respond()` / `send_data` fail with `ConnectionClosedError` as hyper's would."""
+        self._conn._arm_watcher(self)  # the signal is being consumed: make sure a read is parked
         await self._peer_closed_evt.wait()
 
     async def respond(
@@ -212,7 +210,13 @@ class ServerRequest:
         client's `Request.trailers` (F45): the body is framed chunked regardless of its
         shape and the fields are declared in a `Trailer` header unless one is already
         set — hyper's encoder emits only declared fields (`Encoder::encode_trailers`).
-        On HTTP/1.0 (no chunked framing) they are dropped, as hyper does."""
+        On HTTP/1.0 (no chunked framing) they are dropped, as hyper does.
+
+        Raises `ConnectionClosedError` if the client closed its side before or while the
+        response is written (hyper: `IncompleteMessage`). With an async body that is
+        raised at once even while the body is parked on its next chunk; the producer is
+        then still parked inside its own await — close or wake whatever it awaits (a
+        channel, an event, an upstream body) and it is finished and closed for you."""
         if self._responded:
             raise RuntimeError("response already sent for this request")
         self._responded = True
@@ -420,17 +424,29 @@ class ServerConnection(H1ConnectionBase):
     # ===== mid-message watcher (hyper conn.rs `mid_message_detect_eof`) =====
 
     def _arm_watcher(self, req):
-        """Park ONE read for the mid-message window of `req` — SYNC (a bare spawn), called
-        the moment the request becomes mid-message: at accept for a bodyless request, or
-        when its body is consumed. Skipped when hyper would not read either (`half_close`;
-        bytes already buffered -> hyper's `read_buf` is non-empty and it returns Pending)
-        or when a task cannot stand in for hyper's poll: a request announcing an upgrade
-        (`Upgrade` / CONNECT) may be detached or switched, and a parked reader cannot be
-        handed to the caller (runtime-forced divergence, documented in `detach`)."""
+        """Park ONE read for the mid-message window of `req` — SYNC (a bare spawn). hyper
+        reads from the moment a request is mid-message (bodyless at accept, or once the
+        body is consumed); httpunk arms LAZILY, when the observation can be consumed: the
+        first `peer_closed()` await, a `respond()` that streams an async body, or a push
+        `send_response()`. Observably equivalent — hyper uses the EOF to drop the handler,
+        which httpunk cannot do; a `respond()` write to a half-closed socket succeeds
+        regardless; pipelined bytes are read before the next head either way; and an EOF
+        that already arrived is delivered at once by the late read — while a plain
+        `respond(bytes)` exchange pays no task at all (measured ~5% of h1 GET throughput).
+        Skipped when hyper would not read either (`half_close`; bytes already buffered ->
+        hyper's `read_buf` is non-empty and it returns Pending), when the body is not yet
+        consumed (hyper's `poll_read` serves the body first), and when a task cannot
+        stand in for hyper's poll: a request announcing an upgrade (`Upgrade` / CONNECT)
+        may be detached or switched, and a parked reader cannot be handed to the caller
+        (runtime-forced divergence, documented in `detach`)."""
+        if req._peer_closed_evt is None:
+            req._peer_closed_evt = self.backend.event()  # whoever arms (or awaits `peer_closed`) needs it
         if self._half_close or self._closed or self.transport is None or self._watcher_handle is not None:
             return
-        if req._response_done or req.is_upgrade or req.method == "CONNECT":
+        if not req._body_done or req._response_done or req.is_upgrade or req.method == "CONNECT":
             return
+        if self._stash:
+            return  # a probe already read the next request: hyper's `read_buf` is non-empty -> no read
         buffered = req._decoder.take_buffered()
         if buffered:
             self._stash += buffered  # the next request is already here: no read (hyper `read_buf`)
@@ -500,15 +516,37 @@ class ServerConnection(H1ConnectionBase):
             req._response_done = True
             self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))
 
-    async def _iter_body_or_peer_close(self, req, body):
-        # hyper polls the connection (and so `mid_message_detect_eof`) while the response
-        # body's next chunk is pending: a client FIN fails the send at once, not after the
-        # app finally yields (see `_common.iter_async_body_or_event`).
+    async def _send_async_body(self, req, body, trailers):
+        """Stream an ASYNC response body and fail fast on a client FIN. hyper polls the
+        connection (so `mid_message_detect_eof`) while the body's next chunk is pending,
+        so a parked producer (SSE, long poll) does not hold a dead exchange. Same shape as
+        the h2 manager's `_send_async_body`: ONE bare pump task per response writes inline;
+        this caller waits once for "pump done" or "peer closed". On the FIN it fails the
+        response at once (the pump exits at its next write — the transport is closed — and
+        closes the generator); a per-chunk `select` measured 4-5x slower."""
+        self._arm_watcher(req)  # the FIN is consumable now: make sure a read is parked
+        done, box = self.backend.event(), []
+        handle = self.backend.spawn_without_results(self._pump_async_body(body, trailers, done, box))
+        winner = await self.backend.select(
+            event_result(done, PUMP_DONE), event_result(req._peer_closed_evt, PUMP_ABANDONED)
+        )
+        if winner is PUMP_ABANDONED and not done.is_set():
+            req._response_done = True
+            self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))  # closes the transport; the pump then fails
+        await handle  # finished: join exactly once
+        if box:
+            req._response_done = True
+            self._fail_response(box[0])
+
+    async def _pump_async_body(self, body, trailers, done, box):
+        # A bare task: never lets an exception escape (it is reported through `box`).
         try:
-            async for chunk in iter_async_body_or_event(body, req._peer_closed_evt, self.backend.select):
-                yield chunk
-        except BodyInterruptedError:
-            raise ConnectionClosedError(_PEER_CLOSED_MSG) from None
+            await self._send_body(self._codec, body, trailers)
+        except Exception as exc:
+            box.append(exc)
+        finally:
+            await aclose_body(body)
+            done.set()
 
     async def graceful_shutdown(self):
         # h1 `Connection::graceful_shutdown` (hyper Dispatcher `disable_keep_alive`):
@@ -611,10 +649,6 @@ class ServerConnection(H1ConnectionBase):
             content_length=head.content_length,
         )
         self._current = req
-        if req._body_done:
-            # A bodyless request is mid-message from the moment its head is parsed (hyper:
-            # `Reading::KeepAlive` + `Writing::Init` -> `mid_message_detect_eof` at once).
-            self._arm_watcher(req)
         return req
 
     def _drain_unread_body(self, req):
@@ -774,8 +808,7 @@ class ServerConnection(H1ConnectionBase):
         path, so the two cannot drift; only the write batching differs."""
         self._check_peer_open(req)
         content_length, chunked = self._body_framing(body)
-        if body is not None and hasattr(body, "__aiter__"):
-            body = self._iter_body_or_peer_close(req, body)  # fail fast on a client FIN while parked on a chunk
+        streaming = body is not None and hasattr(body, "__aiter__")
         if trailers is not None:
             # Trailers ride only on a chunked body (RFC 9112 §7.1.2), and hyper's server
             # encoder allow-lists them against the response's `Trailer` header (role.rs
@@ -789,11 +822,19 @@ class ServerConnection(H1ConnectionBase):
         head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
         req._keep_alive_decision = keep_alive
         req._is_switch = is_switch
-        try:
-            await self._send_head_and_body(self._codec, head, body, trailers)
-        except BaseException as exc:
-            req._response_done = True
-            self._fail_response(exc)
+        if streaming:
+            try:
+                await self.write(head)  # the head must never wait on the app's generator
+            except BaseException as exc:
+                req._response_done = True
+                self._fail_response(exc)
+            await self._send_async_body(req, body, trailers)
+        else:
+            try:
+                await self._send_head_and_body(self._codec, head, body, trailers)
+            except BaseException as exc:
+                req._response_done = True
+                self._fail_response(exc)
         self._finish_response(req)
 
     async def send_response_head(self, req, status, headers, *, end_stream):
@@ -802,6 +843,8 @@ class ServerConnection(H1ConnectionBase):
         pull body does: True = no body (`_body_framing(None)`), False = a body of unknown
         length (streamed -> chunked, or length if the headers carry `content-length`)."""
         self._check_peer_open(req)
+        if not end_stream:
+            self._arm_watcher(req)  # a push producer may park between chunks: make the FIN observable
         content_length, chunked = self._body_framing(None) if end_stream else (None, True)
         head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
         req._keep_alive_decision = keep_alive

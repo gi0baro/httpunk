@@ -44,47 +44,25 @@ async def read_all(aiter):
     return b"".join([chunk async for chunk in aiter])
 
 
-class BodyInterruptedError(Exception):
-    """Internal: the event raced against an async body's next chunk fired first
-    (`iter_async_body_or_event`). Callers convert it to their protocol's error."""
+PUMP_DONE = object()  # sentinel: the async-body pump finished (`event_result`)
+PUMP_ABANDONED = object()  # sentinel: the peer abandoned the exchange first (`event_result`)
 
 
-_END = object()  # sentinel: the async body is exhausted
-_FIRED = object()  # sentinel: the event won the race
-
-
-async def _next_chunk(it):
-    try:
-        return await it.__anext__()
-    except StopAsyncIteration:
-        return _END
-
-
-async def _await_event(evt):
+async def event_result(evt, value):
+    """Await `evt`, then return `value` — a labelled racer for a one-shot `select`."""
     await evt.wait()
-    return _FIRED
+    return value
 
 
-async def iter_async_body_or_event(body, evt, select):
-    """Yield an ASYNC body's chunks, racing each `__anext__` against `evt`; raise
-    `BodyInterruptedError` as soon as the event fires. hyper's shape for both protocols: the
-    body-writing future re-checks the peer's abandonment on every poll while it waits
-    for the next chunk (h2 `PipeToSendStream::poll` -> `poll_reset`; h1 the connection
-    poll that runs `mid_message_detect_eof`), so a parked producer — SSE, long poll —
-    fails fast instead of after it finally yields. Only an async body can park, so only it
-    pays the per-chunk race; `bytes` / sync iterables are sent directly by the callers.
-    The loser the race cancels is an Event wait or the app's own `__anext__` step — never
-    one of our transport reads or writes (those happen outside the race)."""
-    it = body.__aiter__()
-    while True:
-        if evt.is_set():
-            raise BodyInterruptedError
-        result = await select(_next_chunk(it), _await_event(evt))
-        if result is _FIRED:
-            raise BodyInterruptedError
-        if result is _END:
-            return
-        yield result
+async def aclose_body(body):
+    """Deterministically close an async body once its pump is done with it — tonio
+    finalizes nothing, so an async generator left unclosed never runs its cleanup."""
+    aclose = getattr(body, "aclose", None)
+    if aclose is not None:
+        try:
+            await aclose()
+        except Exception:  # noqa: S110 - the app's cleanup failing must not mask the send outcome
+            pass
 
 
 class BaseClientConnection:

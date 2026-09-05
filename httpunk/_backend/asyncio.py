@@ -150,9 +150,12 @@ class _AsyncioStream(asyncio.Protocol):
             self._transport.close()
 
     def read_nowait(self, max_bytes=65536):
-        """Synchronous non-blocking peek: whatever is buffered right now, else `b""`
-        (the `receive_nowait` primitive — approach B peeks *our* buffer)."""
-        return self._take(max_bytes) if self._buffer else b""
+        """Synchronous non-blocking peek: whatever is buffered right now, `b""` once
+        EOF arrived, else `None` (the `receive_nowait` primitive — approach B peeks
+        *our* buffer)."""
+        if self._buffer:
+            return self._take(max_bytes)
+        return b"" if self._eof else None
 
     # ----- helpers -----
 
@@ -259,7 +262,7 @@ class AsyncioBackend:
         selected = ssl_obj.selected_alpn_protocol() if ssl_obj is not None else None
         return stream, selected
 
-    def receive_nowait(self, transport, max_bytes=65536):
+    def receive_nowait(self, transport, max_bytes=65536):  # bytes | b"" (EOF) | None (nothing ready)
         """Synchronous non-blocking peek of the userspace buffer (approach B)."""
         return transport.read_nowait(max_bytes)
 

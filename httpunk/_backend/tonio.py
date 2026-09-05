@@ -63,9 +63,10 @@ class TonioBackend:
 
     def receive_nowait(self, transport, max_bytes=65536):
         """A synchronous, non-blocking read: whatever bytes are immediately
-        available without suspending, or `b""` if none are ready right now (also
-        `b""` at EOF). The readiness primitive hyper's server drain (`poll_read_body`
-        inside `poll_drain_or_close_read`) relies on.
+        available without suspending, `b""` at EOF, or `None` if nothing is ready
+        right now. The readiness primitive hyper's server drain (`poll_read_body`
+        inside `poll_drain_or_close_read`) relies on. EOF and not-ready are distinct
+        (the seam contract `tonio/NOTES_WAIT_READABLE.md` asks for).
 
         - **Plain socket**: tonio's sockets are non-blocking under the hood (its own
           `recv` does exactly this `_sock.recv` inline before ever suspending), so
@@ -77,15 +78,16 @@ class TonioBackend:
           buffer: `pending()` bytes can be `read()` without touching the BIO/socket.
           (Necessarily conservative — tonio exposes no non-blocking "decrypt more",
           so unread ciphertext on the socket reads as "nothing ready"; the drain
-          then closes rather than reuses, which matches hyper's cheap-drain-or-close.)"""
+          then closes rather than reuses, which matches hyper's cheap-drain-or-close.
+          EOF is never reported for TLS either — it is only knowable by decrypting.)"""
         ssl_obj = getattr(transport, "_ssl", None)
         if ssl_obj is not None:  # a TLSStream — peek only already-decrypted plaintext
             pending = ssl_obj.pending()
-            return ssl_obj.read(min(max_bytes, pending)) if pending else b""
+            return ssl_obj.read(min(max_bytes, pending)) if pending else None
         try:
-            return transport.socket._sock.recv(max_bytes)
+            return transport.socket._sock.recv(max_bytes)  # b"" only at EOF
         except (BlockingIOError, InterruptedError):
-            return b""
+            return None
 
     def close_transport(self, transport):
         """Synchronously close a transport, unblocking the peer's read. The driver

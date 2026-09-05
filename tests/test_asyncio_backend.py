@@ -16,11 +16,12 @@ async def test_stream_buffer_receive_peek_and_eof():
     s.connection_made(None)  # no transport needed while under the read high-water mark
     s.data_received(b"hello")
     assert s.read_nowait() == b"hello"  # sync peek drains the buffer
-    assert s.read_nowait() == b""  # empty now
+    assert s.read_nowait() is None  # empty now: nothing ready (NOT EOF)
     s.data_received(b"world")
     assert await s.receive_some(3) == b"wor"  # partial read honors max_bytes
     assert await s.receive_some() == b"ld"
     s.eof_received()
+    assert s.read_nowait() == b""  # EOF -> b"" from the peek too (the h1 server's probe relies on it)
     assert await s.receive_some() == b""  # EOF -> b""
 
 

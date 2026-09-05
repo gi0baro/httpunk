@@ -24,7 +24,7 @@ mirrors, not a line-for-line port.
 
 import threading
 
-from .._common import BodyInterruptedError, aiter_body, iter_async_body_or_event
+from .._common import PUMP_ABANDONED, PUMP_DONE, aclose_body, aiter_body, event_result
 from .._httpunk import H2FlowControl
 from ..exceptions import GoAwayError, H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError, fresh_exc
 from .settings import PeerSettings
@@ -211,20 +211,11 @@ class StreamManager:
         # empty DATA frame. `body is None` only reaches here alongside trailers (a
         # bodyless request that still ends on a trailing HEADERS frame) — skip the
         # chunk loop then, since `aiter_body(None)` is not valid.
-        pending = _UNSET
         if body is not None and hasattr(body, "__aiter__"):
-            # A streaming body is sent chunk-by-chunk AS IT ARRIVES, never held back:
-            # hyper's `PipeToSendStream` sends each polled chunk with END_STREAM =
-            # `body.is_end_stream()`, which a streaming body only reports once exhausted
-            # (proto/h2/mod.rs), so the stream ends on an empty END_STREAM DATA frame (or
-            # the trailers). Holding one chunk back to spare that frame would delay every
-            # chunk until the next one exists — an SSE event would sit unsent until the
-            # following event — and a peer reset while parked on the app's next chunk is
-            # what `_iter_body_or_reset` fails fast on.
-            async for chunk in self._iter_body_or_reset(st, body):
-                await self._send_data(st, bytes(chunk), end_stream=False)
-            pending = b""
-        elif body is not None:
+            await self._send_async_body(st, body, trailers)
+            return
+        pending = _UNSET
+        if body is not None:
             # `bytes` / a sync iterable can't park: hold one chunk back so END_STREAM rides
             # the final DATA frame (hyper knows a `Full` body `is_end_stream` after its one
             # chunk, and a sync iterable's next chunk is known immediately).
@@ -247,16 +238,49 @@ class StreamManager:
             await self._send_data(st, pending, end_stream=True)
         self._finish_send(st)
 
-    async def _iter_body_or_reset(self, st, body):
-        """An ASYNC body's chunks, failing fast on a peer reset: hyper's
-        `PipeToSendStream::poll` (proto/h2/mod.rs L148) polls `poll_reset` on EVERY
-        iteration while it waits for the body's next chunk (see
-        `_common.iter_async_body_or_event`). The reset surfaces with the peer's reason."""
+    async def _send_async_body(self, st, body, trailers):
+        """Stream an ASYNC body and fail fast on a peer reset — hyper's `PipeToSendStream`
+        (proto/h2/mod.rs), which polls `poll_reset` while it waits for the body's next
+        chunk, so a parked producer (SSE, long poll) does not hold the exchange.
+
+        The body is pumped by ONE bare task per response, iterating and writing inline
+        (`_pump_async_body`), while this caller waits once for "pump done" or "stream
+        reset". On a reset it raises with the peer's reason at once; the pump is left to
+        finish the app's parked step, fail at its next write (the stream is closed) and
+        close the generator. hyper drops the body future instead, but a parked coroutine
+        cannot be dropped — cancellation lands only at its next suspension, so this is the
+        same observable behaviour at zero per-chunk cost (a per-chunk `select` measured
+        4-5x slower). Chunks are sent AS THEY ARRIVE, never held back: a streaming `Body`
+        reports `is_end_stream()` only once exhausted, so hyper ends it on an empty
+        END_STREAM DATA frame (or the trailers); holding one back would delay every chunk
+        until the next one exists (an SSE event sitting unsent until the following one)."""
+        backend = self._conn.backend
+        done, box = backend.event(), []
+        handle = backend.spawn_without_results(self._pump_async_body(st, body, trailers, done, box))
+        winner = await backend.select(event_result(done, PUMP_DONE), event_result(st.reset_evt, PUMP_ABANDONED))
+        if winner is PUMP_ABANDONED and not done.is_set():
+            raise self._send_stopped_error(
+                st
+            )  # the pump exits at its next write; not joined (it may be parked in the app)
+        await handle  # finished: join exactly once
+        if box:
+            raise box[0]
+        self._finish_send(st)
+
+    async def _pump_async_body(self, st, body, trailers, done, box):
+        # A bare task: never lets an exception escape (it is reported through `box`).
         try:
-            async for chunk in iter_async_body_or_event(body, st.reset_evt, self._conn.backend.select):
-                yield chunk
-        except BodyInterruptedError:
-            raise self._send_stopped_error(st) from None
+            async for chunk in body:
+                await self._send_data(st, bytes(chunk), end_stream=False)
+            if trailers is not None:
+                await self._send_trailers(st, trailers)
+            else:
+                await self._send_data(st, b"", end_stream=True)
+        except Exception as exc:
+            box.append(exc)
+        finally:
+            await aclose_body(body)
+            done.set()
 
     def _finish_send(self, st):
         """Close the send half after the END_STREAM frame went out (final DATA or

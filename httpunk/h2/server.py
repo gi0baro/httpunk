@@ -127,7 +127,13 @@ class ServerRequest:
         The pull convenience over `send_response` (h2: `SendResponse::send_response` +
         hyper's `PipeToSendStream`, whose body may end with trailers). `trailers` are
         validated (RFC 9113 §8.2.2) before anything is sent, like the client's
-        `Request.trailers`, so a rejected call leaves the stream untouched."""
+        `Request.trailers`, so a rejected call leaves the stream untouched.
+
+        Raises `StreamResetError` with the client's reason if it reset the stream (also
+        after its own END_STREAM, the cancelled-GET case). With an async body that is
+        raised at once even while the body is parked on its next chunk; the producer is
+        then still parked inside its own await — close or wake whatever it awaits (a
+        channel, an event, an upstream body) and it is finished and closed for you."""
         return self._manager.send_response(self._stream, status, headers, body, trailers)
 
     async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:

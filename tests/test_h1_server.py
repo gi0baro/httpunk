@@ -1132,9 +1132,12 @@ async def test_server_pipelined_request_read_mid_message_is_served_not_lost():
             async for req in server:
                 seen.append(req.target)
                 if req.target == "/slow":
+                    stream = await req.send_response(200)  # a push response arms the watcher
                     await release.wait()  # the second request arrives while this one is pending
                     assert not req._peer_closed
-                await req.respond(200, body=req.target.encode())
+                    await stream.send_data(req.target.encode(), end_stream=True)
+                else:
+                    await req.respond(200, body=req.target.encode())
 
     async with scope() as s:
         s.spawn(serve())
@@ -1195,6 +1198,7 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
         transport = await listener.accept()
         async with H1Server(transport) as server:
             async for req in server:
+                server._conn._arm_watcher(req)  # what `peer_closed()` / a streamed or push response does
                 try:
                     req.detach()
                 except RuntimeError as exc:
@@ -1204,7 +1208,7 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/plain", headers={"host": "x"})  # no Upgrade -> watched
+            r = await conn.request("GET", "/plain", headers={"host": "x"})  # no Upgrade -> watchable
             assert await r.read() == b"not detached"
         s.cancel()
     assert len(seen) == 1 and "mid-message read is parked" in seen[0]

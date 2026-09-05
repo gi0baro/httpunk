@@ -83,7 +83,7 @@ def test_receive_nowait_tls_reads_decrypted_plaintext():
 
 def test_receive_nowait_tls_empty_when_no_pending_plaintext():
     # No decrypted plaintext buffered -> "nothing ready" (never touches the socket).
-    assert TonioBackend().receive_nowait(_FakeTLSStream(b"")) == b""
+    assert TonioBackend().receive_nowait(_FakeTLSStream(b"")) is None  # nothing ready (EOF is unknowable for TLS)
 
 
 def test_receive_nowait_tls_never_touches_socket():
@@ -100,7 +100,7 @@ def test_receive_nowait_plain_socket_raw_recv():
 
 def test_receive_nowait_plain_socket_empty_when_would_block():
     # A non-blocking socket with nothing ready raises BlockingIOError -> b"".
-    assert TonioBackend().receive_nowait(_FakePlainStream(b"")) == b""
+    assert TonioBackend().receive_nowait(_FakePlainStream(b"")) is None  # would block -> None, distinct from EOF b""
 
 
 def test_close_transport_plain_socket_calls_close():

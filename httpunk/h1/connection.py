@@ -114,9 +114,9 @@ class H1ConnectionBase:
                 if body is not None:
                     buf += codec.serialize_data(bytes(body))
                 buf += codec.serialize_trailers(trailers) if trailers is not None else codec.serialize_end()
-            await self.transport.send_all(bytes(buf))
+            await self.write(bytes(buf))
             return
-        await self.transport.send_all(head)
+        await self.write(head)
         await self._send_body(codec, body, trailers)
 
     async def _send_body(self, codec, body, trailers=None):
@@ -128,13 +128,16 @@ class H1ConnectionBase:
         # effects don't fire (G37). `trailers` (a HeaderMap, chunked bodies only)
         # terminate the body with a trailer block instead of a bare `0\r\n\r\n` (F45);
         # a request with trailers is always chunked, so it is never `body_is_eof`.
+        # All writes go through `write`, which raises a clean ConnectionClosedError once the
+        # transport was nulled by a teardown (F59) — a body pump orphaned by an abandoned
+        # exchange wakes into that, not into an AttributeError on `None.send_all`.
         if codec.body_is_eof():
-            await self.transport.send_all(codec.serialize_end())
+            await self.write(codec.serialize_end())
             return
         if body is not None:
             async for chunk in aiter_body(body):
-                await self.transport.send_all(codec.serialize_data(bytes(chunk)))
+                await self.write(codec.serialize_data(bytes(chunk)))
         if trailers is not None:
-            await self.transport.send_all(codec.serialize_trailers(trailers))
+            await self.write(codec.serialize_trailers(trailers))
         else:
-            await self.transport.send_all(codec.serialize_end())
+            await self.write(codec.serialize_end())
