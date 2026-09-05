@@ -6,7 +6,7 @@ auto-`Date` header.
 
 import pytest
 from _client import open_h1
-from tonio.colored import scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import Version
@@ -1015,6 +1015,207 @@ async def test_server_respond_trailers_dropped_on_http10():
         finally:
             transport.close()
             s.cancel()
+
+
+# ----- mid-message peer EOF (FR-2; hyper conn.rs `mid_message_detect_eof`) -----
+
+
+@pytest.mark.tonio
+async def test_server_peer_closed_resolves_and_fails_the_late_response():
+    """A client that sends a GET then closes is detected WHILE the handler still runs:
+    `peer_closed()` resolves, and the late `respond()` fails with `ConnectionClosedError`
+    (hyper: `close_read` + `IncompleteMessage`, the service future is dropped). The accept
+    loop then ends."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                await req.peer_closed()
+                seen.append("peer_closed")
+                try:
+                    await req.respond(200, body=b"too late")
+                except ConnectionClosedError:
+                    seen.append("respond failed")
+            seen.append("loop ended")
+            done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        transport.close()  # FIN while the handler is parked
+        await done.wait()
+        s.cancel()
+    assert seen == ["peer_closed", "respond failed", "loop ended"]
+
+
+@pytest.mark.tonio
+async def test_server_streamed_response_fails_fast_on_peer_close():
+    """hyper polls the connection (so `mid_message_detect_eof`) while the response body's
+    next chunk is pending: a client FIN fails `respond()` at once — the app is not left
+    parked on its own `__anext__` forever."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+
+                async def body():
+                    yield b"first"
+                    await Event().wait()  # nothing more to say (yet)
+
+                try:
+                    await req.respond(200, body=body())
+                except ConnectionClosedError:
+                    seen.append("failed")
+                done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        data = await _read_until(transport, b"5\r\nfirst\r\n")  # streamed chunks are not held back
+        assert data.startswith(b"HTTP/1.1 200")
+        transport.close()
+        await done.wait()  # would hit the conftest deadline if the sender stayed parked
+        s.cancel()
+    assert seen == ["failed"]
+
+
+@pytest.mark.tonio
+async def test_server_push_send_data_fails_after_peer_close():
+    """Through the push handle: once the client closed its side, the next `send_data`
+    fails with `ConnectionClosedError` instead of writing into a dead exchange."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200)
+                await stream.send_data(b"tick")
+                await req.peer_closed()
+                try:
+                    await stream.send_data(b"tock")
+                except ConnectionClosedError:
+                    seen.append("failed")
+                done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        await _read_until(transport, b"4\r\ntick\r\n")
+        transport.close()
+        await done.wait()
+        s.cancel()
+    assert seen == ["failed"]
+
+
+@pytest.mark.tonio
+async def test_server_pipelined_request_read_mid_message_is_served_not_lost():
+    """Bytes arriving mid-message are the next pipelined request (hyper keeps them in
+    `read_buf`): the watcher's read must be handed to the next head read, never dropped,
+    and must NOT be mistaken for a peer close."""
+    listener, host, port = await _listener()
+    release, seen = Event(), []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                seen.append(req.target)
+                if req.target == "/slow":
+                    await release.wait()  # the second request arrives while this one is pending
+                    assert not req._peer_closed
+                await req.respond(200, body=req.target.encode())
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET /slow HTTP/1.1\r\nhost: x\r\n\r\n")
+            await sleep(0.05)  # let the watcher park, then pipeline the next request into it
+            await transport.send_all(b"GET /next HTTP/1.1\r\nhost: x\r\n\r\n")
+            await sleep(0.05)
+            release.set()
+            data = await _read_until(transport, b"/next")
+            assert data.count(b"HTTP/1.1 200") == 2
+            assert seen == ["/slow", "/next"]
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_half_close_option_ignores_mid_request_fin():
+    """`half_close=True` (hyper `http1::Builder::half_close`): a client FIN mid-request is
+    not a disconnect — no watcher, `peer_closed()` stays pending, the response completes
+    and is delivered; the connection then ends at the idle read."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport, half_close=True) as server:
+            async for req in server:
+                await sleep(0.05)  # the FIN lands here
+                seen.append(req._peer_closed)
+                await req.respond(200, body=b"still served")
+            done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        transport.socket.shutdown(1)  # SHUT_WR: half-close, we still read
+        data = await _drain_all(transport)
+        transport.close()
+        await done.wait()
+        s.cancel()
+    assert seen == [False]
+    assert data.startswith(b"HTTP/1.1 200") and data.endswith(b"still served")
+
+
+@pytest.mark.tonio
+async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_requests():
+    """A request without `Upgrade` has a mid-message read parked, which cannot be handed
+    to a caller (one reader per transport) -> `detach()` refuses. An Upgrade request is
+    never watched (a task cannot stand in for hyper's poll there) -> `detach()` works."""
+    listener, host, port = await _listener()
+    seen = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                try:
+                    req.detach()
+                except RuntimeError as exc:
+                    seen.append(str(exc))
+                await req.respond(200, body=b"not detached")
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            r = await conn.request("GET", "/plain", headers={"host": "x"})  # no Upgrade -> watched
+            assert await r.read() == b"not detached"
+        s.cancel()
+    assert len(seen) == 1 and "mid-message read is parked" in seen[0]
+
+    # An Upgrade request is never watched, so `detach()` hands the transport over cleanly.
+    stub = _StubTransport(b"GET /ws HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nWSDATA")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    assert conn._watcher_handle is None  # upgrade requests are not watched
+    assert req.detach() == b"WSDATA"
 
 
 @pytest.mark.tonio

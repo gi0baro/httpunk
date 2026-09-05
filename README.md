@@ -208,7 +208,11 @@ other streams keep running — and `await request.reset_received()` resolves wit
 when the *client* abandons the request (`RST_STREAM`, even after it finished sending), the
 signal a long-running or streaming handler races against its own completion to stop early.
 A reset also fails an in-flight `respond()` / `send_data` with `StreamResetError` carrying the
-client's reason, including while the body is waiting on the app's next chunk.
+client's reason, including while the body is waiting on the app's next chunk. The HTTP/1 twin
+is `await request.peer_closed()`: once the request body is complete, a client that closes the
+connection before the response is done is detected (hyper's `mid_message_detect_eof`), the
+in-flight `respond()` / `send_data` fail with `ConnectionClosedError`, and the accept loop ends.
+`H1Server(half_close=True)` turns that off, as hyper's `half_close` does.
 
 For push-style producers (an ASGI `send()` loop, a server-sent-events endpoint) use
 `request.send_response(status, *, headers=None, end_stream=False)`: it writes the head now and

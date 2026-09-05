@@ -24,7 +24,7 @@ mirrors, not a line-for-line port.
 
 import threading
 
-from .._common import aiter_body
+from .._common import BodyInterruptedError, aiter_body, iter_async_body_or_event
 from .._httpunk import H2FlowControl
 from ..exceptions import GoAwayError, H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError, fresh_exc
 from .settings import PeerSettings
@@ -54,20 +54,6 @@ _MAX_RECV_EMPTY_DATA_FRAMES = 100  # h2 0.4.19 MAX_RECV_EMPTY_DATA_FRAMES (proto
 
 _INVALID_CONTENT_LENGTH = object()  # sentinel: content-length header failed to parse
 _UNSET = object()  # sentinel: no chunk buffered yet (send_body one-ahead lookahead)
-_END = object()  # sentinel: the async body is exhausted (`_iter_body_or_reset`)
-_RESET = object()  # sentinel: the stream's reset event won the race (`_iter_body_or_reset`)
-
-
-async def _next_chunk(it):
-    try:
-        return await it.__anext__()
-    except StopAsyncIteration:
-        return _END
-
-
-async def _await_reset(evt):
-    await evt.wait()
-    return _RESET
 
 
 def _is_informational(status):
@@ -262,26 +248,15 @@ class StreamManager:
         self._finish_send(st)
 
     async def _iter_body_or_reset(self, st, body):
-        """An ASYNC body's chunks, failing fast on a peer reset. hyper's
+        """An ASYNC body's chunks, failing fast on a peer reset: hyper's
         `PipeToSendStream::poll` (proto/h2/mod.rs L148) polls `poll_reset` on EVERY
-        iteration while it waits for the body's next chunk, so a peer that abandons the
-        stream fails the send at once — not after the app finally produces a chunk (an
-        SSE / long-poll body may park for minutes). Only an async body can park, so only
-        it pays the per-chunk race (`send_body` sends `bytes` / sync iterables directly).
-        The loser that gets cancelled is either an Event wait or the app's own `__anext__`
-        step — never one of our transport reads or writes (those happen outside the race)."""
-        it = body.__aiter__()
-        reset_evt = st.reset_evt
-        select = self._conn.backend.select
-        while True:
-            if reset_evt.is_set():
-                raise self._send_stopped_error(st)
-            result = await select(_next_chunk(it), _await_reset(reset_evt))
-            if result is _RESET:
-                raise self._send_stopped_error(st)
-            if result is _END:
-                return
-            yield result
+        iteration while it waits for the body's next chunk (see
+        `_common.iter_async_body_or_event`). The reset surfaces with the peer's reason."""
+        try:
+            async for chunk in iter_async_body_or_event(body, st.reset_evt, self._conn.backend.select):
+                yield chunk
+        except BodyInterruptedError:
+            raise self._send_stopped_error(st) from None
 
     def _finish_send(self, st):
         """Close the send half after the END_STREAM frame went out (final DATA or

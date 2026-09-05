@@ -195,6 +195,12 @@ class Http1Builder:
         (default False)."""
         return self._set("ignore_invalid_headers", enabled)
 
+    def half_close(self, val: bool) -> Http1Builder:
+        """Support half-closures: a client that shuts its write side while waiting for
+        the response is not treated as gone (hyper `http1::Builder::half_close`, default
+        False — where the mid-request EOF fails the in-flight response)."""
+        return self._set("half_close", val)
+
     async def serve_connection(self, transport: Any, *, cancel: Any = None) -> H2Server | H1Server:
         return await self._inner.serve_connection(transport, cancel=cancel)
 

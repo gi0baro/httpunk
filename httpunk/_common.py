@@ -44,6 +44,49 @@ async def read_all(aiter):
     return b"".join([chunk async for chunk in aiter])
 
 
+class BodyInterruptedError(Exception):
+    """Internal: the event raced against an async body's next chunk fired first
+    (`iter_async_body_or_event`). Callers convert it to their protocol's error."""
+
+
+_END = object()  # sentinel: the async body is exhausted
+_FIRED = object()  # sentinel: the event won the race
+
+
+async def _next_chunk(it):
+    try:
+        return await it.__anext__()
+    except StopAsyncIteration:
+        return _END
+
+
+async def _await_event(evt):
+    await evt.wait()
+    return _FIRED
+
+
+async def iter_async_body_or_event(body, evt, select):
+    """Yield an ASYNC body's chunks, racing each `__anext__` against `evt`; raise
+    `BodyInterruptedError` as soon as the event fires. hyper's shape for both protocols: the
+    body-writing future re-checks the peer's abandonment on every poll while it waits
+    for the next chunk (h2 `PipeToSendStream::poll` -> `poll_reset`; h1 the connection
+    poll that runs `mid_message_detect_eof`), so a parked producer — SSE, long poll —
+    fails fast instead of after it finally yields. Only an async body can park, so only it
+    pays the per-chunk race; `bytes` / sync iterables are sent directly by the callers.
+    The loser the race cancels is an Event wait or the app's own `__anext__` step — never
+    one of our transport reads or writes (those happen outside the race)."""
+    it = body.__aiter__()
+    while True:
+        if evt.is_set():
+            raise BodyInterruptedError
+        result = await select(_next_chunk(it), _await_event(evt))
+        if result is _FIRED:
+            raise BodyInterruptedError
+        if result is _END:
+            return
+        yield result
+
+
 class BaseClientConnection:
     """Shared public client-facade glue (h1/h2): async-context-manager entry/exit
     + the `request` wrapper over the protocol-specific `send_request`. Subclasses

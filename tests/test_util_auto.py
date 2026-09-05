@@ -98,7 +98,7 @@ async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picke
     # Chain across both sub-builders like hyper-util's http1()/http2() crossover.
     builder.http1().header_read_timeout(5.0).keep_alive(False).max_headers(50).max_buf_size(16384).auto_date_header(
         False
-    ).title_case_headers(True).ignore_invalid_headers(True).http2().max_concurrent_streams(
+    ).title_case_headers(True).ignore_invalid_headers(True).half_close(True).http2().max_concurrent_streams(
         7
     ).initial_stream_window_size(123456).data_frame_budget(4096).initial_connection_window_size(
         2_000_000
@@ -110,6 +110,7 @@ async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picke
     assert isinstance(h1, H1Server)
     assert h1._conn._header_read_timeout == 5.0
     assert h1._conn._keep_alive_enabled is False
+    assert h1._conn._half_close is True
     assert h1._conn._max_buf_size == 16384
     assert h1._conn._codec_options == {
         "max_headers": 50,
