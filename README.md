@@ -369,8 +369,8 @@ The option set mirrors hyper's server builders, with hyper's defaults. HTTP/1
 `auto_date_header`, `title_case_headers`, `ignore_invalid_headers`. HTTP/2 (`http2::Builder`):
 `max_concurrent_streams`, `initial_stream_window_size`, `initial_connection_window_size`,
 `max_frame_size`, `max_header_list_size`, `max_pending_accept_reset_streams`,
-`max_local_error_reset_streams`, `auto_date_header`, plus h2's `data_frame_budget`. The same
-keywords are accepted by `H1Server(...)` / `H2Server(...)` directly.
+`max_local_error_reset_streams`, `auto_date_header`, `max_send_buf_size`, plus h2's
+`data_frame_budget`. The same keywords are accepted by `H1Server(...)` / `H2Server(...)` directly.
 
 #### Connection pools
 

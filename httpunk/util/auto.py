@@ -268,6 +268,11 @@ class Http2Builder:
         """Insert a `Date` header on responses lacking one (default True)."""
         return self._set("auto_date_header", enabled)
 
+    def max_send_buf_size(self, max: int | None) -> Http2Builder:
+        """Per-stream cap on response DATA queued for the connection's writer (hyper
+        `max_send_buf_size`, default 400 KB); the sender awaits room like flow-control window."""
+        return self._set("max_send_buf_size", max)
+
     async def serve_connection(self, transport: Any, *, cancel: Any = None) -> H2Server | H1Server:
         return await self._inner.serve_connection(transport, cancel=cancel)
 

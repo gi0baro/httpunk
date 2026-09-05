@@ -47,6 +47,7 @@ _STREAM_WINDOW = 2 * 1024 * 1024
 _CONN_WINDOW = 5 * 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
+_MAX_SEND_BUF_SIZE = 1024 * 1024  # hyper proto/h2/client.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
 _MAX_STREAM_ID = 2**31 - 1  # h2 StreamId::MAX — the last id `next_id()` will hand out
 
 
@@ -148,8 +149,11 @@ class ClientStreamManager(StreamManager):
             st.holds_slot = True
             self._streams[stream_id] = st
             st.state.send_open(eos=end_stream)
-            await self._conn.send_frame_or_fail(
-                self._conn.codec.serialize_request_headers(stream_id, method, url, headers, end_stream=end_stream)
+            # Encoded + queued as one step under the pump's buffer lock (HPACK encode order
+            # must equal wire order — see the server's `send_response_head`).
+            codec = self._conn.codec
+            self._conn.enqueue_headers(
+                st, lambda: codec.serialize_request_headers(stream_id, method, url, headers, end_stream=end_stream)
             )
         # The connection may have failed / GOAWAY'd between our pre-lock check and
         # inserting the stream, so `fail_all`/`handle_go_away`'s fan-out could have
@@ -258,6 +262,7 @@ class Connection(H2ConnectionBase):
         backend=None,
         initial_window_size=None,
         data_frame_budget=None,
+        max_send_buf_size=None,
     ):
         # `authority`/`scheme` build the :authority/:scheme pseudo-headers for a
         # bare-path request. h2 takes :scheme from the request URI (client.rs
@@ -281,6 +286,8 @@ class Connection(H2ConnectionBase):
                     max_header_list_size=_MAX_HEADER_LIST_SIZE,
                 )
             ),
+            # hyper `client::conn::http2::Builder::max_send_buf_size` (proto/h2/client.rs DEFAULT_MAX_SEND_BUF_SIZE, 1 MB).
+            max_send_buf_size=max_send_buf_size if max_send_buf_size is not None else _MAX_SEND_BUF_SIZE,
         )
         # Signalled once the peer's initial SETTINGS have been applied, so requests
         # respect the peer's limits/window from the first one.
@@ -363,7 +370,11 @@ class H2Connection(BaseClientConnection):
         backend: BackendLike | None = None,
         initial_window_size: int | None = None,
         data_frame_budget: int | None = None,
+        max_send_buf_size: int | None = None,
     ) -> None:
+        """`max_send_buf_size` (hyper `client::conn::http2::Builder::max_send_buf_size`,
+        default 1 MB): per-stream cap on request DATA queued for the connection's writer;
+        the body sender awaits room as it awaits flow-control window."""
         self._conn = Connection(
             transport,
             authority=authority,
@@ -371,6 +382,7 @@ class H2Connection(BaseClientConnection):
             backend=backend,
             initial_window_size=initial_window_size,
             data_frame_budget=data_frame_budget,
+            max_send_buf_size=max_send_buf_size,
         )
 
     def ready(self) -> Awaitable[None]:

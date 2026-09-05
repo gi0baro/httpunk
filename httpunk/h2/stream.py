@@ -45,6 +45,9 @@ class Stream:
         # (a connection error — `error` / the connection's error carries it).
         self.reset_evt = backend.event()
         self.reset_reason = None
+        # DATA payload bytes queued for this stream but not yet written by the connection's
+        # write pump (h2 stream.rs `buffered_send_data`); bounded by `max_send_buf_size`.
+        self.send_buffered = 0
         self.holds_slot = False  # whether this stream holds a MAX_CONCURRENT permit
         # Bytes received but not yet released to the peer (via WINDOW_UPDATE);
         # reclaimed at connection level if the stream is cancelled/reset/closed

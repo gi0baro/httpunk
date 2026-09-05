@@ -331,7 +331,8 @@ class StreamManager:
         # state, and framing on a non-streaming stream must surface the reset (F45).
         if not st.state.is_send_streaming():
             raise self._send_stopped_error(st)
-        await self._conn.send_frame_or_fail(self._conn.codec.serialize_trailers(st.id, trailers))
+        codec = self._conn.codec
+        self._conn.enqueue_headers(st, lambda: codec.serialize_trailers(st.id, trailers))
 
     async def _send_data(self, st, data, end_stream):
         # h2: proto/streams/send.rs `send_data` (L297) + the flow-control-gated
@@ -345,31 +346,37 @@ class StreamManager:
         # non-streaming state — which panics + aborts under `panic = "abort"`.
         if not st.state.is_send_streaming():
             raise self._send_stopped_error(st)
+        codec = self._conn.codec
         if len(data) == 0:
             # A zero-length DATA frame is sent, not elided — h2 queues/flushes it
             # (prioritize.rs L202-213: "Sending out zero length data frames can be done
             # to signal end-of-stream"). So an interior empty chunk goes on the wire as
             # an empty non-END_STREAM DATA frame, matching h2 (F40). Empty payload =>
             # zero window, so no reservation needed.
-            await self._conn.send_frame_or_fail(self._conn.codec.serialize_data(st.id, b"", end_stream=end_stream))
+            self._conn.enqueue_data(st, codec.serialize_data(st.id, b"", end_stream=end_stream), 0)
             return
         offset = 0
         while offset < len(data):
+            # Reserve window AND send-buffer room (h2 `poll_capacity`: capacity is granted
+            # only within both the flow-control window and `max_send_buffer_size`), then
+            # QUEUE the frame for the connection's write pump — the user task never writes
+            # to the socket itself (h2 prioritize.rs: user tasks fill the queue, the
+            # connection task drains it). Queued sync, so no suspension can land between the
+            # window debit and the frame's emission, and nothing can ever be half-written.
             n = await self._reserve_send_window(st, len(data) - offset)
             piece = data[offset : offset + n]
             last = end_stream and (offset + n == len(data))
-            # `send_frame_or_fail`: an interrupted DATA write may be partial, which
-            # poisons the connection — that also makes the window just reserved
-            # above moot (a dead connection's ledger doesn't matter), so the debit
-            # needs no unwind.
-            await self._conn.send_frame_or_fail(self._conn.codec.serialize_data(st.id, piece, end_stream=last))
+            self._conn.enqueue_data(st, codec.serialize_data(st.id, piece, end_stream=last), n)
             offset += n
 
     async def _reserve_send_window(self, st, want):
-        """Reserve up to min(conn, stream, peer max_frame_size, want) bytes of
-        send window, blocking on WINDOW_UPDATE until some is available. The
-        check-and-decrement is serialized (`_send_window_lock`) so concurrent
-        streams can't over-commit the shared connection window."""
+        """Reserve up to min(conn window, stream window, send-buffer room, peer
+        max_frame_size, want) bytes, blocking until some is available: a WINDOW_UPDATE
+        opens window; the write pump flushing this stream's queued DATA opens buffer
+        room (h2 `buffered_send_data` vs `max_send_buffer_size`, prioritize.rs). Both
+        wake `st.window_evt`. The check-and-decrement is serialized
+        (`_send_window_lock`) so concurrent streams can't over-commit the shared
+        connection window."""
         while True:
             # Bail if the stream or connection died while we were parked, so a
             # sender blocked on flow control isn't stranded forever when the
@@ -383,14 +390,15 @@ class StreamManager:
             if st.state.is_closed():
                 raise self._send_stopped_error(st)
             with self._send_window_lock:
-                window = self._send_window(st)
-                if window > 0:
-                    n = min(window, want, self._peer.max_frame_size)
+                budget = self._send_budget(st)
+                if budget > 0:
+                    n = min(budget, want, self._peer.max_frame_size)
                     self._conn_send.send_data(n)
                     st.send_flow.send_data(n)
                     return n
-            # Blocked on flow control: wait for a WINDOW_UPDATE (a connection
-            # window update also sets every stream's window_evt).
+            # Blocked on flow control or on the send buffer: wait for a WINDOW_UPDATE (a
+            # connection window update also sets every stream's window_evt) or for the
+            # write pump to flush this stream's queued DATA (it sets window_evt too).
             st.window_evt.clear()
             self._conn_window_evt.clear()
             # Re-check the wake conditions AFTER clearing: a reset/failure that fired
@@ -402,13 +410,18 @@ class StreamManager:
                 st.error is not None
                 or self._conn.error is not None
                 or st.state.is_closed()
-                or self._send_window(st) > 0
+                or self._send_budget(st) > 0
             ):
                 continue
             await st.window_evt.wait()
 
     def _send_window(self, st):
         return min(self._conn_send.window_size(), st.send_flow.window_size())
+
+    def _send_budget(self, st):
+        # Bytes this stream may queue now: within the flow-control windows AND the
+        # per-stream send buffer cap (hyper `max_send_buf_size` -> h2 `max_send_buffer_size`).
+        return min(self._send_window(st), self._conn.max_send_buf_size - st.send_buffered)
 
     # ===== recv-side flow control (h2: proto/streams/recv.rs) =====
 

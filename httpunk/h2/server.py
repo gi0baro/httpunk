@@ -68,6 +68,7 @@ _STREAM_WINDOW = 1024 * 1024
 _CONN_WINDOW = 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
+_MAX_SEND_BUF_SIZE = 400 * 1024  # hyper proto/h2/server.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
 _MAX_STREAM_ID = 2**31 - 1  # h2 StreamId::MAX — the phase-1 graceful GOAWAY last-stream-id
 _SHUTDOWN_PING = b"SHUTDOWN"  # opaque payload of the graceful-shutdown PING (h2 Ping::SHUTDOWN)
 
@@ -428,8 +429,14 @@ class ServerStreamManager(StreamManager):
         # still able to send a valid response.
         self.check_send_headers(hdrs)
         st.state.send_open(eos=end_stream)  # send response HEADERS
-        await self._conn.send_frame_or_fail(
-            self._conn.codec.serialize_response_headers(st.id, status, hdrs, end_stream=end_stream)
+        # Encoded + queued as ONE step under the pump's buffer lock: the HPACK encoder's
+        # dynamic table mutates on encode, so encode order MUST equal wire order — two
+        # handlers encoding here and then racing for the socket desynchronized the peer's
+        # table (a `date` insertion overtaken by later 3-byte blocks referencing it; the
+        # peer GOAWAYs PROTOCOL_ERROR). h2 encodes inside its connection task's write path.
+        codec = self._conn.codec
+        self._conn.enqueue_headers(
+            st, lambda: codec.serialize_response_headers(st.id, status, hdrs, end_stream=end_stream)
         )
         if end_stream:
             self._close_stream(st)  # bodyless response — HEADERS closed the send half
@@ -480,6 +487,7 @@ class ServerConnection(H2ConnectionBase):
         max_pending_accept_reset_streams=None,
         max_local_error_reset_streams=_LOCAL_ERROR_RESET_MAX,
         auto_date_header=True,
+        max_send_buf_size=None,
     ):
         self._max_concurrent_streams = max_concurrent_streams
         # Our advertised windows / frame / header-list profile, defaulting to hyper's
@@ -510,6 +518,8 @@ class ServerConnection(H2ConnectionBase):
                     max_header_list_size=self._max_header_list_size,
                 )
             ),
+            # hyper `http2::Builder::max_send_buf_size` (proto/h2/server.rs DEFAULT_MAX_SEND_BUF_SIZE, 400 KB).
+            max_send_buf_size=max_send_buf_size if max_send_buf_size is not None else _MAX_SEND_BUF_SIZE,
         )
         self.streams = ServerStreamManager(
             self,
@@ -632,14 +642,16 @@ class H2Server(BaseServer[ServerRequest]):
         max_pending_accept_reset_streams: int | None = None,
         max_local_error_reset_streams: int | None = _LOCAL_ERROR_RESET_MAX,
         auto_date_header: bool = True,
+        max_send_buf_size: int | None = None,
     ) -> None:
         """Options mirror hyper `server::conn::http2::Builder` (defaults are hyper's; `None`
         = default unless noted): `max_concurrent_streams` (200), `initial_window_size`
         (hyper `initial_stream_window_size`, 1 MB), `initial_connection_window_size` (1 MB),
         `max_frame_size` (16 KB, RFC range enforced), `max_header_list_size` (16 KB),
         `max_pending_accept_reset_streams` (h2's 20), `max_local_error_reset_streams`
-        (1024; None = NO limit), `auto_date_header`; plus h2's own
-        `data_frame_budget` (None = Auto)."""
+        (1024; None = NO limit), `auto_date_header`, `max_send_buf_size` (400 KB: per-stream
+        cap on response DATA queued for the connection's writer — the sender awaits room,
+        as it awaits flow-control window); plus h2's own `data_frame_budget` (None = Auto)."""
         self._conn = ServerConnection(
             transport,
             backend=backend,
@@ -652,4 +664,5 @@ class H2Server(BaseServer[ServerRequest]):
             max_pending_accept_reset_streams=max_pending_accept_reset_streams,
             max_local_error_reset_streams=max_local_error_reset_streams,
             auto_date_header=auto_date_header,
+            max_send_buf_size=max_send_buf_size,
         )

@@ -56,7 +56,7 @@ class H2ConnectionBase:
     Subclassed by the client `Connection` and the server `ServerConnection`, which
     supply the connection state (`self.streams`) + the role hooks."""
 
-    def __init__(self, transport, *, backend, codec_role, settings):
+    def __init__(self, transport, *, backend, codec_role, settings, max_send_buf_size):
         # `transport` is a caller-supplied, already-connected byte stream (BYO
         # transport, like hyper's `client`/`server` conn). Subclasses set
         # `self.streams` after building their role state.
@@ -86,11 +86,15 @@ class H2ConnectionBase:
         # the body writers above).
         self._pump_handle = None
         self._send_lock = self.backend.lock()
-        # Control-frame pending-send buffer, flushed by `_write_pump` (spawned in
-        # `_begin`) — h2's pending-send queue drained by its connection task.
-        # `enqueue_frame` is SYNC, so bookkeeping + frame emission commit as one
-        # uninterruptible step; the pump swaps the WHOLE buffer out and writes it
-        # in one send, so control frames batch into single syscalls for free.
+        # The pending-send queue, flushed by `_write_pump` (spawned in `_begin`) — h2's
+        # single frame queue drained by its connection task. EVERY frame goes through it:
+        # control frames via `enqueue_frame`, stream HEADERS/trailers via
+        # `enqueue_headers`, DATA via `enqueue_data`. Enqueue is SYNC, so bookkeeping
+        # (window debit, stream state) + frame emission commit as one uninterruptible
+        # step; the pump swaps the WHOLE buffer out and writes it in one send, so
+        # consecutive frames batch into single syscalls (h2 `poll_complete`). No user
+        # task ever writes to the socket, so no frame can be half-written by a
+        # cancellation, and HPACK encode order equals wire order by construction.
         # All `_write_evt` transitions happen UNDER `_write_buf_lock`, paired
         # with the buffer operation they signal: an unlocked `set()`/`clear()`
         # pair races on the free-threaded runtime (a `set()` landing between
@@ -99,6 +103,14 @@ class H2ConnectionBase:
         self._write_buf_lock = threading.Lock()  # tiny critical section, never held across an await
         self._write_evt = self.backend.event()
         self._write_stop = False  # close() -> the pump drains the buffer and exits
+        # DATA payload bytes queued per stream since the last flush; credited back to
+        # `Stream.send_buffered` (and the stream's sender woken) when the pump has
+        # written them. Bounds queued-but-unwritten data per stream at
+        # `max_send_buf_size` — hyper `max_send_buf_size` -> h2 `max_send_buffer_size`
+        # (server 400 KB / client 1 MB defaults), enforced through the send budget the
+        # flow-control reservation grants (h2 `poll_capacity`).
+        self._buffered = {}
+        self.max_send_buf_size = max_send_buf_size
         self._transport = transport
         self._settings = settings  # SETTINGS sync (proto/settings.rs)
         self._goaway_replied = False  # sent our acknowledging GOAWAY after a peer GOAWAY (F23)
@@ -222,11 +234,18 @@ class H2ConnectionBase:
     #   enqueue makes commit+emission one uninterruptible step, and the write pump
     #   (never user-cancelled) does the writing — the h2-queue property for the
     #   frames that need it.
-    # - STREAM frames (HEADERS/DATA/trailers) stay inline via `send_frame_or_fail`,
-    #   which poisons the connection on ANY interruption mid-write: a possibly
-    #   half-written frame means framing integrity can no longer be proven, so we
-    #   fail loudly ourselves instead of letting the peer discover the desync.
-    # - Connection-lifecycle frames (preface/SETTINGS, GOAWAY, acks) keep plain
+    # - STREAM frames (HEADERS/DATA/trailers) are QUEUED too (`enqueue_headers`,
+    #   `enqueue_data`), never written by the user's task — h2's model, where user
+    #   tasks fill the frame queue and the connection task drains it. Two bugs of the
+    #   earlier inline design cannot exist here: a cancellation landing inside a
+    #   user-task `send_all` left a half-written frame and poisoned the connection;
+    #   and HPACK encode order could differ from wire order (the encoder's dynamic
+    #   table mutates on encode; two handlers encoding then racing for the socket
+    #   desynchronized the peer's table -> GOAWAY PROTOCOL_ERROR under load). Here
+    #   HEADERS are encoded and appended as one step under the buffer lock.
+    #   Backpressure: a DATA sender awaits flow-control window AND send-buffer room
+    #   (`max_send_buf_size`, per stream), like h2's `poll_capacity`.
+    # - Connection-lifecycle frames (preface/SETTINGS, GOAWAY) keep plain
     #   `send_frame`: they run in the pump/handshake/shutdown, not under user
     #   cancellation, and GOAWAY needs flushed-before-stop semantics a queue would
     #   complicate. One exception: the idle-after-peer-GOAWAY reply
@@ -234,27 +253,12 @@ class H2ConnectionBase:
     #   close in user-task context; `close()` drains the queue before the FIN, so
     #   flushed-before-stop still holds.
     #
-    # ORDERING INVARIANT (the property h2's single queue gives for free, restored
-    # here for the hybrid): a control frame committed to the pending buffer before
-    # a sender acquires `_send_lock` reaches the wire before that sender's bytes.
-    # Two pieces enforce it, and both are load-bearing:
-    # - inline senders (`send_frame`, `send_frame_or_fail`) drain the buffer via
-    #   `_take_pending` and write it FIRST, under the send lock they hold;
-    # - the pump swaps the buffer INSIDE `_send_lock` (`_write_pump`), so a batch
-    #   swapped out but not yet written can never coexist with an available lock
-    #   (or an inline sender slipping in between swap and flush would still
-    #   invert the order).
-    # Without it, the RST/WINDOW_UPDATE a dispatch enqueues can lose the wire
-    # race to a response committed AFTER it (h2 guarantees the reverse), which is
-    # peer-observable: the forgotten-stream RST arriving after the next stream's
-    # response flaked F17 in CI. Lock order is send -> buf everywhere; the buffer
-    # lock is a sync leaf, never held across an await. NOT covered (unchanged,
-    # matches the pre-existing hybrid semantics): two INLINE sends serialize in
-    # lock-acquisition order, not state-commit order.
-    #
-    # The full-fidelity alternative — port h2's buffered-send/`reserve_capacity`
-    # model and route DATA through the queue too — remains open as a future step;
-    # this hybrid was chosen to keep F41's zero-buffering and the inline hot path.
+    # ORDERING: with one queue, wire order equals commit (enqueue) order — h2's
+    # property, for free. The inline lifecycle senders (`send_frame`) still drain
+    # the queue via `_take_pending` FIRST, under the send lock, and the pump swaps
+    # the buffer INSIDE `_send_lock`, so a lifecycle frame can never overtake frames
+    # committed before it. Lock order is send -> buf everywhere; the buffer lock is
+    # a sync leaf, never held across an await.
 
     def enqueue_frame(self, data):
         """Append a control frame to the pending-send buffer and wake the write
@@ -264,6 +268,34 @@ class H2ConnectionBase:
         any more (the punkreq class of bug)."""
         with self._write_buf_lock:
             self._write_buf += data
+            self._write_evt.set()
+
+    def enqueue_headers(self, st, encode):
+        """Encode (`encode()` -> the HEADERS/trailers frame bytes, via the shared HPACK
+        encoder) and append, as ONE step under the buffer lock: the encoder's dynamic
+        table mutates on encode, so the order blocks are encoded in MUST be the order
+        they reach the wire, or the peer's decoder desynchronizes. h2 encodes inside
+        its connection task's write path; this lock is the same guarantee. Raises the
+        connection error if the connection already failed (h2 `send_headers` on a
+        closed connection errors)."""
+        if self.error is not None:
+            raise fresh_exc(self.error) from self.error
+        with self._write_buf_lock:
+            self._write_buf += encode()
+            self._write_evt.set()
+
+    def enqueue_data(self, st, frame, payload_len):
+        """Queue a DATA frame for `st` (`payload_len` bytes of body, already debited from
+        the flow-control windows by `_reserve_send_window`, which also ensured send-buffer
+        room). Sync: window debit and emission commit together. The pump credits
+        `payload_len` back to `st.send_buffered` once written."""
+        if self.error is not None:
+            raise fresh_exc(self.error) from self.error
+        with self._write_buf_lock:
+            self._write_buf += frame
+            if payload_len:
+                st.send_buffered += payload_len
+                self._buffered[st] = self._buffered.get(st, 0) + payload_len
             self._write_evt.set()
 
     def _take_pending(self):
@@ -306,6 +338,7 @@ class H2ConnectionBase:
             async with self._send_lock:
                 with self._write_buf_lock:
                     data, self._write_buf = bytes(self._write_buf), bytearray()
+                    batch, self._buffered = self._buffered, {}
                     self._write_evt.clear()
                     stopping = self._write_stop
                 if data:
@@ -315,6 +348,13 @@ class H2ConnectionBase:
                         failed = ConnectionClosedError(f"connection closed: {exc}")
                     except Exception as exc:
                         failed = exc
+            # The batch is on the wire (or the connection is dead — either way the bytes
+            # no longer occupy the send buffer): credit each stream back and wake its
+            # sender, which re-checks its budget — or the connection error (h2: the
+            # connection task's `poll_complete` releases `buffered_send_data`).
+            for st, n in batch.items():
+                st.send_buffered -= n
+                st.window_evt.set()
             if failed is not None:
                 self._fail(failed)
                 break
@@ -326,38 +366,6 @@ class H2ConnectionBase:
                 with self._write_buf_lock:
                     if not self._write_buf:
                         break
-
-    async def send_frame_or_fail(self, data):
-        """Send a stream frame (HEADERS/DATA/trailers) inline; any interruption of
-        the write itself — error, cancellation, GC unwind — POISONS the connection.
-        `send_all` loops per-syscall, so an interruption may leave a truncated
-        frame on the wire; every later frame would then be parsed mid-frame by the
-        peer. We cannot tell "nothing written" from "half written", so fail the
-        connection ourselves (h2 equivalent: write errors are connection-fatal;
-        partial writes are unrepresentable — the connection task resumes them).
-        Cancellation while WAITING for the send lock is safe (nothing written) and
-        does not poison.
-
-        Drains the pending control buffer first (under the lock — wire order =
-        commit order, see the design note): the RST/WINDOW_UPDATE a dispatch
-        committed before this frame can no longer lose the wire race to it
-        (the rsts=0 flake in the forgotten-stream test). An interruption then
-        also loses the drained control frames — moot, since every branch below
-        poisons the connection they belonged to."""
-        async with self._send_lock:
-            data = self._take_pending() + data
-            try:
-                await self._transport.send_all(data)
-            except BaseException as exc:
-                if isinstance(exc, OSError):
-                    self._fail(ConnectionClosedError(f"connection closed: {exc}"))
-                elif isinstance(exc, Exception):
-                    self._fail(exc)
-                else:  # cancellation / GC unwind: the frame may be half-written
-                    self._fail(ConnectionClosedError("connection poisoned: frame write interrupted"))
-                if self._transport is not None:  # unblock the peer + our read pump
-                    self.backend.close_transport(self._transport)
-                raise
 
     def _maybe_goaway_reply(self):
         """If the peer has GOAWAY'd us with a REAL last-stream-id and no streams remain,
