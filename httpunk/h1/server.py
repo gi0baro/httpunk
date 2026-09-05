@@ -175,15 +175,23 @@ class ServerRequest:
     def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())
 
-    async def respond(self, status: int, *, headers: HeadersInput = None, body: Body = None) -> None:
-        """Send the whole response: head + body. `body` is None, `bytes`, or a
-        (sync/async) iterable of `bytes`. hyper: `Server::encode` + the dispatcher
+    async def respond(
+        self, status: int, *, headers: HeadersInput = None, body: Body = None, trailers: HeadersInput = None
+    ) -> None:
+        """Send the whole response: head + body (+ trailers). `body` is None, `bytes`,
+        or a (sync/async) iterable of `bytes`. hyper: `Server::encode` + the dispatcher
         polling the response `Body`. The pull convenience over `send_response`: same
-        head-time negotiation and completion, plus head+small-body write coalescing."""
+        head-time negotiation and completion, plus head+small-body write coalescing.
+
+        `trailers` are sent after the body as chunked trailers, symmetric with the
+        client's `Request.trailers` (F45): the body is framed chunked regardless of its
+        shape and the fields are declared in a `Trailer` header unless one is already
+        set — hyper's encoder emits only declared fields (`Encoder::encode_trailers`).
+        On HTTP/1.0 (no chunked framing) they are dropped, as hyper does."""
         if self._responded:
             raise RuntimeError("response already sent for this request")
         self._responded = True
-        await self._conn.send_response(self, status, headers, body)
+        await self._conn.send_response(self, status, headers, body, trailers)
 
     async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
         """Push-style response: send the head now and return a `SendStream` to write
@@ -592,16 +600,27 @@ class ServerConnection(H1ConnectionBase):
             pass
         self._close_transport()
 
-    async def send_response(self, req, status, headers, body):
-        """The pull path (`ServerRequest.respond`): head + whole body, with the
-        head+small-body write coalescing of `_send_head_and_body`. Shares head-time
+    async def send_response(self, req, status, headers, body, trailers=None):
+        """The pull path (`ServerRequest.respond`): head + whole body (+ trailers), with
+        the head+small-body write coalescing of `_send_head_and_body`. Shares head-time
         negotiation (`_prepare_head`) and completion (`_finish_response`) with the push
         path, so the two cannot drift; only the write batching differs."""
-        head, is_switch, keep_alive = self._prepare_head(req, status, headers, *self._body_framing(body))
+        content_length, chunked = self._body_framing(body)
+        if trailers is not None:
+            # Trailers ride only on a chunked body (RFC 9112 §7.1.2), and hyper's server
+            # encoder allow-lists them against the response's `Trailer` header (role.rs
+            # L856-891 -> `Kind::Chunked(Some(fields))`): force chunked framing and declare
+            # the fields if the app didn't — the client's F45 treatment of `Request.trailers`.
+            trailers = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
+            headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
+            content_length, chunked = None, True
+            if "trailer" not in headers:
+                headers["trailer"] = ", ".join(trailers.keys())
+        head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
         req._keep_alive_decision = keep_alive
         req._is_switch = is_switch
         try:
-            await self._send_head_and_body(self._codec, head, body)
+            await self._send_head_and_body(self._codec, head, body, trailers)
         except BaseException as exc:
             req._response_done = True
             self._fail_response(exc)

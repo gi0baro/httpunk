@@ -118,11 +118,16 @@ class ServerRequest:
     def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())
 
-    def respond(self, status: int, *, headers: HeadersInput = None, body: Body = None) -> Awaitable[None]:
-        """Send the whole response: HEADERS (+ body, flow-control-gated). `body` is
-        None, `bytes`, or a (sync/async) iterable of `bytes`. The pull convenience over
-        `send_response` (h2: `SendResponse::send_response` + hyper's `PipeToSendStream`)."""
-        return self._manager.send_response(self._stream, status, headers, body)
+    def respond(
+        self, status: int, *, headers: HeadersInput = None, body: Body = None, trailers: HeadersInput = None
+    ) -> Awaitable[None]:
+        """Send the whole response: HEADERS (+ body, flow-control-gated) (+ a trailing
+        HEADERS frame). `body` is None, `bytes`, or a (sync/async) iterable of `bytes`.
+        The pull convenience over `send_response` (h2: `SendResponse::send_response` +
+        hyper's `PipeToSendStream`, whose body may end with trailers). `trailers` are
+        validated (RFC 9113 §8.2.2) before anything is sent, like the client's
+        `Request.trailers`, so a rejected call leaves the stream untouched."""
+        return self._manager.send_response(self._stream, status, headers, body, trailers)
 
     async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
         """Push-style response: send HEADERS now and return a `SendStream` to write the
@@ -358,13 +363,20 @@ class ServerStreamManager(StreamManager):
 
     # ===== sending responses (h2 server.rs SendResponse::send_response) =====
 
-    async def send_response(self, st, status, headers, body):
-        """The pull path (`ServerRequest.respond`): HEADERS + the whole body. Built on the
-        push primitives — `send_response_head`, the inherited `send_body` (which ends on
-        `_finish_send`), `_after_response` — so the two paths cannot drift."""
-        await self.send_response_head(st, status, headers, end_stream=body is None)
-        if body is not None:
-            await self.send_body(st, body)  # END_STREAM on the final DATA, then `_finish_send`
+    async def send_response(self, st, status, headers, body, trailers=None):
+        """The pull path (`ServerRequest.respond`): HEADERS + the whole body (+ trailers).
+        Built on the push primitives — `send_response_head`, the inherited `send_body`
+        (which ends on `_finish_send`), `_after_response` — so the two paths cannot drift."""
+        if trailers is not None:
+            trailers = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
+            # Validate BEFORE the response HEADERS go out (h2 0.4.16 #925 `check_headers`
+            # on trailers): a rejected call must leave the stream able to respond.
+            self.check_send_headers(trailers)
+        end_stream = body is None and trailers is None
+        await self.send_response_head(st, status, headers, end_stream=end_stream)
+        if not end_stream:
+            # END_STREAM on the final DATA (or on the trailers frame), then `_finish_send`.
+            await self.send_body(st, body, trailers)
             await self._after_response(st)
 
     async def send_response_head(self, st, status, headers, *, end_stream):

@@ -573,6 +573,45 @@ async def test_server_push_send_reset_cancels_stream():
 
 
 @pytest.mark.tonio
+async def test_server_respond_with_trailers():
+    """`respond(trailers=)`: a trailing HEADERS frame ends the stream after the body
+    (also for a bodyless response: HEADERS without END_STREAM, then the trailers);
+    connection-specific trailer fields are rejected BEFORE anything is sent, so the
+    stream can still be answered."""
+    listener, host, port = await _listener()
+    rejected = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H2Server(transport) as server:
+            async for req in server:
+                if req.path == "/bad":
+                    try:
+                        await req.respond(200, body=b"x", trailers={"connection": "close"})
+                    except ValueError as exc:
+                        rejected.append(str(exc))
+                        await req.respond(200, body=b"recovered")
+                elif req.path == "/empty":
+                    await req.respond(200, trailers={"x-checksum": "empty"})
+                else:
+                    await req.respond(200, body=b"payload", trailers={"x-checksum": "abc"})
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h2(host, port) as conn:
+            resp = await conn.request("GET", "/body")
+            assert await resp.read() == b"payload"
+            assert resp.trailers["x-checksum"] == b"abc"
+            resp = await conn.request("GET", "/empty")
+            assert await resp.read() == b""
+            assert resp.trailers["x-checksum"] == b"empty"
+            resp = await conn.request("GET", "/bad")
+            assert await resp.read() == b"recovered"
+        s.cancel()
+    assert len(rejected) == 1
+
+
+@pytest.mark.tonio
 async def test_server_goaway_on_remote_reset_flood():
     """Rapid Reset (CVE-2023-44487): a flood of HEADERS+RST_STREAM on streams the app
     never accepts. Reset pending-accept streams stop counting as concurrent, so

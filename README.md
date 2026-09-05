@@ -200,7 +200,9 @@ async with H1Server(transport, backend=Backend.asyncio) as server:
 
 Each `request` carries `method`, `target`/`path`, `headers`, `version`, and a streamable body
 (`request.read()` / `request.aiter_bytes()`). Answer it with `request.respond(status, *,
-headers=None, body=None)`. On HTTP/2 you can also abort a single stream with
+headers=None, body=None, trailers=None)` — `trailers` are sent after the body (HTTP/1.1
+chunked trailers, declared in a `Trailer` header; an HTTP/2 trailing HEADERS frame), like the
+client's `Request.trailers`. On HTTP/2 you can also abort a single stream with
 `request.reset()` instead of responding (e.g. when a handler fails) — the connection and its
 other streams keep running.
 

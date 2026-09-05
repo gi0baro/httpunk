@@ -925,6 +925,98 @@ async def test_server_next_request_refuses_while_push_body_is_open():
     assert nxt is not None and nxt.target == "/b"
 
 
+# ----- response trailers (FR-6) -----
+
+
+@pytest.mark.tonio
+async def test_server_respond_trailers_force_chunked_and_declare_trailer_header():
+    """`respond(trailers=)` mirrors the client's `Request.trailers` (F45): even a `bytes`
+    body is framed chunked, a `Trailer` header declares the fields, and the trailers
+    arrive after the body. Same for a streamed body; an app-set `Trailer` header is kept."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                if req.target == "/bytes":
+                    await req.respond(200, body=b"payload", trailers={"x-checksum": "abc"})
+                else:
+
+                    async def chunks():
+                        yield b"pay"
+                        yield b"load"
+
+                    await req.respond(
+                        200, headers={"trailer": "x-checksum"}, body=chunks(), trailers={"x-checksum": "def"}
+                    )
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            r = await conn.request("GET", "/bytes", headers={"host": "x"})
+            assert r.headers["transfer-encoding"] == b"chunked"  # forced chunked for a bytes body
+            assert r.headers["trailer"] == b"x-checksum"  # declared for the app
+            assert await r.read() == b"payload"
+            assert r.trailers["x-checksum"] == b"abc"
+            r = await conn.request("GET", "/stream", headers={"host": "x"})
+            assert r.headers["trailer"] == b"x-checksum"
+            assert await r.read() == b"payload"
+            assert r.trailers["x-checksum"] == b"def"
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_trailers_undeclared_fields_are_dropped_by_encoder():
+    """hyper `Encoder::encode_trailers`: only fields named in the response's `Trailer`
+    header are emitted (others are dropped). Through the push handle the app owns the
+    `Trailer` header, so an undeclared field never reaches the wire."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                stream = await req.send_response(200, headers={"trailer": "x-declared"})
+                await stream.send_data(b"body")
+                await stream.send_trailers({"x-declared": "yes", "x-undeclared": "no"})
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            r = await conn.request("GET", "/", headers={"host": "x"})
+            assert await r.read() == b"body"
+            assert r.trailers["x-declared"] == b"yes"
+            assert r.trailers.get("x-undeclared") is None
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_respond_trailers_dropped_on_http10():
+    """HTTP/1.0 has no chunked framing: the body is close-delimited and the trailers are
+    dropped (hyper's close-delimited encoder emits none), not written as garbage."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                await req.respond(200, body=b"old", trailers={"x-checksum": "abc"})
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET / HTTP/1.0\r\nhost: x\r\n\r\n")
+            data = await _drain_all(transport)
+            assert data.startswith(b"HTTP/1.0 200")
+            assert data.endswith(b"\r\n\r\nold")
+            assert b"x-checksum: abc" not in data
+        finally:
+            transport.close()
+            s.cancel()
+
+
 @pytest.mark.tonio
 async def test_h2_preface_closes_silently_without_response():
     """An h1 server that receives the HTTP/2 prior-knowledge preface closes silently
