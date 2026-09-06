@@ -138,6 +138,19 @@ fn classify_hpack(
 
 /// Upper bound on CONTINUATION frames per header block (h2 codec heuristic) —
 /// this is the CONTINUATION-flood DoS guard.
+/// The RFC 9113 §6.5.2 range for SETTINGS_MAX_FRAME_SIZE (h2 frame/settings.rs
+/// asserts it): every entry point that stores one validates here, so an
+/// out-of-range value is a `ValueError`, never a zero divisor or a truncated
+/// 3-byte length field.
+fn check_max_frame_size(val: u32) -> PyResult<()> {
+    if !(DEFAULT_MAX_FRAME_SIZE as u32..=MAX_MAX_FRAME_SIZE).contains(&val) {
+        return Err(PyValueError::new_err(format!(
+            "max_frame_size must be in [{DEFAULT_MAX_FRAME_SIZE}, {MAX_MAX_FRAME_SIZE}], got {val}"
+        )));
+    }
+    Ok(())
+}
+
 fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
     let min_frames_for_list = (header_max / frame_max).max(1);
     let padding = min_frames_for_list >> 2; // ~25%
@@ -554,11 +567,13 @@ impl H2Codec {
     /// payload we now accept on receive. Also recomputes the CONTINUATION-flood
     /// cap, which is derived from the frame size (h2 framed_read.rs
     /// `set_max_frame_size` -> `calc_max_continuation_frames`).
-    fn set_max_recv_frame_size(&self, val: u32) {
+    fn set_max_recv_frame_size(&self, val: u32) -> PyResult<()> {
+        check_max_frame_size(val)?; // also keeps `calc_max_continuation_frames` off a zero divisor
         let mut c = self.inner.lock().unwrap();
         c.max_recv_frame_size = val as usize;
         c.max_continuation_frames =
             calc_max_continuation_frames(c.max_header_list_size, c.max_recv_frame_size);
+        Ok(())
     }
 
     /// Apply our own SETTINGS_MAX_HEADER_LIST_SIZE (on peer ACK): the decoded
@@ -573,8 +588,10 @@ impl H2Codec {
 
     /// Apply the peer's SETTINGS_MAX_FRAME_SIZE: the per-frame payload budget for
     /// what *we* serialize (h2 framed_write.rs `set_max_frame_size`).
-    fn set_send_max_frame_size(&self, val: u32) {
+    fn set_send_max_frame_size(&self, val: u32) -> PyResult<()> {
+        check_max_frame_size(val)?; // the 3-byte length field cannot carry more than 2^24-1
         self.inner.lock().unwrap().send_max_frame_size = val as usize;
+        Ok(())
     }
 
     // ===== serialize (outbound) =====================================
@@ -749,15 +766,21 @@ impl H2Codec {
         // A DATA payload may not exceed the peer's SETTINGS_MAX_FRAME_SIZE (h2:
         // `Encoder::buffer` -> `UserError::PayloadTooBig`, framed_write.rs). The
         // 3-byte length field would also overflow past 2^24-1.
-        let max = self.inner.lock().unwrap().send_max_frame_size;
-        if data.len() > max {
-            return Err(user_payload_too_big(data.len(), max));
-        }
-        let flags = if end_stream { FLAG_END_STREAM } else { 0 };
-        let head = Head::new(Kind::Data, flags, frame::StreamId::from(stream_id));
-        let mut dst = BytesMut::with_capacity(HEADER_LEN + data.len());
-        head.encode(data.len(), &mut dst);
-        dst.extend_from_slice(data);
+        // Check and encode under ONE acquisition, so a concurrent SETTINGS-driven
+        // `set_send_max_frame_size` cannot lower the bound between the two.
+        let dst = {
+            let c = self.inner.lock().unwrap();
+            let max = c.send_max_frame_size;
+            if data.len() > max {
+                return Err(user_payload_too_big(data.len(), max));
+            }
+            let flags = if end_stream { FLAG_END_STREAM } else { 0 };
+            let head = Head::new(Kind::Data, flags, frame::StreamId::from(stream_id));
+            let mut dst = BytesMut::with_capacity(HEADER_LEN + data.len());
+            head.encode(data.len(), &mut dst);
+            dst.extend_from_slice(data);
+            dst
+        };
         Ok(PyBytes::new(py, &dst).unbind())
     }
 

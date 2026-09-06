@@ -19,3 +19,13 @@ def test_raw_items_matches_items_with_bytes_names():
 
 def test_raw_items_empty():
     assert HeaderMap().raw_items() == []
+
+
+def test_equality_with_itself_and_across_maps_does_not_deadlock():
+    """`HeaderMap.__eq__` must never hold both maps' locks at once: `m == m` on the
+    non-reentrant Rust mutex used to self-deadlock, and `a == b` racing `b == a` on two
+    threads could acquire the pair in opposite orders."""
+    m = HeaderMap([("a", "1")])
+    assert m == m
+    assert m != HeaderMap([("a", "2")])
+    assert HeaderMap([("a", "1")]) == m

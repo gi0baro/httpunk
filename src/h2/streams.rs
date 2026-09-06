@@ -119,11 +119,17 @@ impl H2StreamState {
         Ok(())
     }
 
-    fn set_scheduled_reset(&self, reason: u32) {
-        self.inner
-            .lock()
-            .unwrap()
-            .set_scheduled_reset(Reason::from(reason));
+    /// Schedule a reset on a stream that is still open — check-and-act under one
+    /// acquisition, so a peer's reset landing in between cannot trip the vendored
+    /// `debug_assert!(!self.is_closed())` (state.rs L347). Returns whether it was
+    /// scheduled (`False`: already closed, nothing to reset).
+    fn set_scheduled_reset(&self, reason: u32) -> bool {
+        let mut st = self.inner.lock().unwrap();
+        if st.is_closed() {
+            return false;
+        }
+        st.set_scheduled_reset(Reason::from(reason));
+        true
     }
 
     // ----- queries -----
@@ -182,6 +188,20 @@ impl H2StreamState {
     }
 }
 
+/// h2's window arithmetic is `i32` behind a `u32` `WindowSize` (flow_control.rs L216,
+/// L226 cast `as i32`): an amount above 2^31-1 — which the wire can never carry
+/// (`WindowUpdate::load` masks to 31 bits) — would flip sign and corrupt the window.
+/// Reject it at the boundary instead.
+fn check_window_size(sz: u32) -> PyResult<()> {
+    const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
+    if sz > MAX_WINDOW_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "window size {sz} exceeds the maximum {MAX_WINDOW_SIZE} (RFC 9113 6.9.1)"
+        )));
+    }
+    Ok(())
+}
+
 #[pyclass(module = "httpunk._httpunk", name = "H2FlowControl", frozen)]
 pub struct H2FlowControl {
     inner: Mutex<FlowControl>,
@@ -213,6 +233,7 @@ impl H2FlowControl {
     }
 
     fn claim_capacity(&self, capacity: u32) -> PyResult<()> {
+        check_window_size(capacity)?;
         self.inner
             .lock()
             .unwrap()
@@ -221,6 +242,7 @@ impl H2FlowControl {
     }
 
     fn assign_capacity(&self, capacity: u32) -> PyResult<()> {
+        check_window_size(capacity)?;
         self.inner
             .lock()
             .unwrap()
@@ -229,6 +251,7 @@ impl H2FlowControl {
     }
 
     fn inc_window(&self, sz: u32) -> PyResult<()> {
+        check_window_size(sz)?;
         self.inner
             .lock()
             .unwrap()
@@ -237,6 +260,7 @@ impl H2FlowControl {
     }
 
     fn dec_send_window(&self, sz: u32) -> PyResult<()> {
+        check_window_size(sz)?;
         self.inner
             .lock()
             .unwrap()
@@ -245,6 +269,7 @@ impl H2FlowControl {
     }
 
     fn dec_recv_window(&self, sz: u32) -> PyResult<()> {
+        check_window_size(sz)?;
         self.inner
             .lock()
             .unwrap()
@@ -366,7 +391,7 @@ impl Budget {
     }
 
     fn replenish(&mut self, n: usize) {
-        self.current = (self.current + n).min(self.max);
+        self.current = self.current.saturating_add(n).min(self.max);
     }
 }
 

@@ -6,6 +6,8 @@ The HEADERS block below is a hand-encoded, spec-valid HPACK header block:
   - 0x40 ...        -> literal w/ incremental indexing, new name "x-test": "hi"
 """
 
+import pytest
+
 from httpunk import _httpunk
 from httpunk.http import HeaderMap
 
@@ -211,3 +213,17 @@ def test_padded_data_exposes_flow_controlled_len_distinct_from_payload():
     assert frame.data == b"hello"  # padding stripped from the delivered payload
     assert frame.flow_controlled_len == len(payload)  # 9 = 5 (data) + 3 (pad) + 1 (pad-len byte)
     assert frame.flow_controlled_len > len(frame.data)  # the overhead the driver must reclaim
+
+
+def test_max_frame_size_setters_reject_out_of_range_values():
+    """Both frame-size setters validate the RFC 9113 §6.5.2 range: a zero would divide
+    the CONTINUATION cap by zero (a process abort under `panic = "abort"`), a value
+    past 2^24-1 cannot fit the 3-byte length field."""
+    codec = _httpunk.H2Codec()
+    for bad in (0, 16383, (1 << 24)):
+        with pytest.raises(ValueError, match="max_frame_size"):
+            codec.set_max_recv_frame_size(bad)
+        with pytest.raises(ValueError, match="max_frame_size"):
+            codec.set_send_max_frame_size(bad)
+    codec.set_max_recv_frame_size(16384)
+    codec.set_send_max_frame_size((1 << 24) - 1)

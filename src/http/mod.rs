@@ -273,7 +273,22 @@ impl HeaderMap {
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
         match other.cast::<HeaderMap>() {
-            Ok(other) => *self.inner.lock().unwrap() == other.get().snapshot(),
+            Ok(other) => {
+                let other = other.get();
+                if std::ptr::eq(self, other) {
+                    return true; // the non-reentrant `Mutex` would self-deadlock on `m == m`
+                }
+                // The ONE place two `HeaderMap` locks are held together: always taken in
+                // address order, so `a == b` racing `b == a` on two threads cannot deadlock.
+                let (first, second) = if std::ptr::from_ref(self) < std::ptr::from_ref(other) {
+                    (self, other)
+                } else {
+                    (other, self)
+                };
+                let g1 = first.inner.lock().unwrap();
+                let g2 = second.inner.lock().unwrap();
+                *g1 == *g2
+            }
             Err(_) => false,
         }
     }

@@ -411,26 +411,30 @@ impl H1Codec {
             content_length.map(Some)
         };
         let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
-        let req_method = self.inner.lock().unwrap().req_method.clone();
+        // ONE critical section from reading `req_method` to publishing the encoder and
+        // its verdicts: the call is one atomic step, as every codec method must be.
         // hyper `Server::encode` rejects a 1xx (not 101) status and a
         // content-length + transfer-encoding pair as `User` errors
         // (`H1UserError`); the connection then closes (conn.rs `encode_head`
         // -> `Writing::Closed` + the error stored on the connection).
-        let (dst, encoder) = encode_response(
-            status,
-            fields,
-            body,
-            req_method,
-            keep_alive,
-            http10,
-            self.title_case_headers,
-            self.date_header,
-        )
-        .map_err(map_hyper_err)?;
-        let mut st = self.inner.lock().unwrap();
-        st.response_is_last = encoder.is_last();
-        st.response_close_delimited = encoder.is_close_delimited();
-        st.encoder = Some(encoder);
+        let dst = {
+            let mut st = self.inner.lock().unwrap();
+            let (dst, encoder) = encode_response(
+                status,
+                fields,
+                body,
+                st.req_method.clone(),
+                keep_alive,
+                http10,
+                self.title_case_headers,
+                self.date_header,
+            )
+            .map_err(map_hyper_err)?;
+            st.response_is_last = encoder.is_last();
+            st.response_close_delimited = encoder.is_close_delimited();
+            st.encoder = Some(encoder);
+            dst
+        };
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
