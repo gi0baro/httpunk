@@ -171,6 +171,16 @@ class H1Codec:
         `trailer_fields` declares chunked trailer field names (the `Trailer` header)
         that `serialize_trailers` may then emit."""
 
+    @property
+    def request_connection_close(self) -> bool:
+        """The last `serialize_request` carried `Connection: close` on any line (hyper
+        `connection_any_close`): never reuse the connection, whatever the response says."""
+
+    @staticmethod
+    def connection_close(headers: HeaderMap) -> bool:
+        """Any `Connection` line of `headers` carries a `close` token (hyper
+        `headers::connection_any_close`)."""
+
     def serialize_response(
         self,
         status: int,
@@ -236,6 +246,7 @@ class H1RequestHead:
     expect_continue: bool  # client sent `Expect: 100-continue`
     is_upgrade: bool  # CONNECT / Upgrade
     http10: bool
+    allow_trailers: bool  # the request declared `TE: trailers` (hyper `te_is_trailers`)
     def __repr__(self) -> str: ...
 
 class H1BodyDecoder:

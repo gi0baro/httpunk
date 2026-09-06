@@ -18,8 +18,8 @@ use std::sync::Mutex;
 use super::errors::map_hyper_err;
 use crate::http::HeaderMap;
 use vendor_hyper::{
-    BodyDecode, BodyDecoder, BodyEncoder, encode_request, encode_response, parse_request,
-    parse_response,
+    BodyDecode, BodyDecoder, BodyEncoder, connection_any_close, encode_request, encode_response,
+    parse_request, parse_response,
 };
 
 /// Map a facade `BodyDecode` to the `(body_kind, content_length)` a Python driver
@@ -49,6 +49,9 @@ struct State {
     req_method: Option<Method>,
     /// Body framing for the in-flight request (chunked / content-length).
     encoder: Option<BodyEncoder>,
+    /// The in-flight request carried `Connection: close` (any line): hyper's client
+    /// `encode_head` -> `connection_any_close` -> `disable_keep_alive` (1.11.1).
+    request_connection_close: bool,
 }
 
 /// A synchronous HTTP/1 codec (client + server roles).
@@ -81,6 +84,7 @@ impl H1Codec {
                 buf: BytesMut::new(),
                 req_method: None,
                 encoder: None,
+                request_connection_close: false,
             }),
             max_headers,
             ignore_invalid_headers,
@@ -122,12 +126,30 @@ impl H1Codec {
             .map(|n| HeaderName::from_bytes(n.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| value_err("invalid trailer field name", e))?;
+        let connection_close = connection_any_close(&fields);
         let (dst, encoder) = encode_request(m.clone(), uri, fields, body, http10, trailers)
             .map_err(map_hyper_err)?;
         let mut st = self.inner.lock().unwrap();
         st.req_method = Some(m);
         st.encoder = Some(encoder);
+        st.request_connection_close = connection_close;
         Ok(PyBytes::new(py, &dst).unbind())
+    }
+
+    /// The request serialized by `serialize_request` carried `Connection: close` on any
+    /// line (hyper `connection_any_close`): the client must not reuse the connection
+    /// whatever the response says (conn.rs `encode_head` -> `disable_keep_alive`).
+    #[getter]
+    fn request_connection_close(&self) -> bool {
+        self.inner.lock().unwrap().request_connection_close
+    }
+
+    /// Any `Connection` line of `headers` carries a `close` token — hyper
+    /// `headers::connection_any_close`; the server driver's keep-alive negotiation
+    /// reads a response's close intent with it before `serialize_response`.
+    #[staticmethod]
+    fn connection_close(headers: &HeaderMap) -> bool {
+        headers.with_inner(connection_any_close)
     }
 
     /// Frame one body chunk (chunked prefix/CRLF, or raw for content-length).
@@ -242,6 +264,7 @@ impl H1Codec {
                         expect_continue: head.expect_continue,
                         is_upgrade: head.wants_upgrade,
                         http10: head.http10,
+                        allow_trailers: head.allow_trailers,
                     },
                 )?;
                 Ok(Some(event.into_any()))
@@ -370,6 +393,10 @@ pub struct RequestHead {
     /// The request was HTTP/1.0 (the response must reflect the version).
     #[pyo3(get)]
     pub http10: bool,
+    /// The request declared `TE: trailers` (hyper `te_is_trailers`): response trailers
+    /// may be sent; otherwise hyper's server drops them.
+    #[pyo3(get)]
+    pub allow_trailers: bool,
 }
 
 #[pymethods]

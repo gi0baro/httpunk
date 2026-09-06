@@ -21,7 +21,7 @@ the accept loop are the caller's job. Usage:
             body = await request.read()
             await request.respond(200, headers={"content-type": "text/plain"}, body=b"hi")
 
-Cross-reference: hyper 1.10.1 `proto/h1/{role,conn,dispatch}.rs` (server path) and
+Cross-reference: hyper 1.11.1 `proto/h1/{role,conn,dispatch}.rs` (server path) and
 `client/conn`/`server/conn`.
 """
 
@@ -67,18 +67,6 @@ _H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 _PEER_CLOSED_MSG = "connection closed before message completed: the client closed its side mid-request"
 
 
-def _connection_has(headers, token):
-    """True if the `Connection` header (any value, comma-split, case-insensitive)
-    carries `token` — e.g. a response `Connection: close`."""
-    if headers is None:
-        return False
-    for value in headers.get_all("connection"):
-        for part in bytes(value).decode("latin-1").split(","):
-            if part.strip().lower() == token:
-                return True
-    return False
-
-
 def _error_status(kind):
     """Map a request-head parse error (`H1ParseError.args[0]`, the hyper `Parse`
     variant) to hyper's automatic status (`Server::on_error`, role.rs L481-499):
@@ -119,6 +107,7 @@ class ServerRequest:
         is_upgrade,
         http10,
         content_length,
+        allow_trailers,
     ):
         self.method = method  # str
         self.target = target  # str — the request-target (origin/absolute/authority form)
@@ -129,6 +118,10 @@ class ServerRequest:
         self.keep_alive = keep_alive
         self.is_upgrade = is_upgrade
         self.content_length = content_length  # declared request Content-Length (None if chunked)
+        # The client declared `TE: trailers`: response trailers may be sent. Without it
+        # hyper's server silently drops them (`Conn::write_trailers` -> "trailers not
+        # allowed to be sent") and the body ends with the bare terminator.
+        self._allow_trailer_fields = allow_trailers
         # The raw tunnel once the app answers a CONNECT/Upgrade with a 101 or a 2xx
         # to CONNECT (hyper `on_upgrade`): the caller owns it and drives it directly.
         self.upgraded = None
@@ -352,7 +345,12 @@ class SendStream:
         hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
         self._done = True
         try:
-            buf = self._codec.serialize_trailers(hdrs)
+            if self._req._allow_trailer_fields:
+                buf = self._codec.serialize_trailers(hdrs)
+            else:
+                # No `TE: trailers` on the request: hyper writes nothing for the trailers
+                # and the body then ends as usual (`end_body`) — the bare terminator.
+                buf = self._codec.serialize_end()
         except BaseException as exc:
             self._req._close_window()
             self._conn._fail_response(exc)
@@ -723,6 +721,7 @@ class ServerConnection(H1ConnectionBase):
             headers=head.headers,
             decoder=decoder,
             keep_alive=head.keep_alive,
+            allow_trailers=head.allow_trailers,  # hyper `read_head`: `te_is_trailers(headers)`
             expect_continue=head.expect_continue,
             is_upgrade=head.is_upgrade,
             http10=head.http10,
@@ -899,6 +898,11 @@ class ServerConnection(H1ConnectionBase):
             content_length, chunked = None, True
             if "trailer" not in headers:
                 headers["trailer"] = ", ".join(trailers.keys())
+            if not req._allow_trailer_fields:
+                # No `TE: trailers` on the request: hyper `write_trailers` writes nothing and
+                # the body ends with the bare terminator (`end_body`). Framing and the `Trailer`
+                # declaration stay as the app shaped them — hyper encodes the head it was given.
+                trailers = None
         head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
         req._keep_alive_decision = keep_alive
         req._is_switch = is_switch
@@ -1015,7 +1019,7 @@ class ServerConnection(H1ConnectionBase):
         # unread request body is drained-or-closed later, in next_request — matching
         # hyper, whose drain runs in a poll_read after the response is written, so the
         # already-sent response keeps its keep-alive header and a failed drain just FINs.)
-        resp_close = _connection_has(hdrs, "close")
+        resp_close = hdrs is not None and H1Codec.connection_close(hdrs)
         keep_alive = req.keep_alive and not resp_close and not close_delimited and not is_switch
         if status == 101 and not is_switch:
             keep_alive = False  # a 101 the request didn't ask for still ends the connection (hyper is_last)

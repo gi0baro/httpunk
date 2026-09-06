@@ -202,9 +202,11 @@ Each `request` carries `method`, `target`/`path`, `headers`, `version`, and a st
 (`request.read()` / `request.aiter_bytes()`). Answer it with `request.respond(status, *,
 headers=None, body=None, trailers=None)` — `trailers` are sent after the body (HTTP/1.1
 chunked trailers, declared in a `Trailer` header; an HTTP/2 trailing HEADERS frame), like the
-client's `Request.trailers`. On HTTP/2 you can also abort a single stream with
-`request.reset()` instead of responding (e.g. when a handler fails) — the connection and its
-other streams keep running — and `await request.reset_received()` resolves with the reason
+client's `Request.trailers`. On HTTP/1.1 they go out only if the request declared
+`TE: trailers`; otherwise they are dropped and the body ends normally, as hyper's server does.
+On HTTP/2 you can also abort a single stream with `request.reset()` instead of responding
+(e.g. when a handler fails) — the connection and its other streams keep running — and
+`await request.reset_received()` resolves with the reason
 when the *client* abandons the request (`RST_STREAM`, even after it finished sending), the
 signal a long-running or streaming handler races against its own completion to stop early.
 A reset also fails an in-flight `respond()` / `send_data` with `StreamResetError` carrying the

@@ -1,4 +1,4 @@
-//! Vendored from hyperium/hyper 1.10.1 (MIT licensed — see `THIRD-PARTY.md`).
+//! Vendored from hyperium/hyper 1.11.1 (MIT licensed — see `THIRD-PARTY.md`).
 //!
 //! Only hyper's **synchronous, sans-IO** HTTP/1 pieces are vendored: `proto::h1`
 //! head parse/encode (`role`) and the body `Encoder` (`encode`), plus the tiny
@@ -56,7 +56,7 @@ pub mod proto;
 // crate — the rest is hyper-internal machinery). See
 // `proto/h1/httpunk.rs`.
 pub use crate::proto::h1::httpunk::{
-    date_header_value, encode_request, encode_response, error_kind, error_parse_kind,
-    error_user_kind, parse_request, parse_response, BodyDecode, BodyDecoder, BodyEncoder,
-    ParsedHead, ParsedRequest,
+    connection_any_close, date_header_value, encode_request, encode_response, error_kind,
+    error_parse_kind, error_user_kind, parse_request, parse_response, BodyDecode, BodyDecoder,
+    BodyEncoder, ParsedHead, ParsedRequest,
 };

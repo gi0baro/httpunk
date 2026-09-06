@@ -1001,12 +1001,12 @@ async def test_server_respond_trailers_force_chunked_and_declare_trailer_header(
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/bytes", headers={"host": "x"})
+            r = await conn.request("GET", "/bytes", headers={"host": "x", "te": "trailers"})
             assert r.headers["transfer-encoding"] == b"chunked"  # forced chunked for a bytes body
             assert r.headers["trailer"] == b"x-checksum"  # declared for the app
             assert await r.read() == b"payload"
             assert r.trailers["x-checksum"] == b"abc"
-            r = await conn.request("GET", "/stream", headers={"host": "x"})
+            r = await conn.request("GET", "/stream", headers={"host": "x", "te": "trailers"})
             assert r.headers["trailer"] == b"x-checksum"
             assert await r.read() == b"payload"
             assert r.trailers["x-checksum"] == b"def"
@@ -1031,11 +1031,62 @@ async def test_server_trailers_undeclared_fields_are_dropped_by_encoder():
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/", headers={"host": "x"})
+            r = await conn.request("GET", "/", headers={"host": "x", "te": "trailers"})
             assert await r.read() == b"body"
             assert r.trailers["x-declared"] == b"yes"
             assert r.trailers.get("x-undeclared") is None
         s.cancel()
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize("path", ["pull", "push"])
+async def test_server_trailers_dropped_without_te_trailers(path):
+    """hyper's server sends response trailers only if the request declared `TE: trailers`
+    (conn.rs `read_head` -> `allow_trailer_fields`; `write_trailers` -> "trailers not
+    allowed to be sent"): without it the trailer block is not written and the body ends
+    with the bare chunked terminator. The framing and the `Trailer` declaration are the
+    app's head as given. Both the pull and the push path (a silent client: the push
+    response arms the mid-message watcher, which must not read the stub's EOF)."""
+    stub = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    assert not req._allow_trailer_fields
+    if path == "pull":
+        await req.respond(200, body=b"payload", trailers={"x-checksum": "abc"})
+    else:
+        stream = await req.send_response(200, headers={"trailer": "x-checksum"})
+        await stream.send_data(b"payload")
+        await stream.send_trailers({"x-checksum": "abc"})
+    head, _, body = stub.sent.partition(b"\r\n\r\n")
+    assert b"trailer: x-checksum" in head.lower()
+    assert body == b"7\r\npayload\r\n0\r\n\r\n"  # bare terminator, no trailer block
+    assert b"x-checksum: abc" not in stub.sent
+    await conn.close()  # ends the watcher's parked read (push path)
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize(
+    ("te_lines", "allowed"),
+    [
+        (b"te: trailers\r\n", True),
+        (b"te: gzip, Trailers\r\n", True),  # any position in the list, case-insensitive
+        (b"te: gzip\r\nte: trailers\r\n", True),  # any of several TE lines
+        (b"te: gzip\r\n", False),
+        (b"te: trailers-please\r\n", False),  # a token, not a prefix
+    ],
+)
+async def test_server_te_trailers_token_forms(te_lines, allowed):
+    """hyper 1.11.1 `headers::te_is_trailers`: the `trailers` token may sit in any `TE` line,
+    at any position of its comma list, in any case — earlier hyper only matched a first
+    line equal to `trailers`."""
+    stub = _StubTransport(b"GET / HTTP/1.1\r\nhost: x\r\n" + te_lines + b"\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    assert req._allow_trailer_fields is allowed
+    await req.respond(200, body=b"payload", trailers={"x-checksum": "abc"})
+    assert (b"\r\n0\r\nx-checksum: abc\r\n\r\n" in stub.sent) is allowed
 
 
 @pytest.mark.tonio
@@ -1054,7 +1105,7 @@ async def test_server_respond_trailers_dropped_on_http10():
         s.spawn(serve())
         transport = await _raw_client(host, port)
         try:
-            await transport.send_all(b"GET / HTTP/1.0\r\nhost: x\r\n\r\n")
+            await transport.send_all(b"GET / HTTP/1.0\r\nhost: x\r\nte: trailers\r\n\r\n")
             data = await _drain_all(transport)
             assert data.startswith(b"HTTP/1.0 200")
             assert data.endswith(b"\r\n\r\nold")

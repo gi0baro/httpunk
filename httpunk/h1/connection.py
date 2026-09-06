@@ -10,7 +10,7 @@ like h2). Only the transport-ownership + body-framing/send + teardown leaves are
 genuinely shared, and they live here. All byte work is the Rust sans-IO core
 (`H1Codec` head parse/encode + body encode, `H1BodyDecoder` body decode).
 
-Cross-reference: hyperium/hyper 1.11.0 `src/proto/h1/{conn,dispatch,role}.rs`.
+Cross-reference: hyperium/hyper 1.11.1 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
 from .. import _backend

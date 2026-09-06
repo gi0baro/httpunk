@@ -7,7 +7,15 @@ from _client import open_h1
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
-from httpunk import H1BodyError, H1IncompleteMessageError, H1UnexpectedMessageError, H1UserError, HTTPunkError, Version
+from httpunk import (
+    H1BodyError,
+    H1IncompleteMessageError,
+    H1UnexpectedMessageError,
+    H1UserError,
+    HeaderMap,
+    HTTPunkError,
+    Version,
+)
 
 
 async def _read_request(stream):
@@ -717,3 +725,35 @@ async def test_request_body_short_of_content_length_is_user_error():
             assert ei.value.args[0] == "body_write_aborted"
         await done.wait()
         s.cancel()
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize(
+    "connection_headers",
+    [
+        [("connection", "close")],
+        [("connection", "keep-alive, Close")],  # any position in the list, case-insensitive
+        [("connection", "keep-alive"), ("connection", "close")],  # any of several lines
+    ],
+)
+async def test_request_connection_close_is_never_reused(connection_headers):
+    """A request carrying `Connection: close` is not reused even when the server ignores it
+    and answers keep-alive: hyper 1.11.1 `encode_head` -> `connection_any_close` ->
+    `disable_keep_alive` up front (previously reuse was derived from the response alone).
+    The connection closes once the response is consumed."""
+    listener, host, port = await _listener()
+    requests, done = [], Event()
+    keep_alive_response = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"  # no `Connection: close`
+
+    async with scope() as s:
+        s.spawn(_serve(listener, [keep_alive_response], requests, done))
+        async with open_h1(host, port) as conn:
+            headers = HeaderMap([("host", f"{host}:{port}"), *connection_headers])
+            resp = await conn.request("GET", "/", headers=headers)
+            assert await resp.read() == b"ok"
+            assert conn.closed
+            with pytest.raises(HTTPunkError):
+                await conn.request("GET", "/again", headers={"host": f"{host}:{port}"})
+        await done.wait()
+        s.cancel()
+    assert len(requests) == 1

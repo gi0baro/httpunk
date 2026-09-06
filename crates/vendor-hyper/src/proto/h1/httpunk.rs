@@ -133,6 +133,17 @@ pub struct ParsedRequest {
     /// response version — hyper `enforce_version`/`fix_keep_alive` (conn.rs): a
     /// 1.0 response defaults to close and cannot use chunked framing.
     pub http10: bool,
+    /// The request declared `TE: trailers`, so the response may carry trailers —
+    /// hyper conn.rs `read_head`: `allow_trailer_fields = te_is_trailers(headers)`;
+    /// without it `write_trailers` drops them.
+    pub allow_trailers: bool,
+}
+
+/// Any `Connection` header line carries a `close` token — hyper `headers::
+/// connection_any_close`, what the client's `encode_head` checks to disable
+/// keep-alive up front (1.11.1) and what `Server::encode` treats as `is_last`.
+pub fn connection_any_close(headers: &HeaderMap) -> bool {
+    crate::headers::connection_any_close(headers)
 }
 
 /// Owns the vendored body `Encoder` and frames request-body chunks into bytes,
@@ -334,6 +345,7 @@ pub fn parse_request(
             Ok(Some(ParsedRequest {
                 method: m.to_string(),
                 target: uri.to_string(),
+                allow_trailers: crate::headers::te_is_trailers(&parsed.head.headers),
                 headers: parsed.head.headers,
                 body: map_body(parsed.decode),
                 keep_alive: parsed.keep_alive,

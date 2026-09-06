@@ -74,6 +74,12 @@ impl HeaderMap {
         self.inner.lock().unwrap().clone()
     }
 
+    /// Run `f` over the inner map under its lock — a borrow for read-only scans
+    /// (the codec's header-token checks) that would otherwise `snapshot` a clone.
+    pub(crate) fn with_inner<R>(&self, f: impl FnOnce(&HttpHeaderMap) -> R) -> R {
+        f(&self.inner.lock().unwrap())
+    }
+
     /// Number of values (crate-visible; `__len__` itself is private to pymethods).
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().unwrap().len()

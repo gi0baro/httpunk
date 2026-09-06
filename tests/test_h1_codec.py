@@ -183,3 +183,17 @@ def test_invalid_status_argument_stays_value_error():
     codec = H1Codec()
     with pytest.raises(ValueError, match="invalid status"):
         codec.serialize_response(1000)
+
+
+def test_head_terminated_by_bare_lf_then_crlf_parses():
+    """hyper 1.11.1 `is_complete_fast`: a bare-LF header line ending followed by a CRLF
+    blank line ends the head (httparse accepts it), so the partial-read fast path must
+    recognise it too instead of waiting for more bytes. Both roles."""
+    codec = H1Codec()
+    head = codec.receive_request_head(b"GET / HTTP/1.1\r\na: b\n\r\n")
+    assert head is not None and head.headers["a"] == b"b"
+
+    codec = H1Codec()
+    codec.serialize_request("GET", "http://h/", HeaderMap([("host", "h")]))
+    head = codec.receive_head(b"HTTP/1.1 204 No Content\r\na: b\n\r\n")
+    assert head is not None and head.status == 204 and head.headers["a"] == b"b"

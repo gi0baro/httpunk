@@ -70,9 +70,10 @@ class Connection(H1ConnectionBase):
       (role.rs L1013), so they never surface here.
     - A 101 upgrade / 2xx-to-CONNECT hands the raw transport to the caller as an
       `H1Upgraded` (`resp.upgraded`); the driver detaches (hyper `on_upgrade`).
-    - `Expect: 100-continue` and the request's `Connection: close` are non-gaps for
-      the client: hyper hard-codes `expect_continue: false` (role.rs L1161) and
-      derives reuse solely from the response's keep-alive (conn.rs L294).
+    - `Expect: 100-continue` is a non-gap for the client: hyper hard-codes
+      `expect_continue: false` (role.rs L1161). A request's own `Connection: close`
+      disables reuse up front (conn.rs `encode_head` -> `connection_any_close`,
+      1.11.1), ANDed with the response's keep-alive (conn.rs L294).
     - While reusable-idle, a watcher task holds read interest — the re-expression
       of hyper's always-polled `Connection` future (see `_watch_idle`) — so an
       idle peer close or stray byte flips `closed`/`error` when it happens, and
@@ -420,7 +421,13 @@ class Connection(H1ConnectionBase):
             # "the request body was fully sent". A close-delimited body ends only at
             # EOF (the server closes to signal end), so it can never be reused even if
             # the keep-alive signal said otherwise (hyper conn.rs L458-489).
-            resp_keep_alive = resp_head.keep_alive and resp_head.body_kind != "close"
+            # A request carrying `Connection: close` (any line, any position) is never
+            # reused, whatever the response says: hyper 1.11.1 `encode_head` ->
+            # `connection_any_close` -> `disable_keep_alive` up front, so a server that
+            # ignores the request-side close does not leave the connection reusable.
+            resp_keep_alive = (
+                resp_head.keep_alive and resp_head.body_kind != "close" and not codec.request_connection_close
+            )
             # The response body owns the slot from here; it releases it (and resolves
             # the writer) when fully read or on aclose. A bodyless response has nothing
             # to read, so resolve it now (in this async context) instead.
