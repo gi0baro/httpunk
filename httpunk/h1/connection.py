@@ -1,7 +1,8 @@
-"""HTTP/1 connection driver base — the role-agnostic leaf layer shared by the
-client `Connection` (client.py) and the server `ServerConnection` (server.py),
-mirroring hyper's generic `Conn<T: Http1Transaction>` (the connection state +
-IO shared by both roles).
+"""HTTP/1 framing leaves — the role-agnostic layer shared by the client
+`Connection` (client.py) and the server `ServerConnection` (server.py): the
+write half of hyper's generic `Conn<T: Http1Transaction>` (body framing + send).
+The connection STATE of each role is Rust (`H1ClientState` / `H1ServerState`,
+src/h1/conn.rs); each driver subclasses its state and mixes this in.
 
 HTTP/1 is a role *inversion* — the client writes a request then reads a response;
 the server reads a request then writes a response — so the orchestration is
@@ -13,9 +14,7 @@ genuinely shared, and they live here. All byte work is the Rust sans-IO core
 Cross-reference: hyperium/hyper 1.11.1 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
-from .. import _backend
 from .._common import aiter_body
-from ..exceptions import ConnectionClosedError
 
 
 _READ_SIZE = 65536
@@ -33,55 +32,10 @@ _READ_SIZE = 65536
 _COALESCE_MAX = 8192
 
 
-class H1ConnectionBase:
-    """Role-agnostic h1 connection leaves over a caller-supplied transport
-    (hyper's `Conn`). Subclassed by the client `Connection` and the server
-    `ServerConnection`, which add the role-specific orchestration."""
-
-    def __init__(self, transport, *, backend=None):
-        self.transport = transport
-        self.backend = _backend.resolve(backend)
-        self._closed = False
-        # Set once the connection is handed off as a raw tunnel (101 / CONNECT):
-        # the transport belongs to an `H1Upgraded` the caller owns — don't close it.
-        self._upgraded = False
-
-    def _close_transport(self):
-        # Close + null the transport, unless it was handed to an `H1Upgraded`
-        # tunnel (hyper: after `on_upgrade`/`into_parts` the driver no longer owns
-        # it). Nulling makes a later close / failure path a no-op.
-        if self.transport is not None and not self._upgraded:
-            self.backend.close_transport(self.transport)
-            self.transport = None
-
-    async def close(self):
-        self._closed = True
-        self._close_transport()
-
-    def _detach(self):
-        """Relinquish the transport to a caller-owned `H1Upgraded` tunnel (101 /
-        CONNECT): no more requests, and neither `close` nor a failure path may
-        touch the transport again (hyper `Connection::into_parts`)."""
-        self._upgraded = True
-        self._closed = True
-        self.transport = None
-
-    def read_body_more(self):
-        """Read more transport bytes for an in-flight body. Empty bytes = EOF."""
-        # A concurrent close() may have nulled the transport (its close-first teardown).
-        # Capture it once and raise a clean connection error rather than an
-        # AttributeError on `None.receive_some` (F59). The local capture also closes the
-        # check-then-null race under free-threading.
-        transport = self.transport
-        if transport is None:
-            raise ConnectionClosedError("connection closed")
-        return transport.receive_some(_READ_SIZE)
-
-    def write(self, data):
-        transport = self.transport
-        if transport is None:
-            raise ConnectionClosedError("connection closed")
-        return transport.send_all(data)
+class H1Framing:
+    """The body-framing + send leaves shared by both roles (hyper's `Conn` write
+    half: `encode_head`'s body length, `write_body`/`end_body`). Pure orchestration
+    over `self.write` — no state of its own."""
 
     @staticmethod
     def _body_framing(body):
@@ -122,7 +76,7 @@ class H1ConnectionBase:
         # terminate the body with a trailer block instead of a bare `0\r\n\r\n` (F45);
         # a request with trailers is always chunked, so it is never `body_is_eof`.
         # All writes go through `write`, which raises a clean ConnectionClosedError once the
-        # transport was nulled by a teardown (F59) — a body pump orphaned by an abandoned
+        # state gave the transport away (F59) — a body pump orphaned by an abandoned
         # exchange wakes into that, not into an AttributeError on `None.send_all`.
         if codec.body_is_eof():
             await self.write(codec.serialize_end())

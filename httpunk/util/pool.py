@@ -31,7 +31,6 @@ from typing import Any
 
 from .. import _backend
 from .._httpunk import uri_parts
-from ..exceptions import fresh_exc
 
 
 class Canceled(Exception):  # noqa: N818 - `Canceled` is hyper-util's exact name (singleton.rs)
@@ -51,11 +50,17 @@ class Singleton:
     ) -> None:
         self._connector = connector
         self._backend = _backend.resolve(backend)
-        self._lock = threading.Lock()  # guards the state machine (no await held)
+        # Guards the state machine: every transition is ONE step under it, never held
+        # across an await, and never around foreign code (the connector, a predicate).
+        self._lock = threading.Lock()
         self._state = "empty"  # empty | making | made
         self._conn = None
-        self._error = None
         self._ready = None  # event signalling the current making round is done
+        # The making round's id: `aclose()`/`retain()` during a connect bump it, so a
+        # driver whose round was ditched closes the connection it made instead of
+        # installing it (and its waiters get `Canceled`) — an in-flight connect can
+        # never resurrect a closed singleton or leak a second connection.
+        self._round = 0
 
     async def get(self, dst: Any = None) -> Any:
         """The shared connection, connecting once. Concurrent callers during the
@@ -73,11 +78,11 @@ class Singleton:
                 stale, self._conn, self._state = self._conn, None, "empty"
             if self._state == "empty":
                 self._state = "making"
+                self._round += 1
                 self._ready = self._backend.event()
-                self._error = None
-                ready, driver = self._ready, True
+                ready, driver, rnd = self._ready, True, self._round
             else:  # making — wait for the driver
-                ready, driver = self._ready, False
+                ready, driver, rnd = self._ready, False, self._round
 
         if stale is not None:
             with contextlib.suppress(Exception):
@@ -87,17 +92,23 @@ class Singleton:
             try:
                 conn = await self._connector(dst)
                 await conn.__aenter__()  # HTTP handshake — the pool owns the lifetime
-            except BaseException as exc:
+            except BaseException:
                 with self._lock:
-                    self._state = "empty"  # ditch the round so the next get() retries
-                    # A stripped copy — the caught instance keeps propagating below
-                    # and this pool object is long-lived (exceptions.fresh_exc).
-                    self._error = fresh_exc(exc)
+                    if self._round == rnd and self._state == "making":
+                        self._state = "empty"  # ditch the round so the next get() retries
                 ready.set()
                 raise
             with self._lock:
-                self._conn, self._state = conn, "made"
+                installed = self._round == rnd and self._state == "making"
+                if installed:
+                    self._conn, self._state = conn, "made"
             ready.set()
+            if not installed:
+                # `aclose()`/`retain()` ditched this round mid-connect: the singleton is
+                # closed (or reset), so the fresh connection must not be installed.
+                with contextlib.suppress(Exception):
+                    await conn.__aexit__(None, None, None)
+                raise Canceled("the singleton was closed while this call was connecting")
             return conn
 
         await ready.wait()
@@ -108,10 +119,17 @@ class Singleton:
 
     async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Drop (and close) the shared connection if `predicate(conn)` is False —
-        the eviction hook for a dead/stale connection. No-op while empty/making."""
+        the eviction hook for a dead/stale connection. No-op while empty/making.
+        The predicate (foreign code) runs OUTSIDE the lock; the eviction is then a
+        compare-and-swap on the same connection."""
         with self._lock:
-            if self._state == "made" and not predicate(self._conn):
-                conn, self._conn, self._state = self._conn, None, "empty"
+            conn = self._conn if self._state == "made" else None
+        if conn is None or predicate(conn):
+            return
+        with self._lock:
+            if self._conn is conn:
+                self._conn, self._state = None, "empty"
+                self._round += 1  # a concurrent connect round, if any, is ditched too
             else:
                 conn = None
         if conn is not None:
@@ -123,9 +141,11 @@ class Singleton:
             return self._state == "empty"
 
     async def aclose(self) -> None:
-        """Close the shared connection and reset to empty."""
+        """Close the shared connection and reset to empty. A connect in flight is
+        ditched: its driver closes what it made and raises `Canceled`."""
         with self._lock:
             conn, self._conn, self._state = self._conn, None, "empty"
+            self._round += 1
         if conn is not None:
             await conn.__aexit__(None, None, None)
 
@@ -142,8 +162,11 @@ class Cache:
     ) -> None:
         self._connector = connector
         self._backend = _backend.resolve(backend)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # the idle set + the closed flag: one step each
         self._idle = []
+        # `aclose()` happened: a connection checked in afterwards is closed, not parked
+        # (the pool can never be resurrected by a lease that outlived it).
+        self._closed = False
 
     def checkout(self, dst: Any = None) -> _Lease:
         """A lease over a connection: `async with cache.checkout(dst) as conn: ...`.
@@ -172,17 +195,27 @@ class Cache:
         return conn
 
     def _checkin(self, conn):
+        """Park `conn` in the idle set; `False` if the cache is closed (the lease
+        closes it instead) — decided in the same step as the park."""
         with self._lock:
+            if self._closed:
+                return False
             self._idle.append(conn)
+            return True
 
     async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Keep only the idle connections `predicate(conn)` returns True for; close
-        the rest. The eviction hook for idle/stale connections."""
+        the rest. The eviction hook for idle/stale connections. The predicate
+        (foreign code) runs outside the lock over a snapshot; a connection checked
+        out meanwhile is simply no longer there to drop."""
         with self._lock:
-            keep, drop = [], []
-            for conn in self._idle:
-                (keep if predicate(conn) else drop).append(conn)
-            self._idle = keep
+            snapshot = list(self._idle)
+        rejected = [conn for conn in snapshot if not predicate(conn)]
+        if not rejected:
+            return
+        with self._lock:
+            drop = [conn for conn in self._idle if any(conn is r for r in rejected)]
+            self._idle = [conn for conn in self._idle if not any(conn is r for r in rejected)]
         for conn in drop:
             await conn.__aexit__(None, None, None)
 
@@ -192,9 +225,11 @@ class Cache:
             return not self._idle
 
     async def aclose(self) -> None:
-        """Close every idle connection."""
+        """Close every idle connection. Leases still out finish their exchange; their
+        connections are closed on return instead of parked."""
         with self._lock:
             conns, self._idle = self._idle, []
+            self._closed = True
         for conn in conns:
             await conn.__aexit__(None, None, None)
 
@@ -224,9 +259,11 @@ class _Lease:
         # unrepresentable there, while Python suspension points make it real —
         # a release interrupted mid-teardown leaves the slot held, and parking
         # that connection would deadlock the next checkout on `send_request`.
-        # Drop it instead: never park open-and-lying.
-        if exc_type is None and not (conn.closed or getattr(conn, "busy", False)):
-            self._cache._checkin(conn)  # clean exit + completed exchange -> idle set
+        # Drop it instead: never park open-and-lying. (Liveness stays a use-time
+        # check, as in hyper-util: a peer close landing right after this park is
+        # caught by the next checkout's request, not here.)
+        if exc_type is None and not (conn.closed or getattr(conn, "busy", False)) and self._cache._checkin(conn):
+            pass  # clean exit + completed exchange -> idle set
         else:
             # Deliberate simplification vs hyper-util (F51, documented WON'T-FIX): on ANY
             # exception during use we close the connection, whereas hyper-util returns it
@@ -257,18 +294,27 @@ class Map:
     def __init__(self, make_pool: Callable[[str], Any], *, key: Callable[[str], Any] = _default_key) -> None:
         self._make_pool = make_pool  # (url) -> a pool (Singleton | Cache | ...)
         self._key = key  # (url) -> hashable key; default (scheme, host, port)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # the routing table + the closed flag: one step each
         self._pools = {}
+        self._closed = False  # `aclose()` (end of life): no pool is built afterwards
 
     def pool_for(self, url: str) -> Any:
-        """The inner pool for `url`'s key, creating it via the factory on first use."""
+        """The inner pool for `url`'s key, creating it via the factory on first use.
+        The factory and the key function (foreign code) run outside the lock; two
+        callers racing for a new key keep the first one inserted."""
         k = self._key(url)
         with self._lock:
             pool = self._pools.get(k)
-            if pool is None:
-                pool = self._make_pool(url)
-                self._pools[k] = pool
+            closed = self._closed
+        if pool is not None:
             return pool
+        if closed:
+            raise RuntimeError("Map is closed")
+        pool = self._make_pool(url)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Map is closed")
+            return self._pools.setdefault(k, pool)
 
     def is_empty(self) -> bool:
         """True iff no per-destination pools exist yet."""
@@ -294,5 +340,7 @@ class Map:
             await pool.aclose()
 
     async def aclose(self) -> None:
-        """Close every per-destination pool (end of life)."""
+        """Close every per-destination pool (end of life): no pool is built afterwards."""
+        with self._lock:
+            self._closed = True
         await self.clear()

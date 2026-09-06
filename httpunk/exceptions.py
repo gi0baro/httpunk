@@ -24,8 +24,9 @@ codecs / state machines raise them (`src/h1/errors.rs`, `src/h2/errors.rs`):
         ├── GoAwayError             peer sent GOAWAY
         └── StreamResetError        peer sent RST_STREAM for a stream
 
-`error_code` attributes are `H2Reason` members for known codes (an `IntEnum`, so
-they compare equal to ints), or a plain int for codes outside the RFC set. The
+`error_code` attributes are `H2Reason` members for known codes (a Rust-defined enum
+whose members compare equal to, hash like, and convert to their int code), or a
+plain int for codes outside the RFC set. The
 Rust-defined classes carry their fields positionally in `args`, e.g.
 `H1ParseError.args == (kind, message)`, `H1BodyError.args == (io_kind, message)`,
 `H2UserError.args == (kind, message)`.

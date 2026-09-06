@@ -1,99 +1,71 @@
-"""SETTINGS synchronization state machine (port of h2 proto/settings.rs)."""
-
-from types import SimpleNamespace
+"""SETTINGS synchronization (h2 proto/settings.rs) + value application (streams.rs
+`apply_remote_settings` / `apply_local_settings`), inside the Rust connection state.
+Socket-free: frames are minted through a codec round trip and fed to
+`recv_settings` exactly as the read pump does."""
 
 import pytest
 
-from httpunk._httpunk import H2ProtocolError, H2UserError
-from httpunk.h2.settings import Action, LocalSettings, PeerSettings, Settings
-from httpunk.h2.streams import StreamManager
+from httpunk._backend.asyncio import AsyncioBackend
+from httpunk._httpunk import H2Codec, H2ProtocolError, H2Streams
+from httpunk.h2.client import Connection
+from httpunk.h2.stream import Stream
+from httpunk.http import HeaderMap
 
 
-def _frame(ack=False, **values):
-    """A stand-in for the Rust `Settings` frame event."""
-    defaults = {
-        "header_table_size": None,
-        "initial_window_size": None,
-        "max_frame_size": None,
-        "max_concurrent_streams": None,
-        "enable_push": None,
-        "max_header_list_size": None,
-    }
-    defaults.update(values)
-    return SimpleNamespace(ack=ack, **defaults)
+def _settings_frame(ack=False, **values):
+    server = H2Codec("server")
+    raw = server.serialize_settings_ack() if ack else server.serialize_settings(**values)
+    [frame] = H2Codec("client").receive(raw)
+    return frame
+
+
+def _client():
+    # Constructed only; never connected. The backend only builds the events, and the
+    # asyncio one exists on every interpreter (these tests run on the GIL builds too).
+    conn = Connection(None, backend=AsyncioBackend())
+    conn.begin()  # queues the preface + our SETTINGS: the state is now WaitingAck
+    return conn
 
 
 def test_ack_applies_local_then_synced():
-    s = Settings(LocalSettings(header_table_size=8192))
-    action, local = s.recv_settings(_frame(ack=True))
-    assert action is Action.APPLY_LOCAL
-    assert local.header_table_size == 8192
+    conn = _client()
+    initial, wake, _flags = conn.recv_settings(_settings_frame(ack=True))
+    assert (initial, wake) == (False, [])
     # A second ACK is unexpected (nothing outstanding) -> protocol error.
     with pytest.raises(H2ProtocolError):
-        s.recv_settings(_frame(ack=True))
+        conn.recv_settings(_settings_frame(ack=True))
 
 
-def test_remote_settings_stored_for_ack_and_apply():
-    s = Settings(LocalSettings())
-    frame = _frame(initial_window_size=100_000, max_concurrent_streams=128)
-    action, pending = s.recv_settings(frame)
-    assert action is Action.ACK_AND_APPLY
-    assert pending is frame
+def test_ack_before_our_settings_is_a_protocol_error():
+    conn = Connection(None, backend=AsyncioBackend())  # `begin()` not called: nothing sent, nothing to ACK
+    with pytest.raises(H2ProtocolError):
+        conn.recv_settings(_settings_frame(ack=True))
 
-    taken, is_initial = s.take_remote()
-    assert taken is frame
-    assert is_initial is True
-    assert s.has_received_remote_initial
 
+def test_remote_settings_acked_applied_and_initial_once():
+    conn = _client()
+    conn.take_pending()  # drop the handshake bytes
+    initial, _wake, _flags = conn.recv_settings(
+        _settings_frame(initial_window_size=100_000, max_concurrent_streams=128)
+    )
+    assert initial is True  # the peer's first SETTINGS: the client is now ready
+    assert conn.peer_initial_window_size == 100_000
+    assert conn.peer_max_concurrent_streams == 128
+    assert conn.stream_limit == 128  # the client gates on it
+    # The ACK was queued BEFORE the values were applied (h2 `poll_send` order).
+    [ack] = H2Codec("server").receive(conn.take_pending()[0])
+    assert ack.ack
     # A second remote SETTINGS is no longer the initial one.
-    s.recv_settings(_frame(max_frame_size=32_768))
-    _, is_initial2 = s.take_remote()
-    assert is_initial2 is False
+    initial2, _wake, _flags = conn.recv_settings(_settings_frame(max_frame_size=32_768))
+    assert initial2 is False
+    assert conn.peer_max_frame_size == 32_768
 
 
-def test_send_settings_requires_synced():
-    s = Settings(LocalSettings())  # starts WaitingAck
-    with pytest.raises(H2UserError):
-        s.send_settings(LocalSettings(initial_window_size=1))
-    s.recv_settings(_frame(ack=True))  # -> Synced
-    s.send_settings(LocalSettings(initial_window_size=1))  # now allowed
-
-
-def test_peer_settings_defaults_and_update():
-    ps = PeerSettings()
-    assert ps.initial_window_size == 65_535
-    assert ps.max_frame_size == 16_384
-    assert ps.max_concurrent_streams is None
-
-    # First update: window changes from the default.
-    old = ps.update(_frame(initial_window_size=1_000_000, max_concurrent_streams=100, header_table_size=8192))
-    assert old == 65_535
-    assert ps.initial_window_size == 1_000_000
-    assert ps.max_concurrent_streams == 100
-    assert ps.header_table_size == 8192
-
-    # A frame that doesn't touch the window returns None (no adjustment needed).
-    assert ps.update(_frame(max_frame_size=32_768)) is None
-    assert ps.max_frame_size == 32_768
-
-
-class _FakeSendFlow:
-    def __init__(self):
-        self.inc = []
-        self.dec = []
-
-    def inc_window(self, n):
-        self.inc.append(n)
-
-    def dec_send_window(self, n):
-        self.dec.append(n)
-
-
-class _FakeStream:
-    def __init__(self, send_closed):
-        self.state = SimpleNamespace(is_send_closed=lambda: send_closed)
-        self.send_flow = _FakeSendFlow()
-        self.window_evt = SimpleNamespace(set=lambda: None)
+def test_peer_settings_defaults():
+    conn = Connection(None, backend=AsyncioBackend())
+    assert conn.peer_initial_window_size == 65_535
+    assert conn.peer_max_frame_size == 16_384
+    assert conn.peer_max_concurrent_streams is None
 
 
 def test_adjust_send_windows_skips_send_closed_streams():
@@ -101,15 +73,31 @@ def test_adjust_send_windows_skips_send_closed_streams():
     SKIPS send-closed ones — matching h2 (its decrease branch guards
     is_send_closed()), which avoids pointlessly adjusting a window we'll never use and a
     needless inc_window overflow teardown on the increase side (F41)."""
-    mgr = object.__new__(StreamManager)  # bypass __init__: we only exercise _streams
-    open_st = _FakeStream(send_closed=False)
-    closed_st = _FakeStream(send_closed=True)
-    mgr._streams = {1: open_st, 3: closed_st}
+    conn = _client()
+    closed, streaming = Stream(conn.backend), Stream(conn.backend)
+    assert conn.try_claim_slot() and conn.try_claim_slot()
+    # Stream 1: END_STREAM on HEADERS -> send-closed; stream 3: a body follows -> streaming.
+    assert conn.open_stream("GET", "http://x/", HeaderMap(), True, False, closed) == 1
+    assert conn.open_stream("POST", "http://x/", HeaderMap(), False, False, streaming) == 3
+    assert conn.stream_send_window(1) == conn.stream_send_window(3) == 65_535
 
-    mgr._adjust_send_windows(1000, 3000)  # increase by 2000
-    assert open_st.send_flow.inc == [2000]  # applied to the open stream
-    assert closed_st.send_flow.inc == []  # send-closed stream skipped
+    _initial, wake, _flags = conn.recv_settings(_settings_frame(initial_window_size=100_000))  # +34_465
+    assert conn.stream_send_window(1) == 65_535  # send-closed stream skipped
+    assert conn.stream_send_window(3) == 100_000  # applied to the open stream
+    assert wake == [streaming]  # only its sender is woken
 
-    mgr._adjust_send_windows(3000, 1000)  # decrease by 2000
-    assert open_st.send_flow.dec == [2000]
-    assert closed_st.send_flow.dec == []  # skipped here too
+    conn.recv_settings(_settings_frame(initial_window_size=50_000))  # -50_000
+    assert conn.stream_send_window(1) == 65_535  # skipped here too
+    assert conn.stream_send_window(3) == 50_000
+
+
+def test_constructor_validates_ranges():
+    with pytest.raises(ValueError):
+        H2Streams(
+            "server",
+            initial_window_size=1,
+            connection_window=1,
+            max_frame_size=100,  # below the RFC minimum (16384)
+            max_header_list_size=1,
+            max_send_buf_size=1,
+        )

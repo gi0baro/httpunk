@@ -125,7 +125,7 @@ impl H1Codec {
     /// Start the next message on this connection: drop the per-message state, keep
     /// the read buffer (hyper's `read_buf` persists across messages, so bytes of a
     /// pipelined request already received stay right here).
-    fn reset(&self) {
+    pub(super) fn reset(&self) {
         let mut st = self.inner.lock().unwrap();
         st.req_method = None;
         st.encoder = None;
@@ -139,7 +139,7 @@ impl H1Codec {
     /// Append received bytes to the read buffer WITHOUT parsing — bytes another
     /// reader took past a message (the body decoder's leftover, a watcher's read) go
     /// back where hyper's single `read_buf` would have kept them.
-    fn feed(&self, data: &[u8]) {
+    pub(super) fn feed(&self, data: &[u8]) {
         self.inner.lock().unwrap().buf.extend_from_slice(data);
     }
 
@@ -332,7 +332,11 @@ impl H1Codec {
     /// return an `H1RequestHead` (leftover = the start of the request body,
     /// drained via `take_body`) — via the facade's `parse_request` (hyper
     /// `Server::parse`). Records the request method for `serialize_response`.
-    fn receive_request_head(&self, py: Python<'_>, data: &[u8]) -> PyResult<Option<Py<PyAny>>> {
+    pub(super) fn receive_request_head(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+    ) -> PyResult<Option<Py<PyAny>>> {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
         let parsed = match parse_request(&mut st.buf, self.max_headers, self.ignore_invalid_headers)
@@ -394,7 +398,7 @@ impl H1Codec {
     /// `Date` header unless the codec was built with `date_header=False`.
     #[pyo3(signature = (status, headers=None, *, keep_alive=true, http10=false, content_length=None, chunked=false))]
     #[allow(clippy::too_many_arguments)] // faithful mirror of hyper's Encode fields
-    fn serialize_response(
+    pub(super) fn serialize_response(
         &self,
         py: Python<'_>,
         status: u16,
@@ -442,14 +446,14 @@ impl H1Codec {
     /// closes after this response (keep-alive off, a response `Connection: close`, a
     /// 101, or a 2xx to CONNECT) — conn.rs `try_keep_alive`.
     #[getter]
-    fn response_is_last(&self) -> bool {
+    pub(super) fn response_is_last(&self) -> bool {
         self.inner.lock().unwrap().response_is_last
     }
 
     /// hyper `Encoder::is_close_delimited` of the last `serialize_response`: the body
     /// ends by closing the connection (an unknown-length HTTP/1.0 response).
     #[getter]
-    fn response_close_delimited(&self) -> bool {
+    pub(super) fn response_close_delimited(&self) -> bool {
         self.inner.lock().unwrap().response_close_delimited
     }
 
@@ -463,15 +467,20 @@ impl H1Codec {
 
     /// Drain the bytes buffered after the head — the body bytes already received,
     /// to hand to the Python body decoder.
-    fn take_body(&self, py: Python<'_>) -> Py<PyBytes> {
-        let mut st = self.inner.lock().unwrap();
-        let out = st.buf.split();
-        PyBytes::new(py, &out).unbind()
+    pub(super) fn take_body(&self, py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new(py, &self.take_body_raw()).unbind()
     }
 
     /// Number of bytes currently buffered (unparsed head, or post-head body).
-    fn buffered(&self) -> usize {
+    pub(super) fn buffered(&self) -> usize {
         self.inner.lock().unwrap().buf.len()
+    }
+}
+
+impl H1Codec {
+    /// `take_body` for a Rust consumer (the server state feeds the decoder itself).
+    pub(super) fn take_body_raw(&self) -> BytesMut {
+        self.inner.lock().unwrap().buf.split()
     }
 }
 
@@ -565,14 +574,14 @@ impl H1BodyDecoder {
     /// `length` is the Content-Length when `kind == "length"`.
     #[new]
     #[pyo3(signature = (kind, length=0))]
-    fn new(kind: &str, length: u64) -> Self {
+    pub(super) fn new(kind: &str, length: u64) -> Self {
         H1BodyDecoder {
             inner: Mutex::new(BodyDecoder::new(kind, length)),
         }
     }
 
     /// Append received body bytes.
-    fn feed(&self, data: &[u8]) {
+    pub(super) fn feed(&self, data: &[u8]) {
         self.inner.lock().unwrap().feed(data);
     }
 
@@ -593,21 +602,21 @@ impl H1BodyDecoder {
     }
 
     #[getter]
-    fn is_complete(&self) -> bool {
+    pub(super) fn is_complete(&self) -> bool {
         self.inner.lock().unwrap().is_complete()
     }
 
     /// Drain and return the bytes buffered past the completed body — the start of
     /// the next pipelined request (hyper keeps these in its persistent read
     /// buffer). The server driver feeds them back to the codec (`H1Codec.feed`).
-    fn take_buffered(&self, py: Python<'_>) -> Py<PyBytes> {
+    pub(super) fn take_buffered(&self, py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, &self.inner.lock().unwrap().take_buffered()).unbind()
     }
 
     /// Bytes buffered past the body, without moving them — hyper's
     /// `!read_buf().is_empty()` (`require_empty_read`, conn.rs L463-465).
     #[getter]
-    fn buffered(&self) -> usize {
+    pub(super) fn buffered(&self) -> usize {
         self.inner.lock().unwrap().buffered()
     }
 

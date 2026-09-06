@@ -5,14 +5,14 @@ connection's enter/close lifecycle; the connector hands back an un-entered conne
 """
 
 import pytest
-from tonio.colored import scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import H1Connection, H2Connection
 from httpunk._backend.tonio import TonioBackend
 from httpunk.h1.server import H1Server
 from httpunk.h2.server import H2Server
-from httpunk.util.pool import Cache, Map, Singleton
+from httpunk.util.pool import Cache, Canceled, Map, Singleton
 
 
 async def _listener():
@@ -299,3 +299,98 @@ async def test_map_retain_forwards_and_clear_resets():
     assert m.is_empty()  # and reset the routing table
     m.pool_for("http://c/")  # still usable — rebuilt lazily
     assert not m.is_empty()
+
+
+# ----- two-party transitions (HTTPUNK_RUST_STATE_DESIGN.md §3.4): one step under one lock -----
+
+
+class _FakeConn:
+    """An un-entered connection stand-in: records enter/close, closes on `__aexit__`."""
+
+    def __init__(self):
+        self.entered = False
+        self.closed = False
+        self.busy = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *exc):
+        self.closed = True
+        return False
+
+
+@pytest.mark.tonio
+async def test_singleton_aclose_during_connect_ditches_the_round():
+    """`aclose()` while a connect is in flight: the driver must NOT install the fresh
+    connection into a singleton that was just closed (a leaked, un-owned connection);
+    it closes it and reports `Canceled`, and the singleton stays empty (U1)."""
+    made = []
+    release = Event()
+
+    async def connector(_dst):
+        conn = _FakeConn()
+        made.append(conn)
+        await release.wait()  # park the connect until the test closed the singleton
+        return conn
+
+    pool = Singleton(connector)
+    outcome = []
+
+    async def driver():
+        try:
+            await pool.get()
+        except Canceled:
+            outcome.append("canceled")
+
+    async with scope() as s:
+        s.spawn(driver())
+        while not made:
+            await sleep(0)  # the driver is parked inside the connector
+        await pool.aclose()  # closes nothing yet — but ditches the round
+        release.set()
+    assert outcome == ["canceled"]
+    assert made[0].entered and made[0].closed  # the driver closed what it made
+    assert pool.is_empty()
+
+
+@pytest.mark.tonio
+async def test_singleton_retain_evaluates_predicate_outside_the_lock():
+    """The predicate is foreign code: it may re-enter the singleton (here `is_empty`)
+    without deadlocking, and the eviction is a compare-and-swap on the same connection."""
+
+    async def connector(_dst):
+        return _FakeConn()
+
+    pool = Singleton(connector)
+    conn = await pool.get()
+    seen = []
+    await pool.retain(lambda c: seen.append(pool.is_empty()) or False)  # re-enters the pool, then evicts
+    assert seen == [False] and conn.closed and pool.is_empty()
+
+
+@pytest.mark.tonio
+async def test_cache_checkin_after_aclose_closes_instead_of_parking():
+    """A lease that outlives `aclose()` must not resurrect the pool: its connection is
+    closed on return, never parked in a closed cache (U2)."""
+
+    async def connector(_dst):
+        return _FakeConn()
+
+    cache = Cache(connector)
+    async with cache.checkout() as conn:
+        await cache.aclose()  # while the lease is out
+    assert conn.closed  # closed on return...
+    assert cache.is_empty()  # ...not parked
+
+
+@pytest.mark.tonio
+async def test_map_pool_for_after_aclose_refuses_and_factory_runs_unlocked():
+    """After `aclose()` (end of life) no pool is built; the factory (foreign code) runs
+    outside the lock, so it may consult the map itself."""
+    m = Map(lambda _url: (m.is_empty(), _StubPool())[1])  # the factory re-enters the map: no deadlock
+    m.pool_for("http://a/")
+    await m.aclose()
+    with pytest.raises(RuntimeError, match="closed"):
+        m.pool_for("http://b/")

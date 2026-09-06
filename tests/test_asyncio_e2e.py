@@ -254,8 +254,10 @@ def _server_ctx(ca):
 
 
 def _client_ctx(ca):
+    # A caller-supplied context is never mutated by `connect()`: it carries its own ALPN offer.
     ctx = ssl.create_default_context()
     ca.configure_trust(ctx)
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
     return ctx
 
 
@@ -270,9 +272,7 @@ async def test_tls_alpn_negotiates_h2(ca):
     host, port, serve = await _run_server(handler, lambda s: auto.serve(s, backend=backend), ssl_ctx=_server_ctx(ca))
     async with asyncio.TaskGroup() as tg:
         tg.create_task(serve())
-        conn = await connect(
-            f"https://127.0.0.1:{port}/", backend=backend, ssl_context=_client_ctx(ca), alpn=("h2", "http/1.1")
-        )
+        conn = await connect(f"https://127.0.0.1:{port}/", backend=backend, ssl_context=_client_ctx(ca))
         assert isinstance(conn, H2Connection)  # ALPN chose h2 over TLS
         async with conn:
             resp = await conn.request("GET", "/x")

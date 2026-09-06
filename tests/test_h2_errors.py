@@ -564,7 +564,7 @@ async def test_stream_id_overflow_refuses_new_stream():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            conn._conn.streams._next_id = (2**31 - 1) + 2  # exhaust the client id space
+            conn._conn.set_next_stream_id((2**31 - 1) + 2)  # exhaust the client id space
             with pytest.raises(H2Error, match="exhausted"):
                 await conn.request("GET", "/a")
         s.cancel()
@@ -744,7 +744,7 @@ async def test_aclose_after_connection_failure_is_clean():
         resp = await conn.request("GET", "/")  # head arrives; body left unread
         assert resp.status == 200
         got_resp.set()
-        while conn._conn.error is None:  # wait until the pump processed the EOF (fail_all ran)
+        while not conn._conn.is_failed():  # wait until the pump processed the EOF (fail_all ran)
             await sleep(0)
         # The stream is now Closed via recv_eof; aclose must NOT RST the dead transport.
         await resp.aclose()  # would raise without F60
@@ -865,8 +865,10 @@ async def test_close_flushes_queued_frames_even_after_connection_error():
             inner = conn._conn
             real_set = inner._write_evt.set
             inner._write_evt.set = lambda: None  # the pump can't wake: the frame stays queued
-            inner.enqueue_frame(inner.codec.serialize_ping(b"flushme!"))
-            inner.error = ConnectionClosedError("simulated failure")
+            # A peer PING makes the state queue its PONG (same payload) — a queued frame.
+            [ping] = H2Codec("client").receive(H2Codec("server").serialize_ping(b"flushme!"))
+            inner._after(inner.recv_ping(ping))
+            inner._fail(ConnectionClosedError("simulated failure"))
             # Restore the wake before `close()` runs: its stop signal must reach
             # the pump, whose drain-then-exit is what flushes the queued frame.
             inner._write_evt.set = real_set

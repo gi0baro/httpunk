@@ -4,7 +4,14 @@
 The sans-IO byte work is all Rust over the vendored hyper core: `H1Codec.
 receive_request_head` (head parse via `Server::parse`) + `serialize_response`
 (head encode via `Server::encode`, incl. the `Date` header) + the body `Encoder`,
-and `H1BodyDecoder` for the request body. Only the orchestration is Python.
+and `H1BodyDecoder` for the request body. The connection + request STATE is Rust
+too: `ServerConnection` subclasses `H1ServerState` (src/h1/conn.rs), which holds —
+under one mutex — the transport, the keep-alive / close / shutdown flags, the
+mid-message watcher slot and the current request's flags (responded, response
+done, body done, peer closed, the head-time decisions). Every decision is one call
+into it returning a verdict; this file holds only the async machinery: the head
+read and its deadline, the body pumps, the watcher task, the events
+(HTTPUNK_RUST_STATE_DESIGN.md §3.2).
 
 HTTP/1 is strictly one request/response at a time (no multiplexing), so — like
 the h1 client — there is no background pump: `next_request` reads a request head
@@ -27,16 +34,31 @@ Cross-reference: hyper 1.11.1 `proto/h1/{role,conn,dispatch}.rs` (server path) a
 
 from __future__ import annotations
 
-import threading
 from collections.abc import AsyncIterator, Awaitable
 from typing import TYPE_CHECKING, Any
 
+from .. import _backend
 from .._common import PUMP_ABANDONED, PUMP_DONE, BaseServer, aclose_body, event_result, read_all
-from .._httpunk import H1BodyDecoder, H1Codec
+from .._httpunk import (
+    H1_NEXT_CLOSE,
+    H1_NEXT_DRAIN,
+    H1_NEXT_NONE,
+    H1_NEXT_RAISE,
+    H1_READ_EOF,
+    H1_READ_PARSE,
+    H1_READ_SHUTDOWN,
+    H1_READ_WATCHER,
+    H1_REQ_CONTINUE,
+    H1_REQ_OK,
+    H1_REQ_PARKED,
+    H1_REQ_PEER_CLOSED,
+    H1Codec,
+    H1ServerState,
+)
 from ..exceptions import ConnectionClosedError, H1IncompleteMessageError, H1ParseError, HTTPunkError
 from ..http import HeaderMap
 from ..types import Version
-from .connection import H1ConnectionBase
+from .connection import H1Framing
 from .share import H1Upgraded
 
 
@@ -55,9 +77,27 @@ _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (ht
 _PEER_CLOSED_MSG = "connection closed before message completed: the client closed its side mid-request"
 
 
+def _codec_options(*, max_headers, ignore_invalid_headers, title_case_headers, auto_date_header, max_buf_size):
+    # ONE codec per connection (hyper's `Conn`): its read buffer persists across
+    # messages, like hyper's `read_buf`. Options are hyper `http1::Builder`'s:
+    # `max_headers` (None = hyper's 100), `ignore_invalid_headers`,
+    # `title_case_headers`, `auto_date_header`, `max_buf_size` (validated there, >= 8192).
+    options = {
+        "max_headers": max_headers,
+        "ignore_invalid_headers": ignore_invalid_headers,
+        "title_case_headers": title_case_headers,
+        "date_header": auto_date_header,
+    }
+    if max_buf_size is not None:
+        options["max_buf_size"] = max_buf_size
+    return options
+
+
 class ServerRequest:
     """An incoming request + the handle to respond to it (hyper: the request +
-    its `Sender`/response channel). One in flight at a time."""
+    its `Sender`/response channel). One in flight at a time. Its state lives in
+    the connection's `H1ServerState`, keyed by `_seq` (a request outliving its
+    exchange gets a deterministic answer, never the next request's state)."""
 
     method: str
     target: str  # the request-target (origin/absolute/authority form)
@@ -70,73 +110,53 @@ class ServerRequest:
     content_length: int | None  # declared request Content-Length (None if chunked)
     upgraded: H1Upgraded | None  # the raw tunnel once a CONNECT/Upgrade is answered
 
-    def __init__(
-        self,
-        conn,
-        *,
-        method,
-        target,
-        headers,
-        decoder,
-        keep_alive,
-        expect_continue,
-        is_upgrade,
-        http10,
-        content_length,
-    ):
-        self.method = method  # str
-        self.target = target  # str — the request-target (origin/absolute/authority form)
-        self.path = target  # alias
-        self.headers = headers  # httpunk.http.HeaderMap
-        self.version = Version.HTTP_10 if http10 else Version.HTTP_11  # hyper `Request::version()`
+    def __init__(self, conn, seq, head, decoder):
+        self.method = head.method  # str
+        self.target = head.target  # str — the request-target (origin/absolute/authority form)
+        self.path = head.target  # alias
+        self.headers = head.headers  # httpunk.http.HeaderMap
+        self.version = Version.HTTP_10 if head.http10 else Version.HTTP_11  # hyper `Request::version()`
         self.trailers = None  # chunked trailers, populated once the body is read
-        self.keep_alive = keep_alive
-        self.is_upgrade = is_upgrade
-        self.content_length = content_length  # declared request Content-Length (None if chunked)
+        self.keep_alive = head.keep_alive
+        self.is_upgrade = head.is_upgrade
+        self.content_length = head.content_length  # declared request Content-Length (None if chunked)
         # The raw tunnel once the app answers a CONNECT/Upgrade with a 101 or a 2xx
         # to CONNECT (hyper `on_upgrade`): the caller owns it and drives it directly.
         self.upgraded = None
         self._conn = conn
+        self._seq = seq
         self._decoder = decoder
-        self._http10 = http10  # the driver's 1.0-specific negotiation keys off the codec flag
-        self._expect_continue = expect_continue
-        self._continue_sent = False
-        self._body_done = decoder.is_complete
-        self._responded = False  # the response head was sent (or the request detached)
-        self._response_done = False  # the response is complete: body ended, connection state settled
-        # Head-time decisions applied at completion (`ServerConnection._finish_response`).
-        self._keep_alive_decision = False
-        self._is_switch = False
-        self._head_negotiated = False  # `_is_switch` is decided: the head is being sent (under `_arm_lock`)
-        # The client closed its side (or the transport failed) while this request was
-        # mid-message — set by the connection's mid-message watcher (hyper
-        # `mid_message_detect_eof` -> `close_read` + `IncompleteMessage`).
-        self._peer_closed = False
-        # Set by the watcher on a mid-message EOF, and by `_close_window` when the
-        # exchange completes: the two ends of the mid-message window `peer_closed()`
-        # observes. Eager (not created on first use) so the window's close and a
-        # concurrent `peer_closed()` need no flag/event handshake (free-threaded rule:
-        # one transition, one primitive).
+        # The two ends of the mid-message window `peer_closed()` observes: set by the
+        # watcher on a mid-message EOF, and when the exchange completes (the state's
+        # `peer_closed` flag is published first — one transition, one primitive).
         self._peer_closed_evt = conn.backend.event()
-        # `peer_closed()` / a streamed or push response asked for the read: park it as
-        # soon as hyper would. Written and read only under `ServerConnection._arm_lock`,
-        # together with `_head_negotiated`.
-        self._watch_wanted = False
+        # A `100 Continue` claimed by the body reader has been written (or failed):
+        # a responder told to await it parks here, so the head never overtakes it.
+        # Only an `Expect: 100-continue` request can ever claim one (the state
+        # records the ask in `begin_request`), so only that request pays for the event.
+        self._continue_evt = conn.backend.event() if head.expect_continue else None
+
+    @property
+    def _peer_closed(self):
+        """The client closed its side mid-request (as the watcher recorded it)."""
+        return self._conn.peer_closed_flag(self._seq)
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         """Yield request body chunks, pulling transport bytes on demand (decoded
         by `H1BodyDecoder`). Sends `100 Continue` first if the client asked for it."""
         if self._decoder.is_complete:
             return
-        if self._expect_continue and not self._continue_sent and not self._responded and not self._http10:
+        conn = self._conn
+        if conn.try_send_continue(self._seq):
             # The client is waiting for a 1xx before sending the body (RFC 9110
             # §10.1.1). hyper auto-sends 100 Continue when the body is first polled,
             # but ONLY while `Writing::Init` (before any response) and ONLY for versions
-            # > HTTP/1.0 (conn.rs L409-415, L311). Sending it after `respond()` began
-            # (F15) would be parsed as the next response; sending it to a 1.0 client
-            # (F16) violates the spec hyper deliberately follows.
-            self._continue_sent = True
-            await self._conn.write(_CONTINUE)
+            # > HTTP/1.0 (conn.rs L409-415, L311) — decided in the state, under the same
+            # lock as `try_respond`; a responder that lost the race awaits our write.
+            try:
+                await conn.write(_CONTINUE)
+            finally:
+                self._continue_evt.set()
         try:
             while True:
                 chunk = self._decoder.decode()
@@ -145,16 +165,26 @@ class ServerRequest:
                     continue
                 if self._decoder.is_complete:
                     break
-                data = await self._conn.read_body_more()
+                # ONE reader on the transport: the state refuses once the next
+                # request's drain owns the read (or the request is over).
+                if not conn.begin_body_read(self._seq):
+                    raise ConnectionClosedError("request body no longer readable")
+                try:
+                    data = await conn.read_body_more()
+                finally:
+                    conn.end_body_read(self._seq, False)
                 if data:
                     self._decoder.feed(data)
                 else:
                     self._decoder.mark_eof()  # client closed mid-body
         except BaseException:
-            self._conn.mark_unusable()
+            conn.mark_unusable()
             raise
         self.trailers = self._decoder.take_trailers()
-        self._body_done = True
+        conn.end_body_read(self._seq, True)
+        # The body is consumed: a `peer_closed()` asked for before it was read arms now
+        # (hyper serves the body first, then keeps its mid-message read pending).
+        await conn._arm_watcher(self, want=False)
 
     def read(self) -> Awaitable[bytes]:
         return read_all(self.aiter_bytes())
@@ -177,21 +207,17 @@ class ServerRequest:
         httpunk cannot drop the app's coroutine, so the same observation is exposed
         instead; the in-flight `respond()` / `send_data` fail with
         `H1IncompleteMessageError` as hyper's would."""
-        if self._response_done:
-            return self._peer_closed
-        self._conn._arm_watcher(self)  # the signal is being consumed: park a read as soon as possible
+        now = self._conn.peer_closed_now(self._seq)
+        if now is not None:
+            return now
+        await self._conn._arm_watcher(self)  # the signal is being consumed: park a read as soon as possible
         await self._peer_closed_evt.wait()
-        return self._peer_closed
+        return self._conn.peer_closed_flag(self._seq)
 
     def _close_window(self):
-        """The response is complete or failed: the mid-message window is over. Wakes a
-        parked `peer_closed()` (which then reports `_peer_closed` as it stands). The
-        flag flips under the connection's `_arm_lock`: `_arm_watcher` reads it there
-        before it parks a read or moves bytes into the codec, so an arm racing this
-        completion either lands before it (and `next_request` takes that read over)
-        or sees the window closed — never a second reader beside the next head read."""
-        with self._conn._arm_lock:
-            self._response_done = True
+        """The response is complete or failed: the mid-message window is over (the
+        state flipped first). Wakes a parked `peer_closed()`."""
+        self._conn.close_window(self._seq)
         self._peer_closed_evt.set()
 
     async def respond(
@@ -214,10 +240,7 @@ class ServerRequest:
         cancelled at that await (hyper drops the body future) and has unwound — its
         cleanup ran — before this raises. Cancelling the task awaiting `respond()`
         cancels the producer the same way."""
-        if self._responded:
-            raise RuntimeError("response already sent for this request")
-        self._responded = True
-        await self._conn.send_response(self, status, headers, body, trailers)
+        await self._conn._send_response(self, status, headers, body, trailers)
 
     async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
         """Push-style response: send the head now and return a `SendStream` to write
@@ -229,10 +252,7 @@ class ServerRequest:
         `existing_con_len`). hyper's h1 has no push API; this is the h1 twin of h2's
         `SendResponse::send_response -> SendStream`, over the same codec calls
         `respond()` makes, so the wire behaviour is hyper's either way."""
-        if self._responded:
-            raise RuntimeError("response already sent for this request")
-        self._responded = True
-        return await self._conn.send_response_head(self, status, headers, end_stream=end_stream)
+        return await self._conn._send_response_head(self, status, headers, end_stream=end_stream)
 
     def detach(self) -> bytes:
         """Take over the raw connection for a protocol upgrade (WebSocket, or a custom protocol):
@@ -242,30 +262,21 @@ class ServerRequest:
         sends no response). Like httpunk's 101/CONNECT tunnel hand-off, but caller-driven.
 
         After this, the accept loop ends (`next_request` returns None) and the server's close on
-        `__aexit__` is a no-op, so the transport stays open. cf. Go's `http.Hijacker`."""
-        if self._responded:
-            raise RuntimeError("cannot detach: a response was already sent for this request")
-        conn = self._conn
-        if conn._watcher_handle is not None and not conn._watcher_done.is_set():
-            # A mid-message read is parked on the transport (see `_arm_watcher`; deferred
-            # past the head for requests that announce an upgrade, so it is never parked
-            # while a detach is still possible). It cannot be handed to the caller — one
-            # reader per transport — nor cancelled without risking bytes; hyper's poll
-            # model has no such task to hand off (`Connection::into_parts`). Refuse.
+        `__aexit__` is a no-op, so the transport stays open. cf. Go's `http.Hijacker`. Refused
+        while a mid-message read is parked on the transport (see `_arm_watcher`; deferred past
+        the head for requests that announce an upgrade, so it is never parked while a detach is
+        still possible): one reader per transport, and hyper's poll model has no such task to
+        hand off (`Connection::into_parts`)."""
+        code, _transport, leftover = self._conn.detach(self._seq)
+        if code == H1_REQ_PARKED:
             raise RuntimeError(
                 "cannot detach: a mid-message read is parked on the transport (the request carried no "
                 "Upgrade / was not a CONNECT); detach only upgrade requests"
             )
-        self._responded = True
-        self._close_window()
-        # Bytes buffered past the head, plus any the watcher already read (a pipelined
-        # message the caller's protocol must see) — hyper's `read_buf` in `into_parts`.
-        conn._codec.feed(self._decoder.take_buffered())
-        if conn._watcher_data:
-            conn._codec.feed(conn._watcher_data)
-        conn._watcher_data = None
-        conn._detach()
-        return conn._codec.take_body()
+        if code != H1_REQ_OK:
+            raise RuntimeError("cannot detach: a response was already sent for this request")
+        self._peer_closed_evt.set()
+        return leftover
 
     def __repr__(self) -> str:
         return f"ServerRequest(method={self.method!r}, target={self.target!r})"
@@ -305,8 +316,7 @@ class SendStream:
             # `serialize_end` on a body short of its Content-Length: hyper `end_body` ->
             # `User::BodyWriteAborted` + `Writing::Closed`. Same poison as a failed write.
             self._done = True
-            self._req._close_window()
-            self._conn._fail_response(exc)
+            self._conn._fail_response(self._req, exc)
         if end_stream:
             self._done = True
         if buf:
@@ -325,8 +335,7 @@ class SendStream:
         try:
             buf = self._codec.serialize_trailers(hdrs)  # bare terminator unless the request said `TE: trailers`
         except BaseException as exc:
-            self._req._close_window()
-            self._conn._fail_response(exc)
+            self._conn._fail_response(self._req, exc)
         await self._write(buf)
         self._conn._finish_response(self._req)
 
@@ -338,10 +347,7 @@ class SendStream:
         if self._done:
             return
         self._done = True
-        self._req._close_window()
-        self._conn._reusable = False
-        self._conn._closed = True
-        self._conn._close_transport()
+        self._conn._abort_response(self._req)
 
     def _check_open(self):
         if self._done:
@@ -352,14 +358,43 @@ class SendStream:
             await self._conn.write(data)
         except BaseException as exc:
             self._done = True
-            self._req._close_window()
-            self._conn._fail_response(exc)
+            self._conn._fail_response(self._req, exc)
 
 
-class ServerConnection(H1ConnectionBase):
+class ServerConnection(H1Framing, H1ServerState):
     """The server-side h1 driver: reads a request, hands back a `ServerRequest`,
     then writes the response; reuses the connection on keep-alive. The accepting
-    analogue of the client `Connection`, over the shared `H1ConnectionBase`."""
+    analogue of the client `Connection`. The state is the Rust `H1ServerState` base;
+    the async machinery (head read + deadline, body pumps, the watcher task) is here."""
+
+    def __new__(
+        cls,
+        transport,
+        *,
+        backend=None,
+        header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT,
+        keep_alive=True,
+        max_headers=None,
+        max_buf_size=None,
+        auto_date_header=True,
+        title_case_headers=False,
+        ignore_invalid_headers=False,
+        half_close=False,
+    ):
+        codec = H1Codec(
+            **_codec_options(
+                max_headers=max_headers,
+                ignore_invalid_headers=ignore_invalid_headers,
+                title_case_headers=title_case_headers,
+                auto_date_header=auto_date_header,
+                max_buf_size=max_buf_size,
+            )
+        )
+        # hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive()` on a Busy (not yet
+        # idle) connection = `KA::Disabled` (http1.rs L463, conn.rs L876): the first response
+        # is encoded `Connection: close` and the connection closes after it. `half_close`
+        # (hyper `http1::Builder::half_close`, default False) disables the mid-message watcher.
+        return H1ServerState.__new__(cls, codec, transport, keep_alive=keep_alive, half_close=half_close)
 
     def __init__(
         self,
@@ -375,187 +410,159 @@ class ServerConnection(H1ConnectionBase):
         ignore_invalid_headers=False,
         half_close=False,
     ):
-        super().__init__(transport, backend=backend)
-        self._reusable = True  # keep-alive: may we read another request after this one?
-        # Mid-message EOF detection (hyper conn.rs `mid_message_detect_eof`, L491-508): while
-        # a request's body is complete and its response is not, hyper keeps a read pending
-        # on the connection; EOF there errors the connection (`IncompleteMessage`), bytes
-        # are the next pipelined request (kept in `read_buf`). httpunk re-expresses that
-        # pending read as ONE parked `receive_some` in a bare watcher task (the server twin
-        # of the client's idle watcher): never cancelled — it ends by data, EOF, or transport
-        # close — and its result is dispatched by state when it completes (`_watch_mid_message`).
-        # If the response finishes first, the still-parked read IS the next head read
-        # (`_recv_head_bytes`): a hand-off, never a second reader (one reader per transport).
-        # `half_close` (hyper `http1::Builder::half_close`, default False) disables it: a
-        # client FIN mid-request is then ignored until the idle read after the response.
-        self._half_close = half_close
-        # Guards the arm decision (`_arm_watcher`): its callers — `peer_closed()`, a
-        # streamed / push response, the head negotiation — can run in different tasks on
-        # different threads, and "is a read parked? if not, park one" plus the
-        # want/negotiated handshake must be one step (free-threaded rule).
-        self._arm_lock = threading.Lock()
-        self._watcher_handle = None  # bare task handle: awaited exactly once (`_take_watcher` / `close`)
-        self._watcher_done = None  # event: the watcher's single read completed
-        self._watcher_data = None  # its bytes (b"" = EOF); None on error / not yet
-        self._watcher_error = None  # its transport error, if any
-        # hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive()` on a Busy (not yet
-        # idle) connection = `KA::Disabled` (http1.rs L463, conn.rs L876): the first response
-        # is encoded `Connection: close` and the connection closes after it — exactly the
-        # graceful-shutdown path, applied from the start. Reading the first request is unaffected.
-        self._keep_alive_enabled = keep_alive
-        # ONE codec per connection (hyper's `Conn`): its read buffer persists across
-        # messages, like hyper's `read_buf`, so pipelined bytes are never copied out;
-        # `reset()` starts each message. Options are hyper `http1::Builder`'s:
-        # `max_headers` (None = hyper's 100), `ignore_invalid_headers`,
-        # `title_case_headers`, `auto_date_header`, `max_buf_size` (validated there, >= 8192).
-        self._codec_options = {
-            "max_headers": max_headers,
-            "ignore_invalid_headers": ignore_invalid_headers,
-            "title_case_headers": title_case_headers,
-            "date_header": auto_date_header,
-        }
-        if max_buf_size is not None:
-            self._codec_options["max_buf_size"] = max_buf_size
-        self._codec = H1Codec(**self._codec_options)
-        self._current = None  # current ServerRequest (for body draining)
-        self._shutdown_evt = self.backend.event()  # set by graceful_shutdown()
+        self.backend = _backend.resolve(backend)
+        self._codec_options = _codec_options(
+            max_headers=max_headers,
+            ignore_invalid_headers=ignore_invalid_headers,
+            title_case_headers=title_case_headers,
+            auto_date_header=auto_date_header,
+            max_buf_size=max_buf_size,
+        )
+        self._codec = self.codec  # the one codec the state holds (hyper's `Conn`)
+        self._shutdown_evt = self.backend.event()  # set by graceful_shutdown() (the select-based race)
         # Max time to read a complete request head before closing (slowloris defence),
         # hyper's `header_read_timeout` (default 30s, http1.rs L249). `None` disables it.
         self._header_read_timeout = header_read_timeout
         # The head-read deadline always uses `backend.timeout` (every backend implements it).
         # This capability is extra: a backend that can wake a parked read from another task
         # (asyncio) lets us skip the per-read shutdown `select`; absent (tonio) → use `select`.
-        # See `_read_or_shutdown` + `graceful_shutdown`.
         self._native_read_interrupt = getattr(self.backend, "native_read_interrupt", False)
-        self._idle_read_parked = False  # True only while parked in the idle between-requests read
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
 
     async def close(self):
-        await super().close()  # closes the transport, which is what ends a parked watcher read
-        handle, self._watcher_handle = self._watcher_handle, None
-        if handle is not None:
-            await handle  # join (never cancel) — see `_watch_mid_message`
+        # Close the transport FIRST (what ends a parked watcher read), then JOIN the
+        # watcher (never cancel it — see `_watch_mid_message`). The state hands out
+        # the transport and the watcher's done event in one step.
+        transport, done = self.mark_closed()
+        if transport is not None:
+            self.backend.close_transport(transport)
+        if done is not None:
+            await done.wait()
+            handle = self.take_watcher_handle()
+            if handle is not None:
+                await handle
+
+    # ----- transport access (the state owns the transport) -----
+
+    def write(self, data):
+        transport = self.transport_ref()
+        if transport is None:
+            raise ConnectionClosedError("connection closed")
+        return transport.send_all(data)
+
+    def read_body_more(self):
+        """Read more transport bytes for an in-flight body. Empty bytes = EOF."""
+        transport = self.transport_ref()
+        if transport is None:
+            raise ConnectionClosedError("connection closed")
+        return transport.receive_some(_READ_SIZE)
+
+    def _close(self, transport):
+        if transport is not None:
+            self.backend.close_transport(transport)
 
     # ===== mid-message watcher (hyper conn.rs `mid_message_detect_eof`) =====
 
-    def _arm_watcher(self, req, *, want=True, head_negotiated=False):
-        """Park ONE read for the mid-message window of `req` — SYNC (a bare spawn). hyper
-        reads from the moment a request is mid-message (bodyless at accept, or once the
-        body is consumed); httpunk arms LAZILY, when the observation can be consumed: the
-        first `peer_closed()` await, a `respond()` that streams an async body, or a push
+    async def _arm_watcher(self, req, *, want=True, head_negotiated=False):
+        """Park ONE read for the mid-message window of `req`. hyper reads from the moment
+        a request is mid-message (bodyless at accept, or once the body is consumed);
+        httpunk arms LAZILY, when the observation can be consumed: the first
+        `peer_closed()` await, a `respond()` that streams an async body, or a push
         `send_response()`. Observably equivalent — hyper uses the EOF to drop the handler,
         which httpunk cannot do; a `respond()` write to a half-closed socket succeeds
         regardless; pipelined bytes are read before the next head either way; and an EOF
         that already arrived is delivered at once by the late read — while a plain
-        `respond(bytes)` exchange pays no task at all (measured ~5% of h1 GET throughput).
-        Skipped when hyper would not read either (`half_close`; bytes already buffered ->
-        hyper's `read_buf` is non-empty and it returns Pending), when the body is not yet
-        consumed (hyper's `poll_read` serves the body first), and when a task cannot
-        stand in for hyper's poll: a request announcing an upgrade (`Upgrade` / CONNECT —
-        hyper's `wants_upgrade`, which any `Upgrade: h2c` request sets too) may still be
-        detached or switched, and a parked reader cannot be handed to the caller
-        (runtime-forced divergence, documented in `detach`). That exclusion lasts only
-        until the response head is negotiated with a non-switching status: from then on
-        `detach()` is refused and no tunnel hand-off can follow, so the head-send paths
-        call in with `head_negotiated=True` (`req._is_switch` already set) and a
-        `peer_closed()` awaited earlier is honoured then — `want` records the ask — and
-        the divergence shrinks to the pre-head window of those requests.
+        `respond(bytes)` exchange pays no task at all. Skipped when hyper would not read
+        either (`half_close`; bytes already buffered -> hyper's `read_buf` is non-empty
+        and it returns Pending), when the body is not yet consumed (hyper's `poll_read`
+        serves the body first), and when a task cannot stand in for hyper's poll: a
+        request announcing an upgrade (`Upgrade` / CONNECT — hyper's `wants_upgrade`)
+        may still be detached or switched, and a parked reader cannot be handed to the
+        caller (runtime-forced divergence, documented in `detach`). That exclusion lasts
+        only until the response head is negotiated with a non-switching status
+        (`head_negotiated`); `want` records the ask.
 
-        The whole decision runs under `_arm_lock`: the callers are concurrent tasks, and
-        both the "one read parked" check and the want/negotiated handshake would race
-        without it (two readers on one transport; a lost arm)."""
-        with self._arm_lock:
-            if head_negotiated:
-                req._head_negotiated = True
-            if want:
-                req._watch_wanted = True
-            if not req._watch_wanted:
-                return
-            if self._half_close or self._closed or self.transport is None or self._watcher_handle is not None:
-                return
-            if not req._body_done or req._response_done:
-                return
-            if (req.is_upgrade or req.method == "CONNECT") and not (req._head_negotiated and not req._is_switch):
-                return
-            if self._codec.buffered():
-                return  # a probe already read the next request: hyper's `read_buf` is non-empty -> no read
-            if req._decoder.buffered:
-                # The next request is already here: no read (hyper `read_buf`). Back into
-                # the codec's buffer, where hyper would have kept it all along.
-                self._codec.feed(req._decoder.take_buffered())
-                return
-            self._watcher_data = self._watcher_error = None
-            self._watcher_done = self.backend.event()
-            self._watcher_handle = self.backend.spawn_without_results(self._watch_mid_message(req))
+        The whole decision is ONE call into the state (`arm_watcher`); the spawn happens
+        here, after it, and the handle is stored — or, if the connection closed in
+        between, handed back and joined right here (the watcher exits at once: the
+        transport is gone). Never a second reader beside the next head read."""
+        done = self.backend.event()
+        if not self.arm_watcher(req._seq, done, want=want, head_negotiated=head_negotiated):
+            return
+        handle = self.backend.spawn_without_results(self._watch_mid_message(req, done))
+        refused = self.store_watcher_handle(handle)
+        if refused is not None:
+            await refused
 
-    async def _watch_mid_message(self, req):
-        """ONE read, dispatched by state when it completes (see `_arm_watcher`). Never
+    async def _watch_mid_message(self, req, done):
+        """ONE read, dispatched by state when it completes (`watcher_completed`). Never
         cancelled: a parked `receive_some` ends only via data, EOF, or transport close.
 
         - EOF / transport error while `req`'s response is still in flight: the client is
-          gone — hyper `close_read()` + `IncompleteMessage` (conn.rs L501-504). Mark the
-          request peer-closed (its in-flight `respond()` / `send_data` fail, `peer_closed()`
-          resolves) and the connection non-reusable. The result is also left for a
-          later `next_request` (it reads EOF and ends cleanly), so a racing
-          `_finish_response` that re-marks the connection reusable is harmless: the DATA
-          decides, not the flag.
-        - bytes: a pipelined next request. Left in `_watcher_data` for the next head read
+          gone — hyper `close_read()` + `IncompleteMessage` (conn.rs L501-504). The state
+          marks the request peer-closed (its in-flight `respond()` / `send_data` fail,
+          `peer_closed()` resolves) and the connection non-reusable.
+        - bytes: a pipelined next request. Left in the slot for the next head read
           (hyper's `read_buf`); NOT re-armed — hyper reads once and returns Pending while
           the buffer is non-empty (L495).
         - completed after the response: it was the idle read all along; `next_request`
           takes it via `_recv_head_bytes`."""
-        transport = self.transport
-        if transport is None:  # a racing close nulled it before we ran
-            self._watcher_done.set()
+        transport = self.transport_ref()
+        if transport is None:  # a racing close took it before we ran
+            self.watcher_aborted()
+            done.set()
             return
+        data = error = None
         try:
             data = await transport.receive_some(_READ_SIZE)
         except Exception as exc:
-            self._watcher_error = exc.with_traceback(None)  # strip frames: don't pin the connection in a cycle
-            data = None
-        else:
-            self._watcher_data = data
-        if not data and not req._response_done:
-            self._reusable = False
-            req._peer_closed = True
+            error = exc.with_traceback(None)  # strip frames: don't pin the connection in a cycle
+        if self.watcher_completed(data, error):
             req._peer_closed_evt.set()
-        self._watcher_done.set()
+        done.set()
 
-    async def _take_watcher(self):
+    async def _take_watcher(self, done):
         """The watcher's read result — awaited through its completion EVENT (cancellable:
-        the head-read deadline and the shutdown race may abandon this wait), then its
-        handle joined exactly once. Raises the transport error the read hit, if any."""
-        await self._watcher_done.wait()
-        handle, self._watcher_handle = self._watcher_handle, None
+        the head-read deadline and the shutdown race may abandon this wait, with the
+        handle still in its slot), then its handle joined exactly once (already done:
+        no suspension, so no cancellation can strand it). Raises the transport error
+        the read hit, if any."""
+        await done.wait()
+        handle = self.take_watcher_handle()
         if handle is not None:
             await handle
-        error, self._watcher_error = self._watcher_error, None
+        data, error = self.take_watcher_result()
         if error is not None:
             raise error
-        data, self._watcher_data = self._watcher_data, None
-        return data
+        return b"" if data is None else data
+
+    async def _eof(self):
+        return b""
 
     def _recv_head_bytes(self, n):
         """The next head-read awaitable: the parked watcher's read when one is armed (the
         hand-off — never a second reader on the transport), else a fresh read."""
-        if self._watcher_handle is not None:
-            return self._take_watcher()
-        return self.transport.receive_some(n)
+        done = self.watcher_done()
+        if done is not None:
+            return self._take_watcher(done)
+        transport = self.transport_ref()
+        if transport is None:
+            return self._eof()  # a concurrent close: the connection is over
+        return transport.receive_some(n)
 
     def _check_peer_open(self, req):
         # hyper: once `mid_message_detect_eof` saw EOF the connection is errored and nothing
         # more is written for this exchange. Poison + close, surface `IncompleteMessage`.
-        if req._peer_closed:
-            req._close_window()
-            self._fail_response(H1IncompleteMessageError(_PEER_CLOSED_MSG))
+        if self.peer_closed_flag(req._seq):
+            self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
 
     async def _send_async_body(self, req, body, trailers):
         """Stream an ASYNC response body and fail fast on a client FIN. hyper polls the
         connection (so `mid_message_detect_eof`) while the body's next chunk is pending,
         so a parked producer (SSE, long poll) does not hold a dead exchange. Same shape as
-        the h2 manager's `_send_async_body`: ONE pump task per response; this caller waits
+        the h2 driver's `_send_async_body`: ONE pump task per response; this caller waits
         once for "pump done" or "peer closed". On the FIN the pump is CANCELLED (hyper
         drops the body future) at its suspension — the app's `await`, or, h1 having no
         write pump, possibly inside a chunk write: harmless, this connection is closed
@@ -563,7 +570,7 @@ class ServerConnection(H1ConnectionBase):
         `IncompleteMessage`, io dropped). Also cancelled if this task is cancelled or
         unwinds: neither backend cancels scope children on a body exception, and joining
         a parked pump would hang. (A per-chunk `select` measured 4-5x slower.)"""
-        self._arm_watcher(req)  # the FIN is consumable now: make sure a read is parked
+        await self._arm_watcher(req)  # the FIN is consumable now: make sure a read is parked
         done, box = self.backend.event(), []
         abandoned = False
         async with self.backend.scope() as scope:
@@ -573,21 +580,19 @@ class ServerConnection(H1ConnectionBase):
                     event_result(done, PUMP_DONE), event_result(req._peer_closed_evt, PUMP_ABANDONED)
                 )
                 # The event also marks the window's close (`_close_window`), which cannot
-                # precede this response's own completion — `req._peer_closed` is the verdict.
-                abandoned = winner is PUMP_ABANDONED and req._peer_closed and not done.is_set()
+                # precede this response's own completion — the state's flag is the verdict.
+                abandoned = winner is PUMP_ABANDONED and self.peer_closed_flag(req._seq) and not done.is_set()
             finally:
                 if not done.is_set():
                     scope.cancel()  # leave with the pump gone, whatever ended the wait
-        # The scope exit does not wait for a CANCELLED child to unwind (see the h2 manager's
+        # The scope exit does not wait for a CANCELLED child to unwind (see the h2 driver's
         # `_send_async_body`): wait for the pump's own `done`, set in its `finally` after
         # the producer unwound and the generator was closed.
         await done.wait()
         if abandoned:
-            req._close_window()
-            self._fail_response(H1IncompleteMessageError(_PEER_CLOSED_MSG))
+            self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
         if box:
-            req._close_window()
-            self._fail_response(box[0])
+            self._fail_response(req, box[0])
 
     async def _pump_async_body(self, body, trailers, done, box):
         # A bare task: never lets an exception escape (it is reported through `box`).
@@ -603,23 +608,15 @@ class ServerConnection(H1ConnectionBase):
         # h1 `Connection::graceful_shutdown` (hyper Dispatcher `disable_keep_alive`):
         # a non-blocking signal — stop reusing the connection so the accept loop
         # ends after the current request (`next_request` returns None once
-        # `_reusable` is False), and wake a read parked idly between requests
-        # (`_shutdown_evt`, checked in the head-read). The caller drives the serve
-        # loop to completion and closes; nothing is awaited/closed here.
-        self._reusable = False
+        # non-reusable), and wake a read parked idly between requests: asyncio can
+        # wake it from another task (`interrupt_read`, decided under the state's
+        # lock with the park flag); tonio races the read against `_shutdown_evt`.
+        # The caller drives the serve loop to completion and closes; nothing is
+        # awaited/closed here.
+        transport = self.request_shutdown(self._native_read_interrupt)
         self._shutdown_evt.set()
-        if self._native_read_interrupt and self._idle_read_parked:
-            # asyncio: wake the read parked idly between requests so it returns promptly and
-            # the connection closes, instead of relying on a per-read select race (tonio's path).
-            self.transport.interrupt_read()
-
-    def mark_unusable(self):
-        self._reusable = False
-
-    def _detach(self):
-        # Same as the base, plus mark non-reusable (a tunnel serves no more requests).
-        super()._detach()
-        self._reusable = False
+        if transport is not None:
+            transport.interrupt_read()
 
     async def next_request(self):
         """Read the next request head and return a `ServerRequest`, or None once
@@ -630,76 +627,49 @@ class ServerConnection(H1ConnectionBase):
         hyper: the server `Dispatcher::poll_loop` (dispatch.rs L166) →
         `poll_read_head` (L292) → `Server::parse`; the drain mirrors
         `poll_drain_or_close_read` (conn.rs L849-865)."""
-        if self._closed or not self._reusable:
+        code, obj = self.begin_read()
+        if code == H1_NEXT_RAISE:
+            # hyper serializes structurally (the dispatcher won't read the next head
+            # until the response is fully written, dispatch.rs L628-633 /
+            # `try_keep_alive`). Surface the out-of-order use — no response, or a
+            # push-style body still open — rather than mis-pairing responses.
+            raise RuntimeError("respond to the current request (and finish its body) before reading the next")
+        if code == H1_NEXT_DRAIN:
+            code, obj = self.drain_done(self._drain_unread_body())
+        if code == H1_NEXT_CLOSE:
+            self._close(obj)  # body not cheaply drainable — connection closed
+            return None
+        if code == H1_NEXT_NONE:
             return None
         codec = self._codec
-        if self._current is not None:
-            if not self._current._response_done:
-                # hyper serializes structurally (the dispatcher won't read the next
-                # head until the response is fully written, dispatch.rs L628-633 /
-                # `try_keep_alive`). Surface the out-of-order use — no response, or a
-                # push-style body still open — rather than mis-pairing responses.
-                raise RuntimeError("respond to the current request (and finish its body) before reading the next")
-            if not self._current._body_done and not self._drain_unread_body(self._current):
-                return None  # body not cheaply drainable — connection closed (see below)
-            # Any pipelined bytes the body decoder read past this request's body go
-            # back into the codec's persistent buffer (hyper keeps them in its single
-            # `read_buf`). Bytes the watcher itself read are delivered by its hand-off
-            # read (`_recv_head_bytes`).
-            if self._current._decoder.buffered:
-                codec.feed(self._current._decoder.take_buffered())
-        self._current = None
-        codec.reset()  # the next message: per-message state only, the read buffer persists
-
         try:
-            head = await self._read_request_head(codec)
+            accepted = await self._read_request_head(code, obj)
         except H1ParseError:
-            self._closed = True
-            self._reusable = False
             # hyper conn.rs `on_parse_error`: an HTTP/2 preface is `Parse::VersionH2` and
             # the connection just closes; any other malformed head gets `Server::on_error`'s
             # automatic response (400 / 414 / 431), then closes. The app never sees the
             # `H1ParseError` — hyper's service is never invoked for it either.
+            transport = self.fail_read()
             status = codec.parse_error_status
-            if status is None:
-                self._close_transport()
+            if status is None or transport is None:
+                self._close(transport)
                 return None
-            await self._send_error(codec, status)
+            await self._send_error(transport, codec, status)
             return None
         except self.backend.broken_transport_errors:
             # The transport died at the request boundary — an RST, or a TLS
             # close without close_notify (which httpunk's own abortive
-            # `close_transport` produces, F33a — every httpunk client hanging
-            # up looks like this). The wire outcome is identical to the clean
-            # EOF below — the connection just ends with no request to serve —
-            # so it surfaces as a clean end-of-iteration, extending F47's
-            # contract (hyper instead surfaces an Io error from the connection
-            # future; observability-only, exactly as F47's mid-head-EOF case).
-            self._closed = True
-            self._reusable = False
-            self._close_transport()
+            # `close_transport` produces, F33a). The wire outcome is identical to
+            # the clean EOF below, so it surfaces as a clean end-of-iteration (F47).
+            self._close(self.fail_read())
             return None
-        if head is None:  # clean EOF between requests — client closed
-            self._closed = True
+        if accepted is None:  # clean EOF between requests (or a shutdown released the idle read)
+            self.stop_serving()
             return None
-        decoder = H1BodyDecoder(head.body_kind, head.content_length or 0)
-        decoder.feed(codec.take_body())  # body bytes read alongside the head
-        req = ServerRequest(
-            self,
-            method=head.method,
-            target=head.target,
-            headers=head.headers,
-            decoder=decoder,
-            keep_alive=head.keep_alive,
-            expect_continue=head.expect_continue,
-            is_upgrade=head.is_upgrade,
-            http10=head.http10,
-            content_length=head.content_length,
-        )
-        self._current = req
-        return req
+        head, seq, decoder = accepted  # the head is the current request (`accept_head`)
+        return ServerRequest(self, seq, head, decoder)
 
-    def _drain_unread_body(self, req):
+    def _drain_unread_body(self):
         """Discard an unread request body so the next request parses cleanly, but
         only if it's cheap — a 1:1 mirror of hyper `poll_drain_or_close_read`
         (conn.rs L849-865), which does EXACTLY ONE `poll_read_body` (`let _ =
@@ -708,110 +678,99 @@ class ServerConnection(H1ConnectionBase):
         buffer held nothing decodable yet (need-more, not end) — do ONE non-blocking
         socket read and decode that. Reuse iff that single poll completed the body;
         otherwise `close_read()` (never loop the socket to drain an arbitrary body,
-        never send the skipped `100 Continue`).
-
-        One poll, not a loop, is deliberate and matches hyper exactly: a chunked body
-        with any data frame can't cheaply drain (one `decode()` yields one DATA chunk,
-        the terminating chunk unseen → not complete → close), and a half-buffered length
-        body closes (hyper's length decoder reads from IO only when its buffer is empty,
-        so a partial buffer yields a short frame and gives up — decode.rs Length). The
-        single non-blocking read is `backend.receive_nowait`, the equivalent of hyper's
-        `poll_read_body` seeing `Pending`. Returns True if drained (reusable), else False."""
-        dec = req._decoder
+        never send the skipped `100 Continue`). The state gave this drain the transport
+        read (`NEXT_DRAIN`): no body reader can start beside it. Returns whether the
+        body completed."""
+        dec = self.current_decoder()
+        transport = self.transport_ref()
+        if dec is None or transport is None:
+            return False
         try:
             if dec.decode() is None and not dec.is_complete:  # buffer had no full frame → need more
-                data = self.backend.receive_nowait(self.transport, _READ_SIZE)
+                if self.watcher_parked:
+                    return False  # a read is parked on the transport: never a second reader beside it
+                data = self.backend.receive_nowait(transport, _READ_SIZE)
                 if data:  # b"" == nothing ready right now, or EOF -> give up (close)
                     dec.feed(data)
                     dec.decode()
         except Exception:  # noqa: S110 - a decode failure just means "not drainable → close"
             pass
-        if dec.is_complete:
-            req._body_done = True
-            return True
-        self._closed = True
-        self._reusable = False
-        return False
+        return dec.is_complete
 
-    async def _read_request_head(self, codec):
+    async def _read_request_head(self, code, obj):
         # Bound the head read by `header_read_timeout` (slowloris defence, hyper http1.rs L249):
         # if the deadline wins, close with no response (hyper closes on a header-read timeout).
         # `backend.timeout(coro, seconds) -> (result, completed)` cancels the read cleanly on
         # expiry — cheap on every backend (asyncio: one task + one timer; tonio: its native
         # timeout). `None` disables the deadline.
         if self._header_read_timeout is None:
-            return await self._read_head_frames(codec)
-        result, completed = await self.backend.timeout(self._read_head_frames(codec), self._header_read_timeout)
+            return await self._read_head_frames(code, obj)
+        result, completed = await self.backend.timeout(self._read_head_frames(code, obj), self._header_read_timeout)
         if not completed:
-            self._closed = True
-            self._reusable = False
-            self._close_transport()
+            self._close(self.fail_read())
             return None
         return result
 
-    async def _read_head_frames(self, codec):
-        # Parse what the codec's buffer already holds (pipelined bytes) before touching
-        # the transport, so a request already there parses without a (blocking) read.
-        idle = not codec.buffered()  # no bytes of this request seen yet -> a graceful shutdown may end it
-        if not idle:
-            head = codec.receive_request_head(b"")
-            if head is not None:
-                return head
+    async def _read_head_frames(self, code, obj):
+        """Read + parse the next head from `begin_read`'s verdict: `READ_PARSE` = bytes of
+        it are already buffered (pipelined), parse before touching the transport;
+        `READ_WATCHER` / `READ_TRANSPORT` = the idle between-requests read (`obj` = the
+        parked watcher's done event, or the transport); `READ_SHUTDOWN` / `READ_EOF` =
+        nothing to read. Each read's bytes go to `accept_head`, which parses and — once
+        the head is complete — makes it the current request in the same step. Returns
+        `(head, seq, decoder)`, or None on EOF / a shutdown wake."""
+        if code == H1_READ_PARSE:
+            accepted = self.accept_head(b"")
+            if accepted is not None:
+                return accepted
+            code = None  # a partial head: keep reading — a request in flight must complete
         while True:
-            if idle:
-                # Between requests: a graceful shutdown may end the wait (see
-                # `_read_or_shutdown` — sync; returns the sentinel or the read awaitable).
-                read = self._read_or_shutdown(_READ_SIZE)
-                if read is _SHUTDOWN:
-                    return None
-                # Flag the park as idle so graceful_shutdown() may wake THIS read only —
-                # never a mid-head read (a request in flight must complete).
-                self._idle_read_parked = True
+            if code is None:
+                data = await self._recv_head_bytes(_READ_SIZE)
+            elif code in (H1_READ_SHUTDOWN, H1_READ_EOF):
+                return None
+            else:
+                # Between requests: a graceful shutdown may end the wait. The park was
+                # flagged in the state by the same step that chose this read (`begin_read`),
+                # so `graceful_shutdown()` may wake THIS read only — never a mid-head read.
                 try:
-                    data = await read
+                    data = await self._idle_read(code, obj)
                 finally:
-                    self._idle_read_parked = False
+                    self.unpark_idle_read()
                 if data is _SHUTDOWN:  # tonio select: the shutdown signal won the race
                     return None
                 # An interrupt_read shutdown wake surfaces as b"" and falls into the EOF
                 # return below — same outcome either way (loop ends; close, no response).
-            else:
-                data = await self._recv_head_bytes(_READ_SIZE)
             if not data:
                 # EOF. A clean EOF between requests (nothing buffered) is a normal
                 # client close. hyper additionally distinguishes a MID-head EOF
                 # (`buffered > 0`) as `Parse::Eof`/`IncompleteMessage` (an error), but
                 # the wire outcome is identical either way — the connection just closes
                 # with no response — so we surface both as a clean end-of-iteration
-                # rather than raise (F47, observability-only; raising here would change
-                # `next_request`'s clean-close contract for every host loop).
+                # rather than raise (F47, observability-only).
                 return None
-            idle = False  # a request's bytes have started arriving — don't interrupt now
+            code = None  # a request's bytes have started arriving — don't interrupt now
             # The codec caps a still-incomplete head at `max_buf_size` (hyper io.rs
             # L202-207): past it, `Parse::TooLarge` -> auto 431 + close.
-            head = codec.receive_request_head(data)
-            if head is not None:
-                return head
+            accepted = self.accept_head(data)
+            if accepted is not None:
+                return accepted
 
-    def _read_or_shutdown(self, n):
-        """The next idle-read awaitable, or `_SHUTDOWN` if a graceful shutdown was already
-        requested. A plain (sync) function so the fast path adds no wrapper coroutine: the
-        caller awaits the returned awaitable with `_idle_read_parked` set around it (so
-        `graceful_shutdown()` wakes only an idly-parked read, never a mid-head one) and
-        treats an awaited `_SHUTDOWN` — or a woken `b""` — as shutdown, not data.
+    def _idle_read(self, code, obj):
+        """The idle-read awaitable for a `READ_WATCHER` (`obj` = the parked watcher's done
+        event: the hand-off — never a second reader on the transport) or `READ_TRANSPORT`
+        (`obj` = the transport) verdict. A plain (sync) function so the fast path adds no
+        wrapper coroutine.
 
-        asyncio (`native_read_interrupt`): a plain read; if it parks, graceful_shutdown()
-        wakes it via `interrupt_read` and the read returns b"". Backends without a native
-        read interrupt (tonio can't wake a parked recv from another task): race the read
-        against the shutdown signal via `select`, which cancels the losing branch — hyper's
-        poll instead re-checks `should_read` and completes without reading."""
-        if self._shutdown_evt.is_set():
-            return _SHUTDOWN
-
+        asyncio (`native_read_interrupt`): the read itself; if it parks, graceful_shutdown()
+        wakes it via `interrupt_read` and the read returns b"" (a parked watcher's
+        underlying read is that same transport read). Backends without a native read
+        interrupt (tonio can't wake a parked recv from another task): race the read against
+        the shutdown signal via `select`, which cancels the losing branch — hyper's poll
+        instead re-checks `should_read` and completes without reading."""
+        read = self._take_watcher(obj) if code == H1_READ_WATCHER else obj.receive_some(_READ_SIZE)
         if self._native_read_interrupt:
-            # A parked watcher's underlying read is the same transport read `interrupt_read`
-            # wakes (it returns b"", which the hand-off delivers as the idle EOF).
-            return self._recv_head_bytes(n)
+            return read
 
         async def _await_shutdown():
             await self._shutdown_evt.wait()
@@ -819,26 +778,28 @@ class ServerConnection(H1ConnectionBase):
 
         # With a watcher armed the racer is its completion-event wait, so the losing
         # cancel never lands on the parked read itself (which ends by the close that follows).
-        return self.backend.select(self._recv_head_bytes(n), _await_shutdown())
+        return self.backend.select(read, _await_shutdown())
 
-    async def _send_error(self, codec, status):
+    async def _send_error(self, transport, codec, status):
         """Best-effort automatic error response (bodyless, `Connection: close`),
         then close — hyper `Server::on_error` + `write_head`."""
         try:
             # `keep_alive=False`: hyper `close_read()`s before `on_error`, so `enforce_version`
             # inserts `connection: close` on the automatic response (F29).
             head = codec.serialize_response(status, None, keep_alive=False)
-            await self.transport.send_all(codec.serialize_head_and_body(head))  # one write (coalesced)
+            await transport.send_all(codec.serialize_head_and_body(head))  # one write (coalesced)
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
             pass
-        self._close_transport()
+        self._close(transport)
 
-    async def send_response(self, req, status, headers, body, trailers=None):
+    # ===== sending responses (hyper conn.rs encode_head / role.rs Server::encode) =====
+
+    async def _send_response(self, req, status, headers, body, trailers=None):
         """The pull path (`ServerRequest.respond`): head + whole body (+ trailers), with
         the head+small-body write coalescing of `_send_head_and_body`. Shares head-time
         negotiation (`_prepare_head`) and completion (`_finish_response`) with the push
-        path, so the two cannot drift; only the write batching differs."""
-        self._check_peer_open(req)
+        path, so the two cannot drift; only the write batching differs. The peer-closed
+        check is the claim's (`_claim_response`), which precedes this."""
         content_length, chunked = self._body_framing(body)
         streaming = body is not None and hasattr(body, "__aiter__")
         if trailers is not None and not isinstance(trailers, HeaderMap):
@@ -846,43 +807,33 @@ class ServerConnection(H1ConnectionBase):
             # them) and only fields the response's own `Trailer` header declared are
             # emitted — `Encoder::encode_trailers` drops the rest.
             trailers = HeaderMap(trailers)
-        head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
-        req._keep_alive_decision = keep_alive
-        req._is_switch = is_switch
-        if req.is_upgrade or req.method == "CONNECT":
-            # The head is negotiated: a `peer_closed()` deferred past it arms now (`want=False`:
-            # a bytes body asks for nothing itself). Plain requests never defer — no lock on
-            # their hot path; a streamed body arms in `_send_async_body` regardless.
-            self._arm_watcher(req, want=False, head_negotiated=True)
+        # The head step: claim, verdicts, encode, the hand-off + reuse decisions recorded,
+        # and a `peer_closed()` deferred past the head (an upgrade request) arms now
+        # (`want=False`: a bytes body asks for nothing itself; a streamed body arms in
+        # `_send_async_body` regardless).
+        head = await self._respond_head(req, status, headers, content_length, chunked, want=False)
         if streaming:
             try:
                 await self.write(head)  # the head must never wait on the app's generator
             except BaseException as exc:
-                req._close_window()
-                self._fail_response(exc)
+                self._fail_response(req, exc)
             await self._send_async_body(req, body, trailers)
         else:
             try:
                 await self._send_head_and_body(self._codec, head, body, trailers)
             except BaseException as exc:
-                req._close_window()
-                self._fail_response(exc)
+                self._fail_response(req, exc)
         self._finish_response(req)
 
-    async def send_response_head(self, req, status, headers, *, end_stream):
+    async def _send_response_head(self, req, status, headers, *, end_stream):
         """The push path (`ServerRequest.send_response`): write the head now, return
         the `SendStream`. `end_stream` maps onto hyper's two encode inputs the same way a
         pull body does: True = no body (`_body_framing(None)`), False = a body of unknown
-        length (streamed -> chunked, or length if the headers carry `content-length`)."""
-        self._check_peer_open(req)
+        length (streamed -> chunked, or length if the headers carry `content-length`).
+        The peer-closed check is the claim's (`_claim_response`), which precedes this."""
         content_length, chunked = self._body_framing(None) if end_stream else (None, True)
-        head, is_switch, keep_alive = self._prepare_head(req, status, headers, content_length, chunked)
-        req._keep_alive_decision = keep_alive
-        req._is_switch = is_switch
-        # A push producer may park between chunks: make the FIN observable (`want`). After
-        # the head negotiation, so an upgrade request answered without a switch is armed
-        # too — for it, or for a `peer_closed()` deferred past the head.
-        self._arm_watcher(req, want=not end_stream, head_negotiated=True)
+        # A push producer may park between chunks: make the FIN observable (`want`).
+        head = await self._respond_head(req, status, headers, content_length, chunked, want=not end_stream)
         stream = SendStream(self, req, self._codec)
         if end_stream:
             stream._done = True
@@ -891,13 +842,50 @@ class ServerConnection(H1ConnectionBase):
         try:
             await self.write(head)
         except BaseException as exc:
-            req._close_window()
-            self._fail_response(exc)
+            self._fail_response(req, exc)
         if end_stream:
             self._finish_response(req)
         return stream
 
-    def _fail_response(self, exc):
+    async def _respond_head(self, req, status, headers, content_length, chunked, *, want):
+        """The head step, shared by the pull and push paths — hyper conn.rs `encode_head`
+        (server) as ONE transition (`respond_head`): claim the response, read the verdicts
+        the claim must see (a client gone mid-request; a `100 Continue` in flight),
+        `enforce_version` + `Server::encode` in the codec with hyper's `wants_keep_alive()`,
+        the hand-off + reuse decisions recorded from the encoder's verdicts, and the arm
+        decision (`want`: a streamed / push body asks for the read). Then the spawn the
+        decision asked for (see `_arm_watcher`). Returns the encoded head.
+
+        A `100 Continue` claimed by the body reader goes out first: the claim stands and
+        the head step re-runs once its write is done (the request's continue event). A
+        client that closed mid-request fails the exchange before anything is written
+        (`mid_message_detect_eof` -> `IncompleteMessage`); an encoder `User` error (a 1xx
+        status, content-length + transfer-encoding) fails it after the claim, as hyper's."""
+        hdrs = headers if headers is None or isinstance(headers, HeaderMap) else HeaderMap(headers)
+        done = self.backend.event()
+        while True:
+            try:
+                code, head, armed = self.respond_head(
+                    req._seq, status, hdrs, done, content_length=content_length, chunked=chunked, want=want
+                )
+            except BaseException as exc:
+                self._fail_response(req, exc)
+            if code == H1_REQ_OK:
+                break
+            if code == H1_REQ_CONTINUE:
+                await req._continue_evt.wait()
+                continue
+            if code == H1_REQ_PEER_CLOSED:
+                self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
+            raise RuntimeError("response already sent for this request")
+        if armed:
+            handle = self.backend.spawn_without_results(self._watch_mid_message(req, done))
+            refused = self.store_watcher_handle(handle)
+            if refused is not None:
+                await refused
+        return head
+
+    def _fail_response(self, req, exc):
         """A failed response poisons the connection (hyper `Writing::Closed` + the error
         stored on the connection -> close) and `exc` surfaces as hyper's kind for it:
 
@@ -909,9 +897,8 @@ class ServerConnection(H1ConnectionBase):
           reaching a write is folded in the same way — the write did not complete);
         - the app's own body-iterable exception (hyper `User::Body`) propagates as
           itself — hyper wraps it because Rust must; Python carries the instance."""
-        self._reusable = False
-        self._closed = True
-        self._close_transport()
+        self._close(self.fail_response(req._seq))  # the window closed in the same step
+        req._peer_closed_evt.set()
         if isinstance(exc, HTTPunkError):
             raise exc
         transport_errors = (OSError, *self.backend.broken_transport_errors)
@@ -919,54 +906,25 @@ class ServerConnection(H1ConnectionBase):
             raise ConnectionClosedError("failed to send response") from exc
         raise exc
 
+    def _abort_response(self, req):
+        """`SendStream.send_reset`: hyper closes the connection when a response `Body`
+        errors mid-stream (`Writing::Closed`); the client sees a truncated body."""
+        self._close(self.fail_response(req._seq))
+        req._peer_closed_evt.set()
+
     def _finish_response(self, req):
         """Completion, shared by both paths: the response is fully on the wire — apply
         the head-time reuse decision (hyper `try_keep_alive` after `Writing::KeepAlive`),
-        or hand off the tunnel for a protocol switch."""
-        req._close_window()
-        if req._is_switch:
-            # Hand the raw connection (plus any bytes already buffered past the
-            # request head — the start of the tunnel) to the caller and detach.
-            self._codec.feed(req._decoder.take_buffered())
-            req.upgraded = H1Upgraded(self.transport, self._codec.take_body())
-            self._detach()
-            return
-        self._reusable = req._keep_alive_decision
-        if not self._reusable:
-            self._closed = True
-            self._close_transport()
-
-    def _prepare_head(self, req, status, headers, content_length, chunked):
-        # hyper conn.rs `encode_head` (server): `enforce_version` over the head, then
-        # role.rs `Server::encode` — both in the codec. This side supplies hyper's
-        # inputs and reads its verdict back:
-        # - `keep_alive` = `wants_keep_alive()`: the request was keep-alive and neither a
-        #   graceful shutdown (`disable_keep_alive`, KA::Disabled, conn.rs L682-698) nor
-        #   `keep_alive(false)` turned it off. The response's own `Connection: close`, a
-        #   101 or a 2xx to CONNECT are `is_last` verdicts the encoder derives itself
-        #   (role.rs L392-411, L839-843), as is a close-delimited 1.0 body — the reuse
-        #   decision is `try_keep_alive`'s: neither `is_last` nor close-delimited.
-        # - `is_switch` is the hand-off decision (hyper `on_upgrade`): a 101 the request
-        #   asked for (`wants_upgrade`), or a 2xx to CONNECT. A 101 the request did not ask
-        #   for is not a tunnel (F28) — it still ends the connection (`is_last`).
-        hdrs = headers if headers is None or isinstance(headers, HeaderMap) else HeaderMap(headers)
-        http10 = req._http10
-        is_switch = (status == 101 and req.is_upgrade) or (req.method == "CONNECT" and 200 <= status < 300)
-        wants_keep_alive = req.keep_alive and self._keep_alive_enabled and not self._shutdown_evt.is_set()
-        try:
-            head = self._codec.serialize_response(
-                status,
-                hdrs,
-                keep_alive=wants_keep_alive,
-                http10=http10,
-                content_length=content_length,
-                chunked=chunked,
-            )
-        except BaseException as exc:
-            req._close_window()
-            self._fail_response(exc)
-        keep_alive = not self._codec.response_is_last and not self._codec.response_close_delimited
-        return head, is_switch, keep_alive
+        or hand off the tunnel for a protocol switch. One step in the state; the
+        `peer_closed()` waiters wake after it."""
+        switch, close, transport, leftover = self.finish_response(req._seq)
+        req._peer_closed_evt.set()
+        if switch:
+            # The raw connection (plus any bytes already buffered past the request head —
+            # the start of the tunnel) is the caller's; the state detached.
+            req.upgraded = H1Upgraded(transport, leftover)
+        elif close:
+            self._close(transport)
 
 
 class H1Server(BaseServer[ServerRequest]):
@@ -979,6 +937,13 @@ class H1Server(BaseServer[ServerRequest]):
             async for request in server:
                 await request.respond(200, body=b"hi")
     """
+
+    def _prime(self, data: bytes) -> None:
+        """`util.auto`'s seam (hyper-util's `Rewind`, without the wrapper transport): the
+        bytes the protocol sniff already read — the start of the request line — go into
+        the codec's read buffer (hyper's persistent `read_buf`), so the driver reads the
+        raw transport from the first head on. Before the first read: single-owner."""
+        self._conn.codec.feed(data)
 
     def __init__(
         self,

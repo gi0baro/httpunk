@@ -28,9 +28,11 @@ def _server_ctx(ca, alpn):
     return ctx
 
 
-def _client_ctx(ca):
+def _client_ctx(ca, alpn):
+    # A caller-supplied context is never mutated by `connect()`: it carries its own ALPN offer.
     ctx = ssl.create_default_context()
     ca.configure_trust(ctx)
+    ctx.set_alpn_protocols(list(alpn))
     return ctx
 
 
@@ -58,7 +60,7 @@ async def test_https_alpn_negotiates_h2(ca):
 
     async with scope() as s:
         s.spawn(server_side())
-        conn = await connect(f"https://127.0.0.1:{port}/", ssl_context=_client_ctx(ca), alpn=("h2", "http/1.1"))
+        conn = await connect(f"https://127.0.0.1:{port}/", ssl_context=_client_ctx(ca, ("h2", "http/1.1")))
         assert isinstance(conn, H2Connection)  # ALPN chose h2 -> the "upgrade"
         async with conn:
             resp = await conn.request("POST", "/", body=b"hi")
@@ -85,7 +87,7 @@ async def test_https_falls_back_to_h1_when_alpn_is_http11(ca):
 
     async with scope() as s:
         s.spawn(server_side())
-        conn = await connect(f"https://127.0.0.1:{port}/", ssl_context=_client_ctx(ca), alpn=("http/1.1",))
+        conn = await connect(f"https://127.0.0.1:{port}/", ssl_context=_client_ctx(ca, ("http/1.1",)))
         assert isinstance(conn, H1Connection)
         async with conn:
             resp = await conn.request("POST", "/", headers={"host": f"127.0.0.1:{port}"}, body=b"hey")

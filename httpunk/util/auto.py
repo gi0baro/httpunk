@@ -7,17 +7,22 @@ An h2 client opens with the fixed 24-byte connection preface
 method token and can never begin with that prefix. So peek up to `len(PREFACE)`
 bytes and compare against `PREFACE[:n]` (hyper-util's `H2_PREFACE` check).
 
-Peeking must not consume bytes the codec needs, so the transport is wrapped in a
-`_PrewoundTransport` that replays the peeked bytes before reading live — the same
-leftover-replay mechanism as `H1Upgraded`, and hyper-util's `Rewind`. The h2 server
-then consumes the replayed preface in `_before_frames`; the h1 server parses the
-replayed request line.
+Peeking must not lose bytes the codec needs. hyper-util wraps the IO in a `Rewind`
+adapter that replays them before reading live and stays in place for the connection's
+lifetime (free in Rust, an extra frame per read in Python). httpunk instead seeds the
+peeked bytes into the picked server's codec (`_prime`: the h2 decoder consumes the
+preface, the h1 codec's persistent read buffer holds the start of the request line)
+and hands the driver the RAW transport — the protocol is fixed for the connection's
+lifetime after the sniff, so nothing needs to sit in front of the transport afterwards.
+Same wire behaviour, and the backends' non-blocking peek seams (`read_nowait`,
+`socket`/`_ssl`) always see the real transport: no replay buffer can be overtaken.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .. import _backend
 from .._httpunk import H2Codec
 from ..h1.server import H1Server
 from ..h2.connection import PREFACE
@@ -35,31 +40,6 @@ class SniffCancelledError(Exception):
     """The protocol sniff was interrupted before it could complete — e.g. a graceful
     shutdown of a connected-but-still-silent client (≈ hyper-util `ReadVersion::cancel`).
     The caller should close the connection without building a server."""
-
-
-class _PrewoundTransport:
-    """A transport wrapper that replays `prewound` bytes (already read off the
-    socket while sniffing) before delegating to the real transport — so protocol
-    detection doesn't swallow bytes the codec needs. Everything except the
-    replaying `receive_some` (e.g. `send_all`, `close`, `.socket`/`._ssl` for the
-    backend's non-blocking peek) forwards to the wrapped transport unchanged.
-
-    Mirrors hyper-util `server::conn::auto`'s `Rewind` IO adapter.
-    """
-
-    def __init__(self, transport, prewound):
-        self._transport = transport
-        self._prewound = bytes(prewound)
-
-    async def receive_some(self, max_bytes=65536):
-        if self._prewound:
-            chunk, self._prewound = self._prewound[:max_bytes], self._prewound[max_bytes:]
-            return chunk
-        return await self._transport.receive_some(max_bytes)
-
-    def __getattr__(self, name):
-        # Forward send_all / close / socket / _ssl / … to the wrapped transport.
-        return getattr(self._transport, name)
 
 
 class Builder:
@@ -114,10 +94,10 @@ class Builder:
 
     async def serve_connection(self, transport: Any, *, cancel: Any = None) -> H2Server | H1Server:
         """Sniff `transport` (unless a protocol was forced) and return the matching
-        **un-entered** server over a prewound transport that replays the sniffed bytes
-        (hyper-util `Builder::serve_connection`). A forced server reads the raw
-        transport directly (nothing was peeked). Returned un-entered like `connect` —
-        the caller drives it with `async with server: async for req in server: ...`.
+        **un-entered** server over the raw transport, its codec seeded with the sniffed
+        bytes (hyper-util `Builder::serve_connection` + `Rewind`, see the module doc).
+        Returned un-entered like `connect` — the caller drives it with
+        `async with server: async for req in server: ...`.
 
         `cancel` (an event) makes the peek interruptible (≈ hyper-util
         `ReadVersion::cancel`): if it fires while we're parked reading a silent client's
@@ -143,10 +123,10 @@ class Builder:
             if matched is not None:
                 break  # the full preface (-> h2), or diverged from it (-> h1)
 
-        prewound = _PrewoundTransport(transport, buf)
-        if matched:
-            return self._build_h2(prewound)
-        return self._build_h1(prewound)
+        server = self._build_h2(transport) if matched else self._build_h1(transport)
+        if buf:
+            server._prime(buf)  # the sniffed bytes go into the codec; the driver reads the raw transport
+        return server
 
 
 class Http1Builder:
@@ -304,16 +284,28 @@ async def serve(
 
 
 async def _sniff_read(transport, n, backend, cancel):
-    """One peek read, racing an optional `cancel` signal so a parked read can be
-    interrupted (returns the `_CANCELLED` sentinel if the signal won)."""
+    """One peek read, interruptible by an optional `cancel` signal (returns the
+    `_CANCELLED` sentinel if it fired). A parked `receive_some` is never cancelled
+    (on tonio that leaves the socket registration armed for a dead task): the
+    signal ends the read by CLOSING the transport — the sanctioned way to end a
+    parked read — and the caller, who closes a cancelled connection anyway, gets
+    the sentinel."""
     if cancel is None:
         return await transport.receive_some(n)
+    backend = _backend.resolve(backend)
 
-    async def _recv():
-        return await transport.receive_some(n)
-
-    async def _cancelled():
+    async def _closer():
         await cancel.wait()
-        return _CANCELLED
+        backend.close_transport(transport)
 
-    return await backend.select(_recv(), _cancelled())
+    async with backend.scope() as s:
+        s.spawn(_closer())
+        try:
+            chunk = await transport.receive_some(n)
+        except Exception:
+            chunk = b""  # the close ended the read (EOF on asyncio, an error on tonio)
+        finally:
+            s.cancel()  # the closer parks on an event, never on a read: safe to cancel
+    if cancel.is_set():
+        return _CANCELLED
+    return chunk

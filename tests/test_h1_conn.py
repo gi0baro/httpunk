@@ -2,6 +2,8 @@
 `H1Codec` + `H1BodyDecoder` over a real transport — content-length / chunked /
 close-delimited bodies, request bodies, keep-alive reuse, and connection-close."""
 
+import select
+
 import pytest
 from _client import open_h1
 from tonio.colored import Event, scope, sleep
@@ -522,7 +524,20 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
         async with open_h1(host, port) as conn:
             assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
             r1_read.set()
-            await junk_sent.wait()  # the junk is now sitting in the client's socket buffer
+            await junk_sent.wait()  # the server wrote the junk...
+            # ...but its `send_all` returning does not put it in the client's socket
+            # buffer yet (loopback delivery is asynchronous, and slower under load):
+            # wait until the socket is readable — a non-consuming readiness poll — or the
+            # idle watcher already consumed it (the connection is then poisoned).
+            transport = conn._conn.transport_ref()
+            while transport is not None and not conn._conn.is_dead():
+                try:
+                    readable, _, _ = select.select([transport.socket._sock], [], [], 0)
+                except (ValueError, OSError):
+                    break  # the watcher consumed the junk and closed the socket under us: poisoned
+                if readable:
+                    break
+                await sleep(0)
             with pytest.raises(H1UnexpectedMessageError):
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
         s.cancel()
@@ -557,7 +572,7 @@ async def test_idle_fin_closes_connection_promptly():
                 await sleep(0.005)
             assert conn.closed
             assert conn._conn.error is None  # clean close, not an error
-            assert conn._conn.transport is None  # socket closed NOW, not at next use
+            assert conn._conn.transport_ref() is None  # socket closed NOW, not at next use
             with pytest.raises(HTTPunkError) as excinfo:
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
             assert getattr(excinfo.value, "request_unsent", False) is True

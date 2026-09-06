@@ -387,12 +387,12 @@ async def test_server_header_read_timeout_closes_slow_head():
 
 @pytest.mark.asyncio
 async def test_server_shutdown_wins_over_buffered_pipelined_request():
-    """REGRESSION GUARD: a graceful-shutdown signal is honored BEFORE any idle read consumes
+    """REGRESSION GUARD: a graceful shutdown is honored BEFORE any idle read consumes
     already-buffered bytes — hyper stops parsing new heads once keep-alive is disabled
     (`can_read_head` under KA::Disabled), so a pipelined request already sitting in the
-    transport must NOT be served. Whitebox: the shutdown event is set directly (without
-    `graceful_shutdown()`'s `_reusable = False`, which would end the accept loop before the
-    read even starts) to pin the in-loop ordering: shutdown check -> read."""
+    transport must NOT be served, nor even read off the transport. The shutdown flag and
+    the read decision live in one state step (`begin_read`: the shutdown verdict precedes
+    any transport read), so the signal can never be observed late."""
     transport = _PeekableStub(
         b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n",
         b"GET /b HTTP/1.1\r\nhost: x\r\n\r\n",
@@ -401,8 +401,9 @@ async def test_server_shutdown_wins_over_buffered_pipelined_request():
     req = await conn.next_request()
     assert req.target == "/a"
     await req.respond(200)
-    conn._shutdown_evt.set()  # signal only (whitebox) — see docstring
-    assert await conn.next_request() is None  # /b is readable but must NOT be parsed
+    await conn.graceful_shutdown()
+    assert await conn.next_request() is None  # /b is readable but must NOT be parsed...
+    assert transport._buffered  # ...nor read: the bytes are still in the transport
 
 
 @pytest.mark.tonio
@@ -1311,7 +1312,7 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
         transport = await listener.accept()
         async with H1Server(transport) as server:
             async for req in server:
-                server._conn._arm_watcher(req)  # what `peer_closed()` / a streamed or push response does
+                await server._conn._arm_watcher(req)  # what `peer_closed()` / a streamed or push response does
                 try:
                     req.detach()
                 except RuntimeError as exc:
@@ -1331,8 +1332,8 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
     conn = ServerConnection(stub)
     await conn.start()
     req = await conn.next_request()
-    conn._arm_watcher(req)  # a no-op here: the head is not negotiated yet
-    assert conn._watcher_handle is None
+    await conn._arm_watcher(req)  # a no-op here: the head is not negotiated yet
+    assert not conn.has_watcher
     assert req.detach() == b"WSDATA"
 
 
@@ -1515,7 +1516,7 @@ async def test_server_request_body_truncated_by_client_close_is_body_error():
     with pytest.raises(H1BodyError) as ei:
         await req.read()
     assert ei.value.args[0] == "unexpected_eof"
-    assert not conn._reusable
+    assert not conn.reusable
 
 
 @pytest.mark.tonio
@@ -1666,7 +1667,7 @@ async def test_server_peer_closed_resolves_false_under_half_close():
         await started.wait()
         await req.respond(200, body=b"ok")
     assert seen == [False]
-    assert conn._watcher_handle is None and not stub.parked.is_set()  # no read parked, as hyper
+    assert not conn.has_watcher and not stub.parked.is_set()  # no read parked, as hyper
 
 
 @pytest.mark.tonio
@@ -1693,8 +1694,8 @@ async def test_server_h2c_upgrade_request_is_watched_once_answered():
                     await Event().wait()
 
                 async with scope() as inner:
-                    server._conn._arm_watcher(req)  # `peer_closed()`'s arm, synchronously: deferred, no head yet
-                    assert server._conn._watcher_handle is None
+                    await server._conn._arm_watcher(req)  # `peer_closed()`'s arm: deferred, no head yet
+                    assert not server._conn.has_watcher
                     inner.spawn(watch())
                     try:
                         await req.respond(200, body=body())
@@ -1729,8 +1730,8 @@ async def test_server_upgrade_request_peer_closed_is_deferred_until_the_head():
     async def watch():
         seen.append(await req.peer_closed())
 
-    conn._arm_watcher(req)  # `peer_closed()`'s arm, synchronously
-    assert conn._watcher_handle is None  # no read parked: the transport can still be handed over
+    await conn._arm_watcher(req)  # `peer_closed()`'s arm
+    assert not conn.has_watcher  # no read parked: the transport can still be handed over
     async with scope() as s:
         s.spawn(watch())  # parks (or, if it runs after the detach, returns at once): `False` either way
         assert req.detach() == b"WSDATA"
@@ -1741,8 +1742,8 @@ async def test_server_upgrade_request_peer_closed_is_deferred_until_the_head():
     await conn.start()
     req = await conn.next_request()
     seen = []
-    conn._arm_watcher(req)  # the ask is recorded (`_watch_wanted`), nothing parked yet
-    assert conn._watcher_handle is None
+    await conn._arm_watcher(req)  # the ask is recorded (`watch_wanted`), nothing parked yet
+    assert not conn.has_watcher
     async with scope() as s:
         s.spawn(watch())
         await req.respond(200, body=b"no switch")  # 200 to an upgrade request: served as plain HTTP/1.1

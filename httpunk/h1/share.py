@@ -17,7 +17,7 @@ handed off to the caller — mirroring hyper's `Upgraded` (`on_upgrade` /
 `Connection::into_parts`).
 """
 
-import threading
+from .._httpunk import OnceLatch
 
 
 class H1Upgraded:
@@ -32,7 +32,7 @@ class H1Upgraded:
     def __init__(self, transport, leftover):
         self._transport = transport
         self._leftover = bytes(leftover)  # bytes read past the head, not yet consumed
-        self._closed = False
+        self._close_latch = OnceLatch()  # `aclose` runs once, whichever task gets there first
 
     async def receive_some(self, max_bytes=65536):
         """Read up to `max_bytes` of the upgraded protocol. Empty bytes = EOF."""
@@ -45,8 +45,7 @@ class H1Upgraded:
         return self._transport.send_all(data)
 
     async def aclose(self):
-        if not self._closed:
-            self._closed = True
+        if self._close_latch.try_acquire():
             # The caller owns this raw tunnel and closes it from an async context, so
             # — unlike the driver's sync close paths — we can await a `TLSStream`'s
             # `close()` coroutine (the full `close_notify` dance); a plain socket's
@@ -77,25 +76,38 @@ class H1ResponseBody:
         # is no HTTP body: the connection belongs to `upgraded` (see the driver).
         self.upgraded = upgraded
         self.trailers = None  # chunked trailers, populated once the body is read
-        # An upgrade has already handed the transport to `upgraded`; there is no
-        # slot to release and no body to read.
-        self._released = upgraded is not None
-        # One-shot release latch: `_released` alone is a check-then-act, and on a
-        # free-threaded build the two release paths can run on different threads
-        # (a GC finalizer unwinding an abandoned body generator vs. the user's
-        # aclose chain) — both passing the check would double-release the
-        # driver's 1-permit slot and put two exchanges on one connection.
-        self._release_latch = threading.Lock()
+        # One-shot latches (a cross-thread CAS, never blocking — safe from a GC
+        # finalization context): the release runs exactly once, whichever of the two
+        # release paths gets there first (a GC finalizer unwinding an abandoned body
+        # generator vs. the user's aclose chain — both passing a plain check would
+        # double-release the driver's single slot and put two exchanges on one
+        # connection); the body is iterated by ONE consumer (hyper's `IncomingBody`
+        # is owned). An upgrade has already handed the transport to `upgraded`: no
+        # slot to release, no body to read — pre-latched.
+        self._release_latch = OnceLatch()
+        self._iter_latch = OnceLatch()
+        if upgraded is not None:
+            self._release_latch.try_acquire()
         # A bodyless response (204, HEAD, CL: 0) has nothing to read, so its slot can
         # be freed at once — but freeing it now must also tear down the request-body
         # writer (`release_slot` is async since it may cancel/join that writer), which
         # `__init__` can't await. `send_request` (async) drives this eager finish.
         self._needs_eager_finish = upgraded is None and decoder.is_complete
 
+    @property
+    def _released(self):
+        return self._release_latch.is_set
+
     async def aiter_bytes(self):
-        """Yield response body chunks as they arrive (decoded by `H1BodyDecoder`)."""
+        """Yield response body chunks as they arrive (decoded by `H1BodyDecoder`).
+        Single-consumer: a second iteration while the first is still reading is
+        refused (h2's `RecvStream` / hyper's `IncomingBody` are owned)."""
         if self.upgraded is not None:
             return  # an upgraded connection has no HTTP body — use `Response.upgraded`
+        if not self._iter_latch.try_acquire():
+            if self._released:
+                return  # already fully read (or closed): nothing more to yield
+            raise RuntimeError("response body is already being read")
         try:
             while True:
                 chunk = self._decoder.decode()
@@ -141,13 +153,8 @@ class H1ResponseBody:
             await self._release(keep_alive=False)
 
     async def _release(self, keep_alive=None):
-        # Atomic one-shot: a non-blocking Lock.acquire is a cross-thread CAS that
-        # can never block (safe from a GC finalization context — no deadlock even
-        # if GC fires while a release is in flight on this same object). The
-        # first caller wins; every later (or concurrent) caller no-ops. The
-        # `_released` flag stays as the cheap advisory check for aclose/_finish
-        # (and is pre-set for upgraded bodies, which never touch the latch).
-        if self._released or not self._release_latch.acquire(blocking=False):
+        # Atomic one-shot (the latch is a cross-thread CAS that never blocks): the
+        # first caller wins; every later (or concurrent) caller no-ops.
+        if not self._release_latch.try_acquire():
             return
-        self._released = True
         await self._driver.release_slot(self._keep_alive if keep_alive is None else keep_alive)

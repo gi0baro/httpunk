@@ -1,19 +1,19 @@
 """`httpunk.util.auto` (`Builder` + the `serve` shortcut) — sniff an accepted transport
-and serve it as h1 or h2. Unit tests drive a scripted transport (protocol detection + lossless prewind);
+and serve it as h1 or h2. Unit tests drive a scripted transport (protocol detection + lossless seeding of
+the sniffed bytes into the picked server's codec, over the RAW transport);
 end-to-end loopback tests prove httpunk's own clients round-trip through the picked
 server (the replayed preface / request line parses correctly).
 """
 
 import pytest
 from _client import open_h1, open_h2
-from tonio.colored import scope
+from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk.h1.server import H1Server
 from httpunk.h2.connection import PREFACE
 from httpunk.h2.server import H2Server
 from httpunk.util import auto
-from httpunk.util.auto import _PrewoundTransport
 
 
 class _ScriptedTransport:
@@ -109,8 +109,8 @@ async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picke
     h1 = await builder.serve_connection(_ScriptedTransport(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n"))
     assert isinstance(h1, H1Server)
     assert h1._conn._header_read_timeout == 5.0
-    assert h1._conn._keep_alive_enabled is False
-    assert h1._conn._half_close is True
+    assert h1._conn.keep_alive_enabled is False
+    assert h1._conn.half_close is True
     assert h1._conn._codec_options == {
         "max_headers": 50,
         "max_buf_size": 16384,
@@ -126,8 +126,8 @@ async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picke
     assert h2._conn._initial_connection_window_size == 2_000_000
     assert h2._conn._max_frame_size == 32768
     assert h2._conn._max_header_list_size == 65536
-    assert h2._conn.streams._max_pending_accept_reset_streams == 5
-    assert h2._conn.streams._max_local_error_resets is None  # None = no limit (hyper semantics)
+    assert h2._conn.max_pending_accept_reset_streams == 5
+    assert h2._conn.max_local_error_reset_streams is None  # None = no limit (hyper semantics)
     assert h2._conn._auto_date_header is False
 
 
@@ -159,29 +159,46 @@ async def test_builder_serve_connection_from_sub_builders():
     assert isinstance(await auto.Builder().http2().serve_connection(_ScriptedTransport(b"GET /")), H1Server)
 
 
-# ----- unit: prewound transport replay -----
+# ----- unit: the sniffed bytes are seeded into the codec; the driver gets the raw transport -----
 
 
 @pytest.mark.tonio
-async def test_prewound_replays_then_delegates_losslessly():
-    pw = _PrewoundTransport(_ScriptedTransport(b"LIVE"), b"PEEK")
-    got = b""
-    for _ in range(5):
-        chunk = await pw.receive_some(2)
-        if not chunk:
-            break
-        got += chunk
-    assert got == b"PEEKLIVE"
+async def test_sniff_seeds_h1_codec_and_hands_over_the_raw_transport():
+    # hyper-util keeps a `Rewind` wrapper in front of the IO for the connection's lifetime;
+    # httpunk seeds the peeked bytes into the codec instead (auto.py module doc). The
+    # driver's transport must be the caller's own object — no wrapper — and every sniffed
+    # byte must be in the codec's read buffer, so nothing is lost and nothing can be read
+    # out of order by a non-blocking peek on the raw transport.
+    head = b"GET /x HTTP/1.1\r\nhost: x\r\n\r\n"
+    transport = _ScriptedTransport(head, chunk_size=1)
+    server = await auto.serve(transport)
+    assert isinstance(server, H1Server)
+    assert server._conn.transport_ref() is transport
+    sniffed = len(head) - len(transport._data)  # what the sniff consumed
+    assert 0 < sniffed < len(head)
+    assert server._conn.codec.buffered() == sniffed
+    async with server:
+        req = await server.accept()
+        assert req.target == "/x"  # the seeded bytes + the live remainder parse as one head
 
 
 @pytest.mark.tonio
-async def test_prewound_forwards_send_and_close():
-    inner = _ScriptedTransport(b"")
-    pw = _PrewoundTransport(inner, b"")
-    await pw.send_all(b"hi")
-    pw.close()
-    assert inner.sent == b"hi"
-    assert inner.closed
+async def test_sniff_seeds_h2_preface_and_hands_over_the_raw_transport():
+    transport = _ScriptedTransport(PREFACE, chunk_size=7)
+    server = await auto.serve(transport)
+    assert isinstance(server, H2Server)
+    assert server._conn._transport is transport
+    assert transport._data == b""  # the whole preface was consumed by the sniff...
+    assert server._conn.receive(b"") == []  # ...and accepted by the decoder: no preface wait, no frames
+
+
+@pytest.mark.tonio
+async def test_prime_rejects_a_non_preface():
+    # A forced h2 server has not seen its preface yet: seeding anything else is a
+    # programming error (the sniff only ever seeds a matched preface).
+    server = await auto.serve(_ScriptedTransport(b""), only="h2")
+    with pytest.raises(ValueError):
+        server._prime(b"GET / HTTP/1.1")
 
 
 # ----- end-to-end: the picked server round-trips a real httpunk client -----
@@ -229,3 +246,43 @@ async def test_auto_serves_h1_client_end_to_end():
             resp = await conn.request("POST", "/y", headers={"host": host}, body=b"hey")
             assert await resp.read() == b"h1:hey"
     assert picked["cls"] == "H1Server"
+
+
+# ----- the sniff's cancel ends a parked read by CLOSING, never by cancelling it -----
+
+
+class _SilentTransport(_ScriptedTransport):
+    """A client that connects and then says nothing: the sniff read parks until the
+    transport is closed."""
+
+    def __init__(self):
+        super().__init__(b"")
+        self._closed_evt = Event()
+
+    async def receive_some(self, max_bytes=65536):
+        await self._closed_evt.wait()
+        return b""
+
+    def close(self):
+        super().close()
+        self._closed_evt.set()
+
+
+@pytest.mark.tonio
+async def test_sniff_cancel_closes_the_transport_to_end_the_parked_read():
+    transport = _SilentTransport()
+    cancel = Event()
+    outcome = []
+
+    async def sniff():
+        try:
+            await auto.serve(transport, cancel=cancel)
+        except auto.SniffCancelledError:
+            outcome.append("cancelled")
+
+    async with scope() as s:
+        s.spawn(sniff())
+        await sleep(0)  # let the sniff park on the silent client
+        cancel.set()
+    assert outcome == ["cancelled"]
+    assert transport.closed  # the signal ended the read through the close, not a cancel

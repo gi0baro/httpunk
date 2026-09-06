@@ -3,13 +3,14 @@
 Hand-maintained to match the PyO3 surface in `src/py/**`. Everything here is
 implemented in Rust: the `http`-crate `HeaderMap`, the sans-IO HTTP/1 and HTTP/2
 codecs + their frame/head events, the vendored h2 stream-state and flow-control
-wrappers, the error taxonomy, and the `H2Reason` code enum.
+wrappers, the HTTP/1 and HTTP/2 connection states (`H1ServerState`,
+`H1ClientState`, `H2Streams` + its verdicts, `OnceLatch`), the error
+taxonomy, and the `H2Reason` code enum.
 
 All classes are `frozen` (immutable identity, internally `Mutex`-guarded) and safe
 to share across the runtime's worker threads. Getter attributes are read-only.
 """
 
-import enum
 from collections.abc import Iterable, Iterator, Mapping
 from typing import TypeVar, overload
 
@@ -626,6 +627,453 @@ class H2DataFrameBudget:
     @property
     def empty_frames(self) -> int: ...
 
+# ===========================================================================
+# HTTP/1 connection states  (src/h1/conn.rs) — hyper's single-owner `Conn` state
+# for a multi-task runtime, ONE mutex per connection. `ServerConnection` /
+# `Connection` subclass `H1ServerState` / `H1ClientState` and add only async
+# machinery; server requests are keyed by a sequence number (`seq`), a stale one
+# gets a deterministic answer.
+# ===========================================================================
+
+# `begin_read()` / `drain_done()` codes: between requests, then — positioned at the
+# next head — how to read it.
+H1_NEXT_NONE: int  # the connection can serve no more
+H1_NEXT_RAISE: int  # the current request was not answered (a caller error)
+H1_NEXT_CLOSE: int  # the unread body cannot be drained: closed (the transport is returned)
+H1_NEXT_DRAIN: int  # run the one-poll drain, then `drain_done`
+H1_READ_PARSE: int  # bytes of the next request are already buffered: `accept_head(b"")` first
+H1_READ_SHUTDOWN: int  # a graceful shutdown was requested: no idle read
+H1_READ_WATCHER: int  # the parked watcher's read is the idle read (its done event is returned)
+H1_READ_TRANSPORT: int  # read the transport (returned); the idle park is flagged
+H1_READ_EOF: int  # the transport is gone
+
+# `respond_head()` / `detach()` codes.
+H1_REQ_OK: int
+H1_REQ_ALREADY: int  # already responded / detached
+H1_REQ_STALE: int  # not the current request
+H1_REQ_PARKED: int  # detach: a mid-message read is parked on the transport
+H1_REQ_PEER_CLOSED: int  # respond_head: the client closed mid-request (`IncompleteMessage`)
+H1_REQ_CONTINUE: int  # respond_head: claimed; a `100 Continue` is being written — wait, call again
+
+class H1ServerState:
+    """The connection + current-request state of one HTTP/1 server connection,
+    `frozen` + subclassable. Owns the transport, the keep-alive / close / shutdown
+    flags, the mid-message watcher slot and the current request's flags; holds the
+    connection's `H1Codec` and the current request's `H1BodyDecoder`, locking them
+    nested only where a byte move must be atomic with a state change."""
+
+    def __init__(
+        self, codec: H1Codec, transport: object, *, keep_alive: bool = ..., half_close: bool = ...
+    ) -> None: ...
+    @property
+    def codec(self) -> H1Codec: ...
+    def transport_ref(self) -> object | None:
+        """The transport for a read/write; None once closed or handed off."""
+
+    @property
+    def closed(self) -> bool: ...
+    @property
+    def reusable(self) -> bool: ...
+    @property
+    def upgraded(self) -> bool: ...
+    @property
+    def half_close(self) -> bool: ...
+    @property
+    def keep_alive_enabled(self) -> bool: ...
+    @property
+    def shutdown_requested(self) -> bool: ...
+    @property
+    def has_watcher(self) -> bool: ...
+    @property
+    def watcher_parked(self) -> bool: ...
+    @property
+    def current_seq(self) -> int: ...
+    def current_decoder(self) -> H1BodyDecoder | None: ...
+
+    # ----- the accept loop -----
+    def begin_read(self) -> tuple[int, object | None]:
+        """`(H1_NEXT_* / H1_READ_* code, transport to close | the watcher's done event |
+        the transport to read)`: the between-requests verdict, then — positioned at the
+        next head (codec reset, leftover fed) — how to read it, with the idle park
+        flagged in the same step."""
+
+    def drain_done(self, complete: bool) -> tuple[int, object | None]:
+        """The one-poll drain's outcome: `H1_NEXT_CLOSE` + transport, or the read verdict."""
+
+    def unpark_idle_read(self) -> None: ...
+    def accept_head(self, data: bytes) -> tuple[H1RequestHead, int, H1BodyDecoder] | None:
+        """Feed the head parser; once a head is complete it is the current request:
+        `(head, seq, its body decoder — fed the bytes read alongside the head)`; None =
+        read more. Raises `H1ParseError` (the codec remembers the automatic status)."""
+
+    def fail_read(self) -> object | None:
+        """A head parse failure / deadline / broken transport: closed; the transport to close."""
+
+    def stop_serving(self) -> None: ...
+    def mark_closed(self) -> tuple[object | None, object | None]:
+        """`close()`: `(transport to close, the watcher's done event to await)`."""
+
+    def mark_unusable(self) -> None: ...
+    def request_shutdown(self, native_read_interrupt: bool) -> object | None:
+        """`graceful_shutdown()`: the transport to `interrupt_read` on, if a read is parked idly."""
+
+    # ----- the current request -----
+    def try_send_continue(self, seq: int) -> bool: ...
+    def begin_body_read(self, seq: int) -> bool: ...
+    def end_body_read(self, seq: int, complete: bool) -> None: ...
+    def peer_closed_now(self, seq: int) -> bool | None:
+        """The flag when the window is over (or the request stale); None = still open."""
+
+    def peer_closed_flag(self, seq: int) -> bool: ...
+    def arm_watcher(self, seq: int, done: object, *, want: bool = ..., head_negotiated: bool = ...) -> bool:
+        """The whole arm decision; True = spawn the watcher, then `store_watcher_handle`."""
+
+    def store_watcher_handle(self, handle: object) -> object | None:
+        """None = stored; the handle back = refused (closed meanwhile): join it yourself."""
+
+    def watcher_completed(self, data: bytes | None = ..., error: BaseException | None = ...) -> bool:
+        """True = the request is now peer-closed (resolve its `peer_closed()`)."""
+
+    def watcher_aborted(self) -> None: ...
+    def watcher_done(self) -> object | None: ...
+    def take_watcher_handle(self) -> object | None: ...
+    def take_watcher_result(self) -> tuple[bytes | None, BaseException | None]: ...
+    def close_window(self, seq: int) -> bool: ...
+    def respond_head(
+        self,
+        seq: int,
+        status: int,
+        headers: HeaderMap | None,
+        done: object,
+        *,
+        content_length: int | None = ...,
+        chunked: bool = ...,
+        want: bool = ...,
+    ) -> tuple[int, bytes | None, bool]:
+        """The head step as one transition: claim, verdicts, encode, head-time
+        decisions, arm decision. `(H1_REQ_* code, encoded head, armed)`: `H1_REQ_OK` +
+        head (+ spawn the watcher for `done` if `armed`); `H1_REQ_CONTINUE` = claimed,
+        await the request's continue event and call again; `H1_REQ_PEER_CLOSED`;
+        `H1_REQ_ALREADY` / `H1_REQ_STALE`. Raises the encoder's `H1UserError`."""
+
+    def finish_response(self, seq: int) -> tuple[bool, bool, object | None, bytes | None]:
+        """`(switch, close, transport, tunnel leftover)`."""
+
+    def fail_response(self, seq: int) -> object | None: ...
+    def detach(self, seq: int) -> tuple[int, object | None, bytes | None]:
+        """`(H1_REQ_* code, transport, leftover)`."""
+
+# `watcher_completed()` verdicts (H1ClientState).
+H1_WATCH_HANDOFF: int  # an exchange is active: the bytes/error are its first read
+H1_WATCH_IDLE_EOF: int  # hyper's clean idle close: closed, the transport returned
+H1_WATCH_IDLE_BYTES: int  # bytes on an idle connection: poison
+H1_WATCH_IDLE_ERROR: int  # a transport error while idle: fail
+H1_WATCH_IGNORED: int  # a racing close already committed the flags
+
+class H1ClientState:
+    """The connection state of one HTTP/1 client connection, `frozen` +
+    subclassable: the transport, the single in-flight slot (hyper `Conn::is_busy`),
+    the error slot (first writer wins), the idle watcher's hand-off, the background
+    writer's scope, the peer's version."""
+
+    def __init__(self, transport: object) -> None: ...
+    def transport_ref(self) -> object | None: ...
+    @property
+    def closed(self) -> bool: ...
+    @property
+    def busy(self) -> bool: ...
+    @property
+    def upgraded(self) -> bool: ...
+    @property
+    def peer_http10(self) -> bool: ...
+    def set_peer_http10(self, value: bool) -> None: ...
+    @property
+    def error(self) -> BaseException | None: ...
+    def is_dead(self) -> bool: ...
+    @property
+    def has_watcher(self) -> bool: ...
+    @property
+    def writer_finished(self) -> bool: ...
+
+    # ----- the single in-flight slot -----
+    def try_begin_exchange(self) -> bool: ...
+    def end_exchange(self) -> bool:
+        """True if the slot flipped to free (wake the idle waiters)."""
+
+    def exchange_started(self) -> None: ...
+
+    # ----- failure / close -----
+    def fail(self, exc: BaseException | None = ...) -> object | None:
+        """Store `exc` (a traceback-free copy) if none is stored, close; the transport to close."""
+
+    def close_now(self) -> object | None: ...
+    def mark_closed(self) -> tuple[object | None, object | None, object | None]:
+        """`(transport, watcher done event, writer scope)`."""
+
+    def upgrade(self) -> object | None:
+        """Hand the transport off (101 / CONNECT), in one step."""
+
+    # ----- the background body writer -----
+    def store_writer(self, scope: object) -> object | None:
+        """None = stored; the scope back = refused (closed meanwhile): tear it down yourself."""
+
+    def take_writer(self) -> object | None: ...
+    def writer_done(self) -> None: ...
+
+    # ----- the idle watcher -----
+    def arm_watcher(self, done: object) -> bool: ...
+    def store_watcher_handle(self, handle: object) -> object | None: ...
+    def watcher_aborted(self) -> None: ...
+    def watcher_completed(
+        self, data: bytes | None = ..., error: BaseException | None = ...
+    ) -> tuple[int, object | None]:
+        """`(H1_WATCH_* verdict, transport to close)`."""
+
+    def watcher_done(self) -> object | None: ...
+    def take_watcher_handle(self) -> object | None: ...
+    def take_watcher_result(self) -> tuple[bytes | None, BaseException | None]: ...
+
+class OnceLatch:
+    """A one-shot latch: `try_acquire()` succeeds exactly once, from whichever task
+    (or GC finalizer) gets there first; never blocks."""
+
+    def __init__(self) -> None: ...
+    def try_acquire(self) -> bool: ...
+    @property
+    def is_set(self) -> bool: ...
+
+# ===========================================================================
+# HTTP/2 connection state  (src/h2/conn.rs) — h2 `Streams::inner` + the state
+# half of `proto::Connection`, ONE mutex per connection. The Python driver
+# (`httpunk/h2/connection.py`) subclasses `H2Streams` and adds only async
+# machinery; every method here is one locked check-and-act returning a verdict.
+# ===========================================================================
+
+# Verdict flags: what the caller must do after the call (`H2ConnectionBase._after`).
+H2_FLAG_WAKE: int  # bytes were queued: wake the write pump
+H2_FLAG_SLOT_FREED: int  # client: a MAX_CONCURRENT slot freed / the limit changed
+H2_FLAG_CONN_DONE: int  # the connection failed or finished: wake the role waiters
+H2_FLAG_STOP_ACCEPTING: int  # server: the graceful drain completed
+
+# `H2RecvHeadersVerdict.kind`.
+H2_HEADERS_IGNORED: int
+H2_HEADERS_OPENED: int  # server: a new request stream (the spare handle was consumed)
+H2_HEADERS_HEAD: int  # client: the response head
+H2_HEADERS_TRAILERS: int
+
+class H2Stopped:
+    """Why a stream stopped (h2 `ensure_reason` + the stream's stored error). `reason`:
+    the RST_STREAM / GOAWAY reason, if any; `conn`: a connection-level error applies
+    (the connection's error, or a `GoAwayError` when `reason` is set). Neither: a local
+    cancel — the driver falls back to the connection error, then CANCEL. Also the body
+    queue's terminal item when the reader must raise."""
+
+    @property
+    def reason(self) -> int | None: ...
+    @property
+    def conn(self) -> bool: ...
+
+class H2RecvHeadersVerdict:
+    kind: int
+    handle: object | None
+    stream_id: int
+    eof: bool
+    flags: int
+
+class H2RecvDataVerdict:
+    handle: object | None
+    payload: bytes | None  # None: nothing to deliver (swallowed, or an empty budgeted frame)
+    budgeted: bool
+    eof: bool
+    flags: int
+
+class H2SendVerdict:
+    sent: int  # bytes of `data[offset:]` framed and queued (0 with done=False: wait for window)
+    done: bool  # the last byte (and END_STREAM, if requested) is queued
+    stopped: H2Stopped | None
+    flags: int
+
+class H2ResetVerdict:
+    handle: object | None  # the stream's handle to notify (None: no live stream)
+    stop: H2Stopped | None  # the error the body readers must see (None: a clean EOF)
+    flags: int
+
+class H2Streams:
+    """The connection + stream state of one HTTP/2 connection, `frozen` + subclassable.
+    The stream map, both flow-control windows, the DATA-framing budget, the SETTINGS
+    state, the reset store, the GOAWAY bookkeeping, the error slot, the HPACK codec
+    and the pending-frame buffer live under one mutex. `handle`s are the Python
+    `Stream` objects (id + events + body queue) the state stores and hands back."""
+
+    def __init__(
+        self,
+        role: str,
+        *,
+        initial_window_size: int,
+        connection_window: int,
+        max_frame_size: int,
+        max_header_list_size: int,
+        max_send_buf_size: int,
+        max_concurrent_streams: int | None = ...,
+        max_pending_accept_reset_streams: int = ...,
+        max_local_error_reset_streams: int | None = ...,
+        data_frame_budget: int | None = ...,
+        auto_date_header: bool = ...,
+        enable_push: bool | None = ...,
+    ) -> None:
+        """`role`: "client" | "server". Validates the RFC ranges at construction."""
+
+    @property
+    def is_server(self) -> bool: ...
+
+    # ----- lifecycle -----
+    def begin(self) -> None:
+        """Queue the connection preface (client) + our initial SETTINGS + the initial
+        WINDOW_UPDATE(0); the caller flushes, then starts the pumps."""
+
+    def store_task_handles(self, read: object, pump: object) -> None: ...
+    def take_read_handle(self) -> object | None: ...
+    def take_pump_handle(self) -> object | None: ...
+
+    # ----- inbound (each frame: one locked step) -----
+    def receive(self, data: bytes) -> list[H2Frame]:
+        """Decode inbound bytes into frames (server: consumes the client preface first)."""
+
+    def prime(self, data: bytes) -> bool | None:
+        """Seed the decoder with bytes another reader already took off the transport
+        (`util.auto`'s sniff: the client preface) — hyper-util's `Rewind` without a
+        wrapper transport. None = preface incomplete so far; False = mismatch."""
+
+    def recv_headers(self, frame: H2FrameHeaders, spare: object | None = ...) -> H2RecvHeadersVerdict: ...
+    def recv_data(self, frame: H2FrameData) -> H2RecvDataVerdict: ...
+    def recv_window_update(self, frame: H2FrameWindowUpdate) -> list[object]:
+        """Returns the handles whose senders must be woken."""
+
+    def recv_reset(self, frame: H2FrameRstStream) -> tuple[object, H2Stopped, bool, int] | None:
+        """`(handle, stop, notify_body, flags)` for a live stream, else None."""
+
+    def recv_settings(self, frame: H2FrameSettings) -> tuple[bool, list[object], int]:
+        """`(initial, wake_windows, flags)`: `initial` = the peer's first SETTINGS landed."""
+
+    def recv_ping(self, frame: H2FramePing) -> int: ...
+    def recv_go_away(self, frame: H2FrameGoAway) -> tuple[list[tuple[object, H2Stopped]], int]:
+        """`(aborted, flags)`: the streams above last_stream_id, with their stop."""
+
+    def maybe_goaway_reply(self) -> int: ...
+    def send_goaway(self, reason: int) -> int: ...
+    def fail(self, exc: BaseException | None = ..., message: str = ...) -> list[tuple[object, H2Stopped]]:
+        """Record the error (first writer wins; `exc` is a traceback-free copy) and fan
+        it out; returns the `(handle, stop)` pairs to notify."""
+
+    def conn_error(self) -> BaseException | None: ...
+    def goaway_info(self) -> tuple[int, int, bytes] | None:
+        """The peer's GOAWAY as `(last_stream_id, error_code, debug_data)`."""
+
+    def is_closed(self) -> bool: ...
+    def is_failed(self) -> bool: ...
+
+    # ----- opening (client) -----
+    def try_claim_slot(self) -> bool: ...
+    def can_open(self) -> bool: ...
+    def release_slot_count(self) -> None: ...
+    def apply_stream_limit(self, limit: int | None) -> None: ...
+    def open_stream(
+        self,
+        method: str,
+        target: str,
+        headers: HeaderMap | None,
+        end_stream: bool,
+        is_head: bool,
+        handle: object,
+        *,
+        scheme: str | None = ...,
+        authority: str | None = ...,
+    ) -> int | None:
+        """Allocate the id, `send_open`, insert, HPACK-encode + queue the HEADERS. None:
+        the connection failed / GOAWAY'd (the slot is released)."""
+
+    # ----- sending -----
+    def send_data(self, sid: int, data: bytes, offset: int, end_stream: bool) -> H2SendVerdict: ...
+    def send_trailers(self, sid: int, trailers: HeaderMap) -> tuple[H2Stopped | None, int]: ...
+    def finish_send(self, sid: int) -> tuple[H2Stopped | None, int]: ...
+    def send_response_head(
+        self, sid: int, status: int, headers: HeaderMap | None, end_stream: bool
+    ) -> tuple[H2Stopped | None, int]: ...
+    def after_response(self, sid: int) -> H2ResetVerdict: ...
+    def reset_stream(self, sid: int, reason: int, initiator: str = ...) -> H2ResetVerdict: ...
+    def reset_on_error(self, sid: int, reason: int) -> H2ResetVerdict:
+        """Library reset after a peer violation; counts toward the ENHANCE_YOUR_CALM cap."""
+
+    def aclose_body(self, sid: int) -> H2ResetVerdict: ...
+
+    # ----- recv-side flow control -----
+    def release_capacity(self, sid: int, n: int) -> int: ...
+    def release_data_frame(self, sid: int, payload_len: int) -> None: ...
+    def accepted(self, sid: int) -> None: ...
+
+    # ----- the write pump -----
+    def stop_pump(self) -> None: ...
+    def take_pending(self) -> tuple[bytes, bool]:
+        """`(bytes, stopping)`: everything committed to the pending buffer."""
+
+    def credit_written(self) -> list[object]:
+        """Credit the flushed batch back; returns the handles whose senders to wake."""
+
+    def has_pending(self) -> bool: ...
+
+    # ----- graceful shutdown (server) -----
+    def begin_graceful_shutdown(self) -> int: ...
+
+    # ----- observability (tests / diagnostics) -----
+    @property
+    def last_processed_id(self) -> int: ...
+    @property
+    def max_stream_id(self) -> int: ...
+    @property
+    def graceful(self) -> bool: ...
+    @property
+    def shutdown_final(self) -> bool: ...
+    @property
+    def num_streams(self) -> int: ...
+    def has_stream(self, sid: int) -> bool: ...
+    def is_recv_end_stream(self, sid: int) -> bool: ...
+    def stream_state(self, sid: int) -> str | None: ...
+    def stream_recv_unreleased(self, sid: int) -> int | None: ...
+    def stream_recv_reclaimed(self, sid: int) -> bool | None: ...
+    def stream_data_budget_charged(self, sid: int) -> int | None: ...
+    def stream_send_buffered(self, sid: int) -> int | None: ...
+    def stream_send_window(self, sid: int) -> int | None: ...
+    @property
+    def conn_send_window(self) -> int: ...
+    @property
+    def conn_recv_available(self) -> int: ...
+    @property
+    def data_frame_budget_available(self) -> int: ...
+    @property
+    def data_frame_budget_empty_frames(self) -> int: ...
+    @property
+    def peer_initial_window_size(self) -> int: ...
+    @property
+    def peer_max_frame_size(self) -> int: ...
+    @property
+    def peer_max_concurrent_streams(self) -> int | None: ...
+    @property
+    def stream_limit(self) -> int | None: ...
+    @property
+    def num_open_streams(self) -> int: ...
+    @property
+    def max_pending_accept_reset_streams(self) -> int: ...
+    @property
+    def max_local_error_reset_streams(self) -> int | None: ...
+    @property
+    def local_error_resets(self) -> int: ...
+    @property
+    def goaway_replied(self) -> bool: ...
+    def in_reset_store(self, sid: int) -> bool: ...
+    def set_next_stream_id(self, sid: int) -> None: ...
+    def set_max_stream_id(self, sid: int) -> None: ...
+    def set_last_processed_id(self, sid: int) -> None: ...
+
 # The vendored h2's protocol constants (frame/settings.rs, frame/stream_id.rs,
 # proto/mod.rs) and hyper's client connection preface.
 H2_DEFAULT_HEADER_TABLE_SIZE: int
@@ -638,18 +1086,33 @@ H2_DEFAULT_DATA_FRAME_BUDGET: int
 H2_MAX_RECV_EMPTY_DATA_FRAMES: int
 H2_PREFACE: bytes
 
-class H2Reason(enum.IntEnum):
-    NO_ERROR = 0
-    PROTOCOL_ERROR = 1
-    INTERNAL_ERROR = 2
-    FLOW_CONTROL_ERROR = 3
-    SETTINGS_TIMEOUT = 4
-    STREAM_CLOSED = 5
-    FRAME_SIZE_ERROR = 6
-    REFUSED_STREAM = 7
-    CANCEL = 8
-    COMPRESSION_ERROR = 9
-    CONNECT_ERROR = 10
-    ENHANCE_YOUR_CALM = 11
-    INADEQUATE_SECURITY = 12
-    HTTP_1_1_REQUIRED = 13
+class H2Reason:
+    """h2's `frame::Reason` error codes (RFC 9113 §7) as a Rust-defined enum: one
+    member per code, `int(member)` / `__index__` is the code (a member passes into
+    any `int` parameter), `==` works against members and plain ints, the hash equals
+    the code's, and `H2Reason(code)` looks a code up (`ValueError` when unknown — an
+    unknown peer code stays a plain int on `error_code` attributes)."""
+
+    NO_ERROR: H2Reason
+    PROTOCOL_ERROR: H2Reason
+    INTERNAL_ERROR: H2Reason
+    FLOW_CONTROL_ERROR: H2Reason
+    SETTINGS_TIMEOUT: H2Reason
+    STREAM_CLOSED: H2Reason
+    FRAME_SIZE_ERROR: H2Reason
+    REFUSED_STREAM: H2Reason
+    CANCEL: H2Reason
+    COMPRESSION_ERROR: H2Reason
+    CONNECT_ERROR: H2Reason
+    ENHANCE_YOUR_CALM: H2Reason
+    INADEQUATE_SECURITY: H2Reason
+    HTTP_1_1_REQUIRED: H2Reason
+
+    def __init__(self, code: int) -> None: ...
+    def __int__(self) -> int: ...
+    def __index__(self) -> int: ...
+    def __hash__(self) -> int: ...
+    @property
+    def value(self) -> int: ...
+    @property
+    def name(self) -> str: ...

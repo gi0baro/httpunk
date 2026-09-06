@@ -26,13 +26,13 @@ use vendor_hyper::{H2_PREFACE, date_header_value};
 /// Default HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE, RFC 7540 §6.5.2).
 const DEFAULT_HEADER_TABLE_SIZE: usize = 4096;
 /// Generous cap on the decoded header list size before we bail (abuse guard).
-const DEFAULT_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
+pub(super) const DEFAULT_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 /// Default HTTP/2 frame size cap (SETTINGS_MAX_FRAME_SIZE, RFC 7540 §6.5.2).
-const DEFAULT_MAX_FRAME_SIZE: usize = 16384;
+pub(super) const DEFAULT_MAX_FRAME_SIZE: usize = 16384;
 /// Largest permitted SETTINGS_MAX_FRAME_SIZE (2^24 - 1, RFC 7540 §6.5.2).
-const MAX_MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
+pub(super) const MAX_MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
 /// Largest permitted SETTINGS_INITIAL_WINDOW_SIZE (2^31 - 1, RFC 7540 §6.5.2).
-const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
+pub(super) const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
 
 const FLAG_END_STREAM: u8 = 0x1;
 
@@ -44,7 +44,8 @@ fn encode_headers_frame(
     encoder: &mut hpack::Encoder,
     hframe: frame::Headers,
     max_frame_size: usize,
-) -> BytesMut {
+    dst: &mut BytesMut,
+) {
     // HEADERS, then as many CONTINUATION frames as the block needs: each
     // `encode` writes one frame and returns the remaining block, if any (h2
     // frame/headers.rs `Headers`/`Continuation::encode`). The per-frame budget is
@@ -52,16 +53,14 @@ fn encode_headers_frame(
     // header (h2 framed_write.rs: `max_frame_size + HEADER_LEN`), so a full
     // `max_frame_size` payload fits.
     let limit = HEADER_LEN + max_frame_size;
-    let mut dst = BytesMut::new();
     let mut cont = {
-        let mut limited = (&mut dst).limit(limit);
+        let mut limited = (&mut *dst).limit(limit);
         hframe.encode(encoder, &mut limited)
     };
     while let Some(c) = cont {
-        let mut limited = (&mut dst).limit(limit);
+        let mut limited = (&mut *dst).limit(limit);
         cont = c.encode(&mut limited);
     }
-    dst
 }
 
 /// A connection-level protocol error: the driver sends GOAWAY(reason) and tears
@@ -142,7 +141,7 @@ fn classify_hpack(
 /// asserts it): every entry point that stores one validates here, so an
 /// out-of-range value is a `ValueError`, never a zero divisor or a truncated
 /// 3-byte length field.
-fn check_max_frame_size(val: u32) -> PyResult<()> {
+pub(super) fn check_max_frame_size(val: u32) -> PyResult<()> {
     if !(DEFAULT_MAX_FRAME_SIZE as u32..=MAX_MAX_FRAME_SIZE).contains(&val) {
         return Err(PyValueError::new_err(format!(
             "max_frame_size must be in [{DEFAULT_MAX_FRAME_SIZE}, {MAX_MAX_FRAME_SIZE}], got {val}"
@@ -365,10 +364,15 @@ pub struct StreamErrorFrame {
 
 // ===== The codec ========================================================
 
-/// Mutable codec state, guarded by the `H2Codec` mutex.
-struct Codec {
+/// The inbound half of the codec: the HPACK decoder, the frame read buffer, a
+/// HEADERS block awaiting CONTINUATION, the receive limits, and (server role) the
+/// client connection preface. `H2Streams` keeps it under ITS OWN mutex, separate
+/// from the connection state: a batch's HPACK decode must never make an app task
+/// wait for the stream windows, and nothing the decoder does needs the state — the
+/// only coupling is our own SETTINGS taking effect on the peer's ACK, applied under
+/// both locks in one step (order: state → decoder; nothing takes them in reverse).
+pub(super) struct Decoder {
     decoder: hpack::Decoder,
-    encoder: hpack::Encoder,
     buf: BytesMut,
     max_header_list_size: usize,
     max_continuation_frames: usize,
@@ -376,16 +380,415 @@ struct Codec {
     /// SETTINGS_MAX_FRAME_SIZE; updated when our own SETTINGS is ACKed). h2
     /// rejects an over-size declared length with GOAWAY(FRAME_SIZE_ERROR) before
     /// buffering the payload (framed_read.rs / LengthDelimitedCodec).
+    max_recv_frame_size: usize,
     /// Server side: the client connection preface being matched (`feed_preface`),
     /// `None` once matched — h2 server.rs `Handshaking::ReadPreface`.
     preface_buf: Option<BytesMut>,
-    max_recv_frame_size: usize,
-    /// Peer's advertised SETTINGS_MAX_FRAME_SIZE — the per-frame budget when we
-    /// serialize (HEADERS/CONTINUATION splitting, DATA size check).
-    send_max_frame_size: usize,
+    /// Server role: the first bytes must be the client preface (consumed by
+    /// `receive_frames` itself); `preface_ok` once it matched.
+    expect_preface: bool,
+    preface_ok: bool,
     partial: Option<Partial>, // a HEADERS block awaiting CONTINUATION frames
 }
 
+impl Decoder {
+    pub(super) fn new(expect_preface: bool) -> Self {
+        Decoder {
+            decoder: hpack::Decoder::new(DEFAULT_HEADER_TABLE_SIZE),
+            buf: BytesMut::new(),
+            max_header_list_size: DEFAULT_MAX_HEADER_LIST_SIZE,
+            max_continuation_frames: calc_max_continuation_frames(
+                DEFAULT_MAX_HEADER_LIST_SIZE,
+                DEFAULT_MAX_FRAME_SIZE,
+            ),
+            max_recv_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            preface_buf: None,
+            expect_preface,
+            preface_ok: !expect_preface,
+            partial: None,
+        }
+    }
+
+    /// Feed inbound bytes; return the complete frames now decodable. A server-role
+    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1427-1441:
+    /// a mismatch is a connection PROTOCOL_ERROR).
+    pub(super) fn receive_frames(
+        &mut self,
+        py: Python<'_>,
+        data: &[u8],
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        if self.expect_preface && !self.preface_ok {
+            match self.feed_preface(data) {
+                None => return Ok(Vec::new()),
+                Some(false) => {
+                    return Err(protocol_err(
+                        frame::Reason::PROTOCOL_ERROR,
+                        "bad client connection preface",
+                    ));
+                }
+                Some(true) => self.preface_ok = true, // the bytes past it are in `buf`
+            }
+        } else {
+            self.buf.extend_from_slice(data);
+        }
+        let mut out: Vec<Py<PyAny>> = Vec::new();
+        loop {
+            if self.buf.len() < HEADER_LEN {
+                break;
+            }
+            let payload_len = (usize::from(self.buf[0]) << 16)
+                | (usize::from(self.buf[1]) << 8)
+                | usize::from(self.buf[2]);
+            // Enforce SETTINGS_MAX_FRAME_SIZE on the *declared* length before
+            // buffering the payload (h2: LengthDelimitedCodec `max_frame_length`
+            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:425). This both rejects
+            // frames h2 rejects and prevents buffering an over-size payload.
+            if payload_len > self.max_recv_frame_size {
+                return Err(protocol_err(
+                    frame::Reason::FRAME_SIZE_ERROR,
+                    "frame length exceeds SETTINGS_MAX_FRAME_SIZE",
+                ));
+            }
+            let total = HEADER_LEN + payload_len;
+            if self.buf.len() < total {
+                break;
+            }
+            let frame_buf = self.buf.split_to(total);
+            if let Some(obj) = self.decode_one(py, frame_buf)? {
+                out.push(obj);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(super) fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Feed bytes of the client connection preface (RFC 9113 §3.4) — h2 server.rs
+    /// L1427-1441: `None` while the bytes so far match but the 24 are not all in yet,
+    /// `Some(true)` once the whole preface matched (any bytes past it are already in
+    /// the frame buffer), `Some(false)` on a mismatch.
+    pub(super) fn feed_preface(&mut self, data: &[u8]) -> Option<bool> {
+        let buf = self.preface_buf.get_or_insert_with(BytesMut::new);
+        buf.extend_from_slice(data);
+        let n = buf.len().min(H2_PREFACE.len());
+        if buf[..n] != H2_PREFACE[..n] {
+            return Some(false);
+        }
+        if buf.len() < H2_PREFACE.len() {
+            return None;
+        }
+        let mut full = self.preface_buf.take().unwrap_or_default();
+        let rest = full.split_off(H2_PREFACE.len());
+        self.buf.extend_from_slice(&rest);
+        Some(true)
+    }
+
+    /// `util.auto`'s seam (hyper-util's `Rewind`, without the wrapper): the bytes the
+    /// protocol sniff already read off the transport — the client preface, for a
+    /// server — go straight into the decoder, so the driver reads the raw transport
+    /// from the first frame on. Same verdict as `feed_preface` (`Some(true)` once the
+    /// preface is complete, then the bytes are frame bytes).
+    pub(super) fn prime(&mut self, data: &[u8]) -> Option<bool> {
+        if self.expect_preface && !self.preface_ok {
+            let verdict = self.feed_preface(data);
+            if verdict == Some(true) {
+                self.preface_ok = true;
+            }
+            return verdict;
+        }
+        self.buf.extend_from_slice(data);
+        Some(true)
+    }
+
+    /// Apply our own SETTINGS_HEADER_TABLE_SIZE (on peer ACK): queues a table
+    /// size update for *our* decoder (h2 codec `set_recv_header_table_size`).
+    pub(super) fn set_recv_header_table_size(&mut self, val: u32) {
+        self.decoder.queue_size_update(val as usize);
+    }
+
+    /// Apply our own SETTINGS_MAX_FRAME_SIZE (on peer ACK): the largest frame
+    /// payload we now accept on receive. Also recomputes the CONTINUATION-flood
+    /// cap, which is derived from the frame size (h2 framed_read.rs
+    /// `set_max_frame_size` -> `calc_max_continuation_frames`).
+    pub(super) fn set_max_recv_frame_size(&mut self, val: u32) -> PyResult<()> {
+        check_max_frame_size(val)?; // also keeps `calc_max_continuation_frames` off a zero divisor
+        self.max_recv_frame_size = val as usize;
+        self.max_continuation_frames =
+            calc_max_continuation_frames(self.max_header_list_size, self.max_recv_frame_size);
+        Ok(())
+    }
+
+    /// Apply our own SETTINGS_MAX_HEADER_LIST_SIZE (on peer ACK): the decoded
+    /// header-list size bound, which also feeds the CONTINUATION-flood cap (h2
+    /// framed_read.rs `set_max_header_list_size`).
+    pub(super) fn set_max_header_list_size(&mut self, val: u32) {
+        self.max_header_list_size = val as usize;
+        self.max_continuation_frames =
+            calc_max_continuation_frames(self.max_header_list_size, self.max_recv_frame_size);
+    }
+}
+
+/// The outbound half of the codec: the HPACK encoder and the peer's frame-size
+/// limit. `H2Streams` keeps it INSIDE the connection state: the encoder's dynamic
+/// table mutates on encode, so "encode order == wire order" holds only when
+/// encoding and appending to the connection's pending buffer are one locked step,
+/// and the peer's SETTINGS must fold into it and into the stream windows together.
+pub(super) struct Encoder {
+    encoder: hpack::Encoder,
+    /// Peer's advertised SETTINGS_MAX_FRAME_SIZE — the per-frame budget when we
+    /// serialize (HEADERS/CONTINUATION splitting, DATA size check).
+    send_max_frame_size: usize,
+}
+
+impl Encoder {
+    pub(super) fn new() -> Self {
+        Encoder {
+            encoder: hpack::Encoder::default(),
+            send_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+
+    /// HPACK-encode a HEADERS (or trailers) frame and append it — with as many
+    /// CONTINUATION frames as the block needs — to `dst`.
+    pub(super) fn encode_headers(&mut self, hframe: frame::Headers, dst: &mut BytesMut) {
+        encode_headers_frame(&mut self.encoder, hframe, self.send_max_frame_size, dst);
+    }
+
+    /// Frame a DATA payload into `dst`. A payload may not exceed the peer's
+    /// SETTINGS_MAX_FRAME_SIZE (h2 `Encoder::buffer` -> `UserError::PayloadTooBig`).
+    pub(super) fn encode_data(
+        &self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+        dst: &mut BytesMut,
+    ) -> PyResult<()> {
+        if data.len() > self.send_max_frame_size {
+            return Err(user_payload_too_big(data.len(), self.send_max_frame_size));
+        }
+        let flags = if end_stream { FLAG_END_STREAM } else { 0 };
+        let head = Head::new(Kind::Data, flags, frame::StreamId::from(stream_id));
+        dst.reserve(HEADER_LEN + data.len());
+        head.encode(data.len(), dst);
+        dst.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Apply the peer's SETTINGS_HEADER_TABLE_SIZE: bounds the table *our*
+    /// encoder may use (h2 codec `set_send_header_table_size`).
+    pub(super) fn set_send_header_table_size(&mut self, val: u32) {
+        self.encoder.update_max_size(val as usize);
+    }
+
+    /// Apply the peer's SETTINGS_MAX_FRAME_SIZE: the per-frame payload budget for
+    /// what *we* serialize (h2 framed_write.rs `set_max_frame_size`).
+    pub(super) fn set_send_max_frame_size(&mut self, val: u32) -> PyResult<()> {
+        check_max_frame_size(val)?; // the 3-byte length field cannot carry more than 2^24-1
+        self.send_max_frame_size = val as usize;
+        Ok(())
+    }
+}
+
+/// Both halves behind one mutex: the standalone `H2Codec` pyclass (tests, low-level
+/// use). The drivers never use it — `H2Streams` owns the halves separately.
+pub(super) struct Codec {
+    dec: Decoder,
+    enc: Encoder,
+}
+
+// ----- frame builders / control-frame encoders shared by `H2Codec` and `H2Streams` -----
+//
+// Pure (no codec state): the HEADERS builders parse/validate the request parts
+// BEFORE any lock is taken, so a connection-state method never fails half-way
+// through a critical section.
+
+/// Build a request HEADERS frame (h2 client.rs `Peer::convert_send_message`): the
+/// request-target as `http::Uri` sees it — absolute-form carries its own scheme +
+/// authority; origin-form (a bare path) takes the connection's, which hyper's h2
+/// client fills in the same way (proto/h2/client.rs).
+pub(super) fn build_request_headers(
+    stream_id: u32,
+    method: &str,
+    target: &str,
+    fields: http::HeaderMap,
+    end_stream: bool,
+    scheme: Option<&str>,
+    authority: Option<&str>,
+) -> PyResult<frame::Headers> {
+    let method =
+        Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
+    let uri: Uri = target.parse().map_err(|e| value_err("invalid url", e))?;
+    let uri = if uri.scheme().is_some() && uri.authority().is_some() {
+        uri
+    } else {
+        let (Some(scheme), Some(authority)) = (scheme, authority) else {
+            return Err(PyValueError::new_err(
+                "request target is a bare path but the connection has no authority; \
+                 pass authority=... to H2Connection or use an absolute-URL target",
+            ));
+        };
+        Uri::builder()
+            .scheme(scheme)
+            .authority(authority)
+            .path_and_query(target)
+            .build()
+            .map_err(|e| value_err("invalid url", e))?
+    };
+    let pseudo = frame::Pseudo::request(method, uri, None);
+    let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
+    // A bodyless request carries END_STREAM on HEADERS (h2 `send_request` with
+    // `end_of_stream`), rather than a trailing empty DATA frame.
+    if end_stream {
+        hframe.set_end_stream();
+    }
+    Ok(hframe)
+}
+
+/// Build a response HEADERS frame. `auto_date`: hyper's h2 server inserts `Date`
+/// when the app didn't set one (proto/h2/server.rs L484
+/// `entry(DATE).or_insert_with(date::update_and_header_value)`).
+pub(super) fn build_response_headers(
+    stream_id: u32,
+    status: u16,
+    mut fields: http::HeaderMap,
+    end_stream: bool,
+    auto_date: bool,
+) -> PyResult<frame::Headers> {
+    let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
+    let pseudo = frame::Pseudo::response(status);
+    if auto_date {
+        fields.entry(DATE).or_insert_with(|| {
+            HeaderValue::from_bytes(&date_header_value())
+                .expect("IMF-fixdate is a valid header value")
+        });
+    }
+    let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
+    // A bodyless response carries END_STREAM on HEADERS (e.g. a HEAD response,
+    // 204/304), rather than a trailing empty DATA frame.
+    if end_stream {
+        hframe.set_end_stream();
+    }
+    Ok(hframe)
+}
+
+/// A trailing HEADERS frame (no pseudo-headers, END_STREAM set) — request/response
+/// trailers sent after the DATA frames (h2 `frame::Headers::trailers`) (F45).
+pub(super) fn build_trailers(stream_id: u32, fields: http::HeaderMap) -> frame::Headers {
+    frame::Headers::trailers(frame::StreamId::from(stream_id), fields)
+}
+
+pub(super) fn encode_window_update(dst: &mut BytesMut, stream_id: u32, increment: u32) {
+    frame::WindowUpdate::new(frame::StreamId::from(stream_id), increment).encode(dst);
+}
+
+pub(super) fn encode_rst_stream(dst: &mut BytesMut, stream_id: u32, error_code: u32) {
+    frame::Reset::new(
+        frame::StreamId::from(stream_id),
+        frame::Reason::from(error_code),
+    )
+    .encode(dst);
+}
+
+/// A GOAWAY frame (connection shutdown), `stream_id = 0`.
+pub(super) fn encode_go_away(
+    dst: &mut BytesMut,
+    last_stream_id: u32,
+    error_code: u32,
+    debug_data: &[u8],
+) {
+    let sid = frame::StreamId::from(last_stream_id);
+    let reason = frame::Reason::from(error_code);
+    let ga = if debug_data.is_empty() {
+        frame::GoAway::new(sid, reason)
+    } else {
+        frame::GoAway::with_debug_data(sid, reason, Bytes::copy_from_slice(debug_data))
+    };
+    ga.encode(dst);
+}
+
+fn ping_payload(payload: &[u8]) -> PyResult<[u8; 8]> {
+    if payload.len() != 8 {
+        return Err(PyValueError::new_err(
+            "ping payload must be exactly 8 bytes",
+        ));
+    }
+    let mut p = [0u8; 8];
+    p.copy_from_slice(payload);
+    Ok(p)
+}
+
+/// A PING frame (`ack=false`: a keep-alive / shutdown ping; `ack=true`: its PONG).
+pub(super) fn encode_ping(dst: &mut BytesMut, payload: &[u8], ack: bool) -> PyResult<()> {
+    let p = ping_payload(payload)?;
+    let ping = if ack {
+        frame::Ping::pong(p)
+    } else {
+        frame::Ping::new(p)
+    };
+    ping.encode(dst);
+    Ok(())
+}
+
+pub(super) fn encode_settings_ack(dst: &mut BytesMut) {
+    frame::Settings::ack().encode(dst);
+}
+
+/// The values a local SETTINGS frame advertises (RFC 7540 §6.5.2). `None` = not sent.
+#[derive(Clone, Copy, Default)]
+pub(super) struct SettingsValues {
+    pub header_table_size: Option<u32>,
+    pub enable_push: Option<bool>,
+    pub max_concurrent_streams: Option<u32>,
+    pub initial_window_size: Option<u32>,
+    pub max_frame_size: Option<u32>,
+    pub max_header_list_size: Option<u32>,
+}
+
+/// Encode a SETTINGS frame. Pre-validates the ranges the vendored `frame::Settings`
+/// setters assert on, so a bad value surfaces as a Python error instead of aborting
+/// the process (release builds are `panic = "abort"`). RFC 7540 §6.5.2.
+pub(super) fn encode_settings(dst: &mut BytesMut, v: &SettingsValues) -> PyResult<()> {
+    if let Some(f) = v.max_frame_size
+        && !(DEFAULT_MAX_FRAME_SIZE as u32..=MAX_MAX_FRAME_SIZE).contains(&f)
+    {
+        return Err(PyValueError::new_err(format!(
+            "max_frame_size must be in [{DEFAULT_MAX_FRAME_SIZE}, {MAX_MAX_FRAME_SIZE}], got {f}"
+        )));
+    }
+    if let Some(w) = v.initial_window_size
+        && w > MAX_WINDOW_SIZE
+    {
+        return Err(PyValueError::new_err(format!(
+            "initial_window_size must be <= {MAX_WINDOW_SIZE}, got {w}"
+        )));
+    }
+    let mut s = frame::Settings::default();
+    if let Some(x) = v.header_table_size {
+        s.set_header_table_size(Some(x));
+    }
+    if let Some(x) = v.enable_push {
+        s.set_enable_push(x);
+    }
+    if let Some(x) = v.max_concurrent_streams {
+        s.set_max_concurrent_streams(Some(x));
+    }
+    if let Some(x) = v.initial_window_size {
+        s.set_initial_window_size(Some(x));
+    }
+    if let Some(x) = v.max_frame_size {
+        s.set_max_frame_size(Some(x));
+    }
+    if let Some(x) = v.max_header_list_size {
+        s.set_max_header_list_size(Some(x));
+    }
+    s.encode(dst);
+    Ok(())
+}
+
+/// The standalone codec pyclass: the same `Codec` behind its own mutex, for tests
+/// and low-level use (the drivers use the one embedded in `H2Streams`).
 #[pyclass(module = "httpunk._httpunk", name = "H2Codec", frozen)]
 pub struct H2Codec {
     inner: Mutex<Codec>,
@@ -409,18 +812,8 @@ impl H2Codec {
         };
         Ok(Self {
             inner: Mutex::new(Codec {
-                decoder: hpack::Decoder::new(DEFAULT_HEADER_TABLE_SIZE),
-                encoder: hpack::Encoder::default(),
-                buf: BytesMut::new(),
-                max_header_list_size: DEFAULT_MAX_HEADER_LIST_SIZE,
-                max_continuation_frames: calc_max_continuation_frames(
-                    DEFAULT_MAX_HEADER_LIST_SIZE,
-                    DEFAULT_MAX_FRAME_SIZE,
-                ),
-                preface_buf: None,
-                max_recv_frame_size: DEFAULT_MAX_FRAME_SIZE,
-                send_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-                partial: None,
+                dec: Decoder::new(false),
+                enc: Encoder::new(),
             }),
             role_client,
         })
@@ -428,64 +821,17 @@ impl H2Codec {
 
     /// Feed inbound bytes; return the list of complete frames now decodable.
     fn receive(&self, py: Python<'_>, data: &[u8]) -> PyResult<Vec<Py<PyAny>>> {
-        let mut c = self.inner.lock().unwrap();
-        c.buf.extend_from_slice(data);
-        let mut out: Vec<Py<PyAny>> = Vec::new();
-
-        loop {
-            if c.buf.len() < HEADER_LEN {
-                break;
-            }
-            let payload_len = (usize::from(c.buf[0]) << 16)
-                | (usize::from(c.buf[1]) << 8)
-                | usize::from(c.buf[2]);
-            // Enforce SETTINGS_MAX_FRAME_SIZE on the *declared* length before
-            // buffering the payload (h2: LengthDelimitedCodec `max_frame_length`
-            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:425). This both rejects
-            // frames h2 rejects and prevents buffering an over-size payload.
-            if payload_len > c.max_recv_frame_size {
-                return Err(protocol_err(
-                    frame::Reason::FRAME_SIZE_ERROR,
-                    "frame length exceeds SETTINGS_MAX_FRAME_SIZE",
-                ));
-            }
-            let total = HEADER_LEN + payload_len;
-            if c.buf.len() < total {
-                break;
-            }
-            let frame_buf = c.buf.split_to(total);
-            if let Some(obj) = c.decode_one(py, frame_buf)? {
-                out.push(obj);
-            }
-        }
-        Ok(out)
+        self.inner.lock().unwrap().dec.receive_frames(py, data)
     }
 
     /// Number of bytes currently buffered awaiting a complete frame.
     fn buffered(&self) -> usize {
-        self.inner.lock().unwrap().buf.len()
+        self.inner.lock().unwrap().dec.buffered()
     }
 
-    /// Feed bytes of the client connection preface (RFC 9113 §3.4) — h2 server.rs
-    /// L1427-1441: `None` while the bytes so far match but the 24 are not all in yet,
-    /// `Some(True)` once the whole preface matched (any bytes past it are already in
-    /// the frame buffer: `receive(b"")` decodes them), `Some(False)` on a mismatch
-    /// (h2: "read_preface: invalid preface" -> PROTOCOL_ERROR).
+    /// See `Codec::feed_preface`.
     fn feed_preface(&self, data: &[u8]) -> Option<bool> {
-        let mut c = self.inner.lock().unwrap();
-        let buf = c.preface_buf.get_or_insert_with(BytesMut::new);
-        buf.extend_from_slice(data);
-        let n = buf.len().min(H2_PREFACE.len());
-        if buf[..n] != H2_PREFACE[..n] {
-            return Some(false);
-        }
-        if buf.len() < H2_PREFACE.len() {
-            return None;
-        }
-        let mut full = c.preface_buf.take().unwrap_or_default();
-        let rest = full.split_off(H2_PREFACE.len());
-        c.buf.extend_from_slice(&rest);
-        Some(true)
+        self.inner.lock().unwrap().dec.feed_preface(data)
     }
 
     /// Classify a prefix of a connection's first bytes against the client preface —
@@ -509,23 +855,7 @@ impl H2Codec {
     /// one: the connection and stream stay usable.
     #[staticmethod]
     fn check_send_headers(headers: &HeaderMap) -> PyResult<()> {
-        headers.with_inner(|fields| {
-            if fields.contains_key(http::header::CONNECTION)
-                || fields.contains_key(http::header::TRANSFER_ENCODING)
-                || fields.contains_key(http::header::UPGRADE)
-                || fields.contains_key("keep-alive")
-                || fields.contains_key("proxy-connection")
-            {
-                return Err(map_user_err(UserError::MalformedHeaders));
-            }
-            if fields
-                .get(http::header::TE)
-                .is_some_and(|te| te != "trailers")
-            {
-                return Err(map_user_err(UserError::MalformedHeaders));
-            }
-            Ok(())
-        })
+        headers.with_inner(check_send_fields)
     }
 
     /// `method == Method::HEAD` on the parsed `http::Method` (hyper proto/h2/client.rs
@@ -543,55 +873,32 @@ impl H2Codec {
 
     // ===== settings application (HPACK table sizes) =================
 
-    /// Apply the peer's SETTINGS_HEADER_TABLE_SIZE: bounds the table *our*
-    /// encoder may use (h2 codec `set_send_header_table_size`).
     fn set_send_header_table_size(&self, val: u32) {
         self.inner
             .lock()
             .unwrap()
-            .encoder
-            .update_max_size(val as usize);
+            .enc
+            .set_send_header_table_size(val);
     }
 
-    /// Apply our own SETTINGS_HEADER_TABLE_SIZE (on peer ACK): queues a table
-    /// size update for *our* decoder (h2 codec `set_recv_header_table_size`).
     fn set_recv_header_table_size(&self, val: u32) {
         self.inner
             .lock()
             .unwrap()
-            .decoder
-            .queue_size_update(val as usize);
+            .dec
+            .set_recv_header_table_size(val);
     }
 
-    /// Apply our own SETTINGS_MAX_FRAME_SIZE (on peer ACK): the largest frame
-    /// payload we now accept on receive. Also recomputes the CONTINUATION-flood
-    /// cap, which is derived from the frame size (h2 framed_read.rs
-    /// `set_max_frame_size` -> `calc_max_continuation_frames`).
     fn set_max_recv_frame_size(&self, val: u32) -> PyResult<()> {
-        check_max_frame_size(val)?; // also keeps `calc_max_continuation_frames` off a zero divisor
-        let mut c = self.inner.lock().unwrap();
-        c.max_recv_frame_size = val as usize;
-        c.max_continuation_frames =
-            calc_max_continuation_frames(c.max_header_list_size, c.max_recv_frame_size);
-        Ok(())
+        self.inner.lock().unwrap().dec.set_max_recv_frame_size(val)
     }
 
-    /// Apply our own SETTINGS_MAX_HEADER_LIST_SIZE (on peer ACK): the decoded
-    /// header-list size bound, which also feeds the CONTINUATION-flood cap (h2
-    /// framed_read.rs `set_max_header_list_size`).
     fn set_max_header_list_size(&self, val: u32) {
-        let mut c = self.inner.lock().unwrap();
-        c.max_header_list_size = val as usize;
-        c.max_continuation_frames =
-            calc_max_continuation_frames(c.max_header_list_size, c.max_recv_frame_size);
+        self.inner.lock().unwrap().dec.set_max_header_list_size(val);
     }
 
-    /// Apply the peer's SETTINGS_MAX_FRAME_SIZE: the per-frame payload budget for
-    /// what *we* serialize (h2 framed_write.rs `set_max_frame_size`).
     fn set_send_max_frame_size(&self, val: u32) -> PyResult<()> {
-        check_max_frame_size(val)?; // the 3-byte length field cannot carry more than 2^24-1
-        self.inner.lock().unwrap().send_max_frame_size = val as usize;
-        Ok(())
+        self.inner.lock().unwrap().enc.set_send_max_frame_size(val)
     }
 
     // ===== serialize (outbound) =====================================
@@ -609,50 +916,24 @@ impl H2Codec {
         max_frame_size: Option<u32>,
         max_header_list_size: Option<u32>,
     ) -> PyResult<Py<PyBytes>> {
-        // Pre-validate the ranges the vendored `frame::Settings` setters assert
-        // on, so a bad value surfaces as a Python error instead of aborting the
-        // process (release builds are `panic = "abort"`). RFC 7540 §6.5.2.
-        if let Some(v) = max_frame_size
-            && !(DEFAULT_MAX_FRAME_SIZE as u32..=MAX_MAX_FRAME_SIZE).contains(&v)
-        {
-            return Err(PyValueError::new_err(format!(
-                "max_frame_size must be in [{DEFAULT_MAX_FRAME_SIZE}, {MAX_MAX_FRAME_SIZE}], got {v}"
-            )));
-        }
-        if let Some(v) = initial_window_size
-            && v > MAX_WINDOW_SIZE
-        {
-            return Err(PyValueError::new_err(format!(
-                "initial_window_size must be <= {MAX_WINDOW_SIZE}, got {v}"
-            )));
-        }
-        let mut s = frame::Settings::default();
-        if let Some(v) = header_table_size {
-            s.set_header_table_size(Some(v));
-        }
-        if let Some(v) = enable_push {
-            s.set_enable_push(v);
-        }
-        if let Some(v) = max_concurrent_streams {
-            s.set_max_concurrent_streams(Some(v));
-        }
-        if let Some(v) = initial_window_size {
-            s.set_initial_window_size(Some(v));
-        }
-        if let Some(v) = max_frame_size {
-            s.set_max_frame_size(Some(v));
-        }
-        if let Some(v) = max_header_list_size {
-            s.set_max_header_list_size(Some(v));
-        }
         let mut dst = BytesMut::new();
-        s.encode(&mut dst);
+        encode_settings(
+            &mut dst,
+            &SettingsValues {
+                header_table_size,
+                enable_push,
+                max_concurrent_streams,
+                initial_window_size,
+                max_frame_size,
+                max_header_list_size,
+            },
+        )?;
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
     fn serialize_settings_ack(&self, py: Python<'_>) -> Py<PyBytes> {
         let mut dst = BytesMut::new();
-        frame::Settings::ack().encode(&mut dst);
+        encode_settings_ack(&mut dst);
         PyBytes::new(py, &dst).unbind()
     }
 
@@ -669,40 +950,16 @@ impl H2Codec {
         scheme: Option<&str>,
         authority: Option<&str>,
     ) -> PyResult<Py<PyBytes>> {
-        let method =
-            Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
-        // The request-target as `http::Uri` sees it: absolute-form carries its own
-        // scheme + authority; origin-form (a bare path) takes the connection's, which
-        // hyper's h2 client fills in the same way (proto/h2/client.rs, the `:scheme` /
-        // `:authority` pseudo-headers come from the request's URI parts).
-        let uri: Uri = target.parse().map_err(|e| value_err("invalid url", e))?;
-        let uri = if uri.scheme().is_some() && uri.authority().is_some() {
-            uri
-        } else {
-            let (Some(scheme), Some(authority)) = (scheme, authority) else {
-                return Err(PyValueError::new_err(
-                    "request target is a bare path but the connection has no authority; \
-                     pass authority=... to H2Connection or use an absolute-URL target",
-                ));
-            };
-            Uri::builder()
-                .scheme(scheme)
-                .authority(authority)
-                .path_and_query(target)
-                .build()
-                .map_err(|e| value_err("invalid url", e))?
-        };
-        let pseudo = frame::Pseudo::request(method, uri, None);
         let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
-        let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
-        // A bodyless request carries END_STREAM on HEADERS (h2 `send_request`
-        // with `end_of_stream`), rather than a trailing empty DATA frame.
-        if end_stream {
-            hframe.set_end_stream();
-        }
-        let mut c = self.inner.lock().unwrap();
-        let max = c.send_max_frame_size;
-        let dst = encode_headers_frame(&mut c.encoder, hframe, max);
+        let hframe = build_request_headers(
+            stream_id, method, target, fields, end_stream, scheme, authority,
+        )?;
+        let mut dst = BytesMut::new();
+        self.inner
+            .lock()
+            .unwrap()
+            .enc
+            .encode_headers(hframe, &mut dst);
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
@@ -716,42 +973,30 @@ impl H2Codec {
         end_stream: bool,
         auto_date: bool,
     ) -> PyResult<Py<PyBytes>> {
-        let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
-        let pseudo = frame::Pseudo::response(status);
-        let mut fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
-        if auto_date {
-            // hyper proto/h2/server.rs L484: `entry(DATE).or_insert_with(date::
-            // update_and_header_value)` — the same cached value the h1 encoder writes.
-            fields.entry(DATE).or_insert_with(|| {
-                HeaderValue::from_bytes(&date_header_value())
-                    .expect("IMF-fixdate is a valid header value")
-            });
-        }
-        let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
-        // A bodyless response carries END_STREAM on HEADERS (e.g. a HEAD response,
-        // 204/304), rather than a trailing empty DATA frame.
-        if end_stream {
-            hframe.set_end_stream();
-        }
-        let mut c = self.inner.lock().unwrap();
-        let max = c.send_max_frame_size;
-        let dst = encode_headers_frame(&mut c.encoder, hframe, max);
+        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let hframe = build_response_headers(stream_id, status, fields, end_stream, auto_date)?;
+        let mut dst = BytesMut::new();
+        self.inner
+            .lock()
+            .unwrap()
+            .enc
+            .encode_headers(hframe, &mut dst);
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
-    /// A trailing HEADERS frame (no pseudo-headers, END_STREAM set) — request/response
-    /// trailers sent after the DATA frames (h2 `frame::Headers::trailers`) (F45).
     fn serialize_trailers(
         &self,
         py: Python<'_>,
         stream_id: u32,
         trailers: &HeaderMap,
     ) -> Py<PyBytes> {
-        let fields = trailers.snapshot();
-        let hframe = frame::Headers::trailers(frame::StreamId::from(stream_id), fields);
-        let mut c = self.inner.lock().unwrap();
-        let max = c.send_max_frame_size;
-        let dst = encode_headers_frame(&mut c.encoder, hframe, max);
+        let hframe = build_trailers(stream_id, trailers.snapshot());
+        let mut dst = BytesMut::new();
+        self.inner
+            .lock()
+            .unwrap()
+            .enc
+            .encode_headers(hframe, &mut dst);
         PyBytes::new(py, &dst).unbind()
     }
 
@@ -763,24 +1008,14 @@ impl H2Codec {
         data: &[u8],
         end_stream: bool,
     ) -> PyResult<Py<PyBytes>> {
-        // A DATA payload may not exceed the peer's SETTINGS_MAX_FRAME_SIZE (h2:
-        // `Encoder::buffer` -> `UserError::PayloadTooBig`, framed_write.rs). The
-        // 3-byte length field would also overflow past 2^24-1.
+        let mut dst = BytesMut::new();
         // Check and encode under ONE acquisition, so a concurrent SETTINGS-driven
         // `set_send_max_frame_size` cannot lower the bound between the two.
-        let dst = {
-            let c = self.inner.lock().unwrap();
-            let max = c.send_max_frame_size;
-            if data.len() > max {
-                return Err(user_payload_too_big(data.len(), max));
-            }
-            let flags = if end_stream { FLAG_END_STREAM } else { 0 };
-            let head = Head::new(Kind::Data, flags, frame::StreamId::from(stream_id));
-            let mut dst = BytesMut::with_capacity(HEADER_LEN + data.len());
-            head.encode(data.len(), &mut dst);
-            dst.extend_from_slice(data);
-            dst
-        };
+        self.inner
+            .lock()
+            .unwrap()
+            .enc
+            .encode_data(stream_id, data, end_stream, &mut dst)?;
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
@@ -791,34 +1026,20 @@ impl H2Codec {
         increment: u32,
     ) -> Py<PyBytes> {
         let mut dst = BytesMut::new();
-        frame::WindowUpdate::new(frame::StreamId::from(stream_id), increment).encode(&mut dst);
+        encode_window_update(&mut dst, stream_id, increment);
         PyBytes::new(py, &dst).unbind()
     }
 
     fn serialize_ping_ack(&self, py: Python<'_>, payload: &[u8]) -> PyResult<Py<PyBytes>> {
-        if payload.len() != 8 {
-            return Err(PyValueError::new_err(
-                "ping payload must be exactly 8 bytes",
-            ));
-        }
-        let mut p = [0u8; 8];
-        p.copy_from_slice(payload);
         let mut dst = BytesMut::new();
-        frame::Ping::pong(p).encode(&mut dst);
+        encode_ping(&mut dst, payload, true)?;
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
     /// A PING frame (not ACK) carrying an 8-byte payload — for keep-alive.
     fn serialize_ping(&self, py: Python<'_>, payload: &[u8]) -> PyResult<Py<PyBytes>> {
-        if payload.len() != 8 {
-            return Err(PyValueError::new_err(
-                "ping payload must be exactly 8 bytes",
-            ));
-        }
-        let mut p = [0u8; 8];
-        p.copy_from_slice(payload);
         let mut dst = BytesMut::new();
-        frame::Ping::new(p).encode(&mut dst);
+        encode_ping(&mut dst, payload, false)?;
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
@@ -831,32 +1052,44 @@ impl H2Codec {
         error_code: u32,
         debug_data: Option<&[u8]>,
     ) -> Py<PyBytes> {
-        let sid = frame::StreamId::from(last_stream_id);
-        let reason = frame::Reason::from(error_code);
-        let ga = match debug_data {
-            Some(dd) if !dd.is_empty() => {
-                frame::GoAway::with_debug_data(sid, reason, Bytes::copy_from_slice(dd))
-            }
-            _ => frame::GoAway::new(sid, reason),
-        };
         let mut dst = BytesMut::new();
-        ga.encode(&mut dst);
+        encode_go_away(
+            &mut dst,
+            last_stream_id,
+            error_code,
+            debug_data.unwrap_or(&[]),
+        );
         PyBytes::new(py, &dst).unbind()
     }
 
     /// A RST_STREAM frame — abruptly terminate `stream_id`.
     fn serialize_rst_stream(&self, py: Python<'_>, stream_id: u32, error_code: u32) -> Py<PyBytes> {
         let mut dst = BytesMut::new();
-        frame::Reset::new(
-            frame::StreamId::from(stream_id),
-            frame::Reason::from(error_code),
-        )
-        .encode(&mut dst);
+        encode_rst_stream(&mut dst, stream_id, error_code);
         PyBytes::new(py, &dst).unbind()
     }
 }
 
-impl Codec {
+/// h2 send.rs `check_headers` over a raw `http::HeaderMap` (see `H2Codec::check_send_headers`).
+pub(super) fn check_send_fields(fields: &http::HeaderMap) -> PyResult<()> {
+    if fields.contains_key(http::header::CONNECTION)
+        || fields.contains_key(http::header::TRANSFER_ENCODING)
+        || fields.contains_key(http::header::UPGRADE)
+        || fields.contains_key("keep-alive")
+        || fields.contains_key("proxy-connection")
+    {
+        return Err(map_user_err(UserError::MalformedHeaders));
+    }
+    if fields
+        .get(http::header::TE)
+        .is_some_and(|te| te != "trailers")
+    {
+        return Err(map_user_err(UserError::MalformedHeaders));
+    }
+    Ok(())
+}
+
+impl Decoder {
     fn decode_one(
         &mut self,
         py: Python<'_>,

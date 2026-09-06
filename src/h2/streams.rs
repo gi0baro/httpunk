@@ -16,7 +16,7 @@ use vendor_h2::proto::streams::{FlowControl, State};
 
 use super::errors::{H2ProtocolError, map_proto_err, map_reason, map_user_err};
 
-fn parse_initiator(s: &str) -> PyResult<Initiator> {
+pub(super) fn parse_initiator(s: &str) -> PyResult<Initiator> {
     match s {
         "user" => Ok(Initiator::User),
         "library" => Ok(Initiator::Library),
@@ -192,7 +192,7 @@ impl H2StreamState {
 /// L226 cast `as i32`): an amount above 2^31-1 — which the wire can never carry
 /// (`WindowUpdate::load` masks to 31 bits) — would flip sign and corrupt the window.
 /// Reject it at the boundary instead.
-fn check_window_size(sz: u32) -> PyResult<()> {
+pub(super) fn check_window_size(sz: u32) -> PyResult<()> {
     const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
     if sz > MAX_WINDOW_SIZE {
         return Err(PyValueError::new_err(format!(
@@ -308,10 +308,57 @@ pub const MAX_RECV_EMPTY_DATA_FRAMES: usize = 100;
 /// h2 stream.rs `ContentLength` (L121-125): the declared body length of a message,
 /// decremented per DATA frame and checked at END_STREAM.
 #[derive(Clone, Copy)]
-enum ContentLength {
+pub(super) enum ContentLength {
     Omitted,
     Head,
     Remaining(u64),
+}
+
+impl ContentLength {
+    /// `is_head`: the response to a HEAD request — never has a body, whatever the
+    /// header says (`ContentLength::Head`); else `Omitted` until a header is seen.
+    pub(super) fn new(is_head: bool) -> Self {
+        if is_head {
+            ContentLength::Head
+        } else {
+            ContentLength::Omitted
+        }
+    }
+
+    /// h2 `ContentLength::is_head` (stream.rs L597).
+    pub(super) fn is_head(self) -> bool {
+        matches!(self, ContentLength::Head)
+    }
+
+    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L175-201): a no-op
+    /// for a HEAD response, whose block h2 skips entirely.
+    pub(super) fn set(&mut self, value: u64) {
+        if !matches!(*self, ContentLength::Head) {
+            *self = ContentLength::Remaining(value);
+        }
+    }
+
+    /// h2 stream.rs `dec_content_length` (L338-353): consume `len` body bytes. `false`
+    /// = more data than declared, or any data on a HEAD response.
+    pub(super) fn dec(&mut self, len: u64) -> bool {
+        match *self {
+            ContentLength::Remaining(rem) => match rem.checked_sub(len) {
+                Some(val) => {
+                    *self = ContentLength::Remaining(val);
+                    true
+                }
+                None => false,
+            },
+            ContentLength::Head => len == 0,
+            ContentLength::Omitted => true,
+        }
+    }
+
+    /// h2 stream.rs `ensure_content_length_zero` (L355-361): `false` = a declared
+    /// length still unsatisfied at END_STREAM.
+    pub(super) fn is_satisfied(self) -> bool {
+        !matches!(self, ContentLength::Remaining(n) if n != 0)
+    }
 }
 
 /// `ContentLength` for one stream. `frozen` + `Mutex`: shared across worker threads.
@@ -322,61 +369,34 @@ pub struct H2ContentLength {
 
 #[pymethods]
 impl H2ContentLength {
-    /// `is_head`: the response to a HEAD request — never has a body, whatever the
-    /// header says (`ContentLength::Head`); else `Omitted` until a header is seen.
     #[new]
     #[pyo3(signature = (is_head=false))]
     fn new(is_head: bool) -> Self {
         Self {
-            inner: Mutex::new(if is_head {
-                ContentLength::Head
-            } else {
-                ContentLength::Omitted
-            }),
+            inner: Mutex::new(ContentLength::new(is_head)),
         }
     }
 
-    /// h2 `ContentLength::is_head` (stream.rs L597).
     fn is_head(&self) -> bool {
-        matches!(*self.inner.lock().unwrap(), ContentLength::Head)
+        self.inner.lock().unwrap().is_head()
     }
 
-    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L175-201): a no-op
-    /// for a HEAD response, whose block h2 skips entirely.
     fn set(&self, value: u64) {
-        let mut cl = self.inner.lock().unwrap();
-        if !matches!(*cl, ContentLength::Head) {
-            *cl = ContentLength::Remaining(value);
-        }
+        self.inner.lock().unwrap().set(value);
     }
 
-    /// h2 stream.rs `dec_content_length` (L338-353): consume `len` body bytes. `False`
-    /// = more data than declared, or any data on a HEAD response.
     fn dec(&self, len: u64) -> bool {
-        let mut cl = self.inner.lock().unwrap();
-        match *cl {
-            ContentLength::Remaining(rem) => match rem.checked_sub(len) {
-                Some(val) => {
-                    *cl = ContentLength::Remaining(val);
-                    true
-                }
-                None => false,
-            },
-            ContentLength::Head => len == 0,
-            ContentLength::Omitted => true,
-        }
+        self.inner.lock().unwrap().dec(len)
     }
 
-    /// h2 stream.rs `ensure_content_length_zero` (L355-361): `False` = a declared
-    /// length still unsatisfied at END_STREAM.
     fn is_satisfied(&self) -> bool {
-        !matches!(*self.inner.lock().unwrap(), ContentLength::Remaining(n) if n != 0)
+        self.inner.lock().unwrap().is_satisfied()
     }
 }
 
 /// h2 counts.rs `Budget` (0.4.19): `consume` fails once exhausted, `replenish`
 /// saturates at the resolved maximum.
-struct Budget {
+pub(super) struct Budget {
     current: usize,
     max: usize,
 }
@@ -395,7 +415,7 @@ impl Budget {
     }
 }
 
-struct DataFrameCounts {
+pub(super) struct DataFrameCounts {
     data_frame_budget: Budget,
     num_recv_empty_data_frames: usize,
 }
@@ -411,7 +431,7 @@ pub struct H2DataFrameBudget {
     inner: Mutex<DataFrameCounts>,
 }
 
-fn budget_exhausted() -> PyErr {
+pub(super) fn budget_exhausted() -> PyErr {
     // streams.rs L644-647: `BudgetExhausted` -> connection ENHANCE_YOUR_CALM.
     H2ProtocolError::new_err((
         Some(u32::from(Reason::ENHANCE_YOUR_CALM)),
@@ -419,23 +439,18 @@ fn budget_exhausted() -> PyErr {
     ))
 }
 
-#[pymethods]
-impl H2DataFrameBudget {
+impl DataFrameCounts {
     /// `DataFrameBudget::resolve`: a configured budget as-is; otherwise ("Auto") half
     /// the connection recv window (`connection_window`, default
     /// DEFAULT_INITIAL_WINDOW_SIZE), floored at DEFAULT_DATA_FRAME_BUDGET.
-    #[new]
-    #[pyo3(signature = (configured=None, connection_window=None))]
-    fn new(configured: Option<usize>, connection_window: Option<u32>) -> Self {
+    pub(super) fn new(configured: Option<usize>, connection_window: Option<u32>) -> Self {
         let max = configured.unwrap_or_else(|| {
             let window = connection_window.unwrap_or(vendor_h2::frame::DEFAULT_INITIAL_WINDOW_SIZE);
             (window as usize / 2).max(DEFAULT_DATA_FRAME_BUDGET)
         });
-        Self {
-            inner: Mutex::new(DataFrameCounts {
-                data_frame_budget: Budget { current: max, max },
-                num_recv_empty_data_frames: 0,
-            }),
+        DataFrameCounts {
+            data_frame_budget: Budget { current: max, max },
+            num_recv_empty_data_frames: 0,
         }
     }
 
@@ -444,25 +459,24 @@ impl H2DataFrameBudget {
     /// from the budget (0 for an empty or a large frame) — what `release` gives back
     /// once the chunk leaves the buffer. Raises `H2ProtocolError(ENHANCE_YOUR_CALM)`
     /// on exhaustion of the byte budget or the empty-frame cap.
-    fn record(&self, payload_len: usize) -> PyResult<usize> {
-        let mut c = self.inner.lock().unwrap();
+    pub(super) fn record(&mut self, payload_len: usize) -> PyResult<usize> {
         if payload_len == 0 {
-            c.num_recv_empty_data_frames = c
+            self.num_recv_empty_data_frames = self
                 .num_recv_empty_data_frames
                 .checked_add(1)
                 .ok_or_else(budget_exhausted)?;
-            if c.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
+            if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
                 return Err(budget_exhausted());
             }
             Ok(0)
         } else if payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
             let cost = DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len;
-            if !c.data_frame_budget.consume(cost) {
+            if !self.data_frame_budget.consume(cost) {
                 return Err(budget_exhausted());
             }
             Ok(cost)
         } else {
-            c.data_frame_budget
+            self.data_frame_budget
                 .replenish(payload_len - DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
             Ok(0)
         }
@@ -470,24 +484,47 @@ impl H2DataFrameBudget {
 
     /// `release_data_frame`'s replenish, for a charge previously taken by `record`
     /// (saturating at the resolved budget).
+    pub(super) fn release(&mut self, charge: usize) {
+        self.data_frame_budget.replenish(charge);
+    }
+
+    pub(super) fn available(&self) -> usize {
+        self.data_frame_budget.current
+    }
+
+    pub(super) fn empty_frames(&self) -> usize {
+        self.num_recv_empty_data_frames
+    }
+}
+
+#[pymethods]
+impl H2DataFrameBudget {
+    #[new]
+    #[pyo3(signature = (configured=None, connection_window=None))]
+    fn new(configured: Option<usize>, connection_window: Option<u32>) -> Self {
+        Self {
+            inner: Mutex::new(DataFrameCounts::new(configured, connection_window)),
+        }
+    }
+
+    fn record(&self, payload_len: usize) -> PyResult<usize> {
+        self.inner.lock().unwrap().record(payload_len)
+    }
+
     fn release(&self, charge: usize) {
-        self.inner
-            .lock()
-            .unwrap()
-            .data_frame_budget
-            .replenish(charge);
+        self.inner.lock().unwrap().release(charge);
     }
 
     /// The budget currently available (tests / diagnostics).
     #[getter]
     fn available(&self) -> usize {
-        self.inner.lock().unwrap().data_frame_budget.current
+        self.inner.lock().unwrap().available()
     }
 
     /// Empty non-final DATA frames received over the connection's lifetime (counts.rs
     /// `num_recv_empty_data_frames`, capped at MAX_RECV_EMPTY_DATA_FRAMES).
     #[getter]
     fn empty_frames(&self) -> usize {
-        self.inner.lock().unwrap().num_recv_empty_data_frames
+        self.inner.lock().unwrap().empty_frames()
     }
 }

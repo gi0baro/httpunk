@@ -9,7 +9,7 @@
 #   H2_VERSION=0.4.19 scripts/vendor-h2.sh
 #
 # The copy is kept byte-identical to upstream so `git diff` between two vendored
-# versions shows only genuine upstream changes. Modifications: drop hpack/test/, a few documented state.rs shims, and a
+# versions shows only genuine upstream changes. Modifications: drop hpack/test/, one documented state.rs shim, and a
 # uniform pub(crate)->pub widening (see steps below and THIRD-PARTY.md).
 set -euo pipefail
 
@@ -49,23 +49,26 @@ perl -0pi -e 's/#\[cfg\(test\)\]\s*\nmod test;\n//' "$DST/hpack/mod.rs"
 # 3. Vendor the *synchronous* proto pieces: the stream state machine + flow
 #    control + the error types they reference. The async proto/streams
 #    orchestration (recv/send/prioritize/streams/store/buffer/counts) and
-#    connection/ping_pong/go_away are NOT vendored — that's rewritten in Python.
+#    connection/ping_pong/go_away are NOT vendored — their state is re-expressed in
+#    src/h2/conn.rs (H2Streams) and their async half in Python.
 #    The hand-written module glue (crates/vendor-h2/src/{lib,proto,codec}/… glue) is NOT touched by this script.
 mkdir -p "$DST/proto/streams" "$DST/codec"
 cp "$SRC/src/proto/streams/state.rs" "$DST/proto/streams/state.rs"
 cp "$SRC/src/proto/streams/flow_control.rs" "$DST/proto/streams/flow_control.rs"
 cp "$SRC/src/proto/error.rs" "$DST/proto/error.rs"
 cp "$SRC/src/codec/error.rs" "$DST/codec/error.rs"
+#    h2's public `Error` (src/error.rs): pure, and what `State::ensure_reason` returns
+#    — vendored so that method stays byte-identical (the connection state derives a
+#    stream's stop reason from it; httpunk's own `H2Streams` is the caller).
+cp "$SRC/src/error.rs" "$DST/error.rs"
 
-# state.rs modifications (so the Python driver can drive it with primitives):
-#   a. drop PollReset from the proto import (ensure_reason is removed below)
+# state.rs modifications (the driver has no `frame::Headers` at open time — the
+# decoder already turned it into the Python frame event):
 #   b. shim recv_open(&frame::Headers) -> recv_open(eos, informational)
-#   c. remove ensure_reason (server-send-side only; would pull in PollReset +
-#      the public crate::Error). Transition logic is otherwise byte-identical.
-perl -0pi -e 's/use crate::proto::\{self, Error, Initiator, PollReset\};/use crate::proto::{self, Error, Initiator};/' "$DST/proto/streams/state.rs"
+#   (`PollReset` — h2 send.rs L43-48 — lives in the hand-written proto/mod.rs glue,
+#   and `crate::Error` is vendored above, so `ensure_reason` is byte-identical.)
 perl -0pi -e 's/pub fn recv_open\(&mut self, frame: &frame::Headers\) -> Result<bool, Error> \{\n        let mut initial = false;\n        let eos = frame\.is_end_stream\(\);/pub fn recv_open(\&mut self, eos: bool, informational: bool) -> Result<bool, Error> {\n        let mut initial = false;/' "$DST/proto/streams/state.rs"
 perl -0pi -e 's/frame\.is_informational\(\)/informational/g' "$DST/proto/streams/state.rs"
-perl -0pi -e 's/    \/\/\/ Returns a reason if the stream has been reset\.\n    pub\(super\) fn ensure_reason.*?\n    \}\n//s' "$DST/proto/streams/state.rs"
 #   d. strip the trailing inline `#[cfg(test)] mod tests` (added in 0.4.16): it
 #      drives `recv_open(&frame::Headers)`, the pre-shim signature from (b), so it
 #      can't compile against the shimmed file (same tradeoff as hyper's stripped
@@ -83,12 +86,15 @@ perl -0pi -e 's/\n+#\[cfg\(test\)\]\nmod tests \{.*\z/\n/s' "$DST/proto/streams/
 find "$DST/frame" "$DST/hpack" -name '*.rs' -print0 \
   | xargs -0 perl -0pi -e 's/\bpub\(crate\)/pub/g'
 perl -0pi -e 's/\bpub\(crate\)/pub/g' \
-  "$DST/ext.rs" \
+  "$DST/ext.rs" "$DST/error.rs" \
   "$DST/proto/streams/state.rs" "$DST/proto/streams/flow_control.rs" \
   "$DST/proto/error.rs" "$DST/codec/error.rs"
+#    `State::ensure_reason` is `pub(super)` upstream (only `streams::send` calls it);
+#    the same widening, so the main crate's `H2Streams` can.
+perl -0pi -e 's/\bpub\(super\)/pub/g' "$DST/proto/streams/state.rs"
 
 # 5. License + version stamp.
 cp "$SRC/LICENSE" "$DST/../LICENSE"
 echo "$H2_VERSION" > "$DST/../UPSTREAM_VERSION"
 
-echo "vendored h2 $H2_VERSION into crates/vendor-h2/src/ (frame + hpack + ext + proto{state,flow_control,error} + codec/error)"
+echo "vendored h2 $H2_VERSION into crates/vendor-h2/src/ (frame + hpack + ext + error + proto{state,flow_control,error} + codec/error)"

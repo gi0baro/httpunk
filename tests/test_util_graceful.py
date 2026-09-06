@@ -16,10 +16,11 @@ from tonio.colored.net import open_tcp_listeners
 
 from httpunk import H1Connection, H2Connection, H2Reason
 from httpunk._backend.tonio import TonioBackend
-from httpunk._httpunk import H2Codec, H2FrameGoAway, H2FramePing
+from httpunk._httpunk import H2_HEADERS_IGNORED, H2_HEADERS_OPENED, H2Codec, H2FrameGoAway, H2FramePing
 from httpunk.exceptions import HTTPunkError
 from httpunk.h1.server import H1Server, ServerConnection as H1ServerConnection
 from httpunk.h2.server import H2Server, ServerConnection as H2ServerConnection
+from httpunk.h2.stream import Stream
 from httpunk.http import HeaderMap
 from httpunk.util import GracefulShutdown
 
@@ -102,52 +103,50 @@ async def test_watch_registers_count_synchronously():
 
 
 def _req_frame(stream_id):
-    """A minimal valid request-HEADERS stub for `_recv_headers_target`."""
-    return SimpleNamespace(
-        stream_id=stream_id,
-        method="GET",
-        scheme="https",
-        authority="x",
-        path="/",
-        headers=HeaderMap(),
-        end_stream=True,
-        status=None,
-        content_length=None,
-        content_length_invalid=False,
-        is_informational=False,
-    )
+    """A minimal valid request-HEADERS frame (END_STREAM), minted through a codec round trip."""
+    raw = H2Codec("client").serialize_request_headers(stream_id, "GET", "https://x/", HeaderMap(), end_stream=True)
+    [frame] = H2Codec("server").receive(raw)
+    return frame
+
+
+def _data_frame(stream_id, payload=b"x"):
+    [frame] = H2Codec("server").receive(H2Codec("client").serialize_data(stream_id, payload))
+    return frame
 
 
 @pytest.mark.tonio
 async def test_h2_graceful_two_phase_serves_then_ignores():
     """Two-phase graceful shutdown (h2). PHASE 1 (GOAWAY 2^31-1 + shutdown PING) keeps
     ACCEPTING streams — a request already in flight when we started the shutdown is
-    served, not refused. PHASE 2 (the shutdown PING's ack lowers `_max_stream_id` to the
+    served, not refused. PHASE 2 (the shutdown PING's ack lowers `max_stream_id` to the
     last-processed id) silently IGNORES streams opened above it, never REFUSED."""
     conn = H2ServerConnection(_IdleTransport(), max_concurrent_streams=100)
-    conn.streams._graceful = True  # phase 1: _max_stream_id is still 2^31-1
-    assert conn.streams._recv_headers_target(_req_frame(1)) is None  # handled...
-    assert 1 in conn.streams._streams  # ...by ACCEPTING (served), not refusing
-    assert conn.streams._last_processed_id == 1
+    conn.begin_graceful_shutdown()  # phase 1: max_stream_id is still 2^31-1
+    assert conn.graceful
+    v = conn.recv_headers(_req_frame(1), Stream(conn.backend))
+    assert v.kind == H2_HEADERS_OPENED  # handled by ACCEPTING (served), not refusing
+    assert conn.has_stream(1)
+    assert conn.last_processed_id == 1
 
-    # phase 2, as `_on_pong` sets it: the final GOAWAY's last-processed id
-    conn.streams._shutdown_final = True
-    conn.streams._max_stream_id = conn.streams._last_processed_id  # 1
-    assert conn.streams._recv_headers_target(_req_frame(3)) is None  # id > max -> ignored
-    assert 3 not in conn.streams._streams
-    assert conn.streams._last_processed_id == 1  # an ignored stream must not count
+    # phase 2, as the shutdown PING's ack sets it: the final GOAWAY's last-processed id
+    conn.set_max_stream_id(conn.last_processed_id)  # 1
+    v = conn.recv_headers(_req_frame(3), Stream(conn.backend))
+    assert v.kind == H2_HEADERS_IGNORED  # id > max -> ignored
+    assert not conn.has_stream(3)
+    assert conn.last_processed_id == 1  # an ignored stream must not count
 
 
 @pytest.mark.tonio
 async def test_h2_frame_above_goaway_ignored_not_errored():
-    """A NON-headers frame (DATA/etc., via `_recv_lookup`) on a client stream above the
-    last-stream-id of our GOAWAY is silently IGNORED (returns None -> recv_data drops it
-    with conn-window accounting, h2 `ignore_data`), never an RST(STREAM_CLOSED) or a
-    connection PROTOCOL_ERROR that would abort the graceful drain (F42)."""
+    """A NON-headers frame (DATA/etc.) on a client stream above the last-stream-id of
+    our GOAWAY is silently IGNORED (dropped with conn-window accounting, h2
+    `ignore_data`), never an RST(STREAM_CLOSED) or a connection PROTOCOL_ERROR that
+    would abort the graceful drain (F42)."""
     conn = H2ServerConnection(_IdleTransport(), max_concurrent_streams=100)
-    conn.streams._max_stream_id = 1  # as phase-2 graceful lowers it
+    conn.set_max_stream_id(1)  # as phase-2 graceful lowers it
     # Stream 3 (> 1) was refused by our GOAWAY: a late frame on it is ignored, not raised.
-    assert conn.streams._recv_lookup(3) is None
+    v = conn.recv_data(_data_frame(3))
+    assert v.handle is None and v.payload is None
 
 
 @pytest.mark.tonio
@@ -159,7 +158,8 @@ async def test_h2_graceful_shutdown_emits_two_phase_goaways():
     conn = H2ServerConnection(t, max_concurrent_streams=100)
     peer = H2Codec("client")  # decode what the server wrote
 
-    await conn.graceful_shutdown()  # phase 1
+    await conn.graceful_shutdown()  # phase 1 (queued for the write pump)
+    await conn._flush()  # no pump is running here: write what was queued
     phase1 = peer.receive(t.sent)
     t.sent = b""
     goaways = [f for f in phase1 if isinstance(f, H2FrameGoAway)]
@@ -170,14 +170,17 @@ async def test_h2_graceful_shutdown_emits_two_phase_goaways():
 
     # Idempotent: a second call emits nothing.
     await conn.graceful_shutdown()
+    await conn._flush()
     assert t.sent == b""
 
     # Phase 2: the shutdown ping's ack, after having processed up to stream 5.
-    conn.streams._last_processed_id = 5
-    await conn._on_pong(SimpleNamespace(data=pings[0].data))
+    conn.set_last_processed_id(5)
+    [pong] = H2Codec("server").receive(H2Codec("client").serialize_ping_ack(pings[0].data))
+    conn._after(conn.recv_ping(pong))
+    await conn._flush()
     phase2 = [f for f in peer.receive(t.sent) if isinstance(f, H2FrameGoAway)]
     assert len(phase2) == 1 and phase2[0].last_stream_id == 5  # the real last-processed id
-    assert conn.streams._shutdown_final is True
+    assert conn.shutdown_final is True
 
 
 # ----- h1 primitive: non-blocking signal (stop reuse + arm the idle-read release) -----
@@ -188,7 +191,7 @@ async def test_h1_graceful_is_a_nonblocking_signal():
     transport = _IdleTransport()
     conn = H1ServerConnection(transport)
     await conn.graceful_shutdown()
-    assert not conn._reusable
+    assert not conn.reusable
     assert conn._shutdown_evt.is_set()
     assert not transport.closed  # the primitive does NOT close — the serve loop does
     assert await conn.next_request() is None  # not reusable -> serves no more
@@ -278,3 +281,43 @@ async def test_h1_graceful_releases_idle_connection_and_closes():
         await graceful.shutdown()
         assert graceful.count() == 0
         await conn.__aexit__(None, None, None)
+
+
+# ----- two-party transitions (HTTPUNK_RUST_STATE_DESIGN.md §3.4) -----
+
+
+@pytest.mark.tonio
+async def test_shutdown_signal_and_liveness_sample_are_one_step():
+    """`shutdown()` signals and samples "anyone live?" under the lock: a watch
+    registered before the call is always waited for, and one whose serve ends before
+    the signal was ever observed drops the count exactly once (the release latch),
+    so `shutdown()` returns instead of hanging on a negative count (U3, U5)."""
+    graceful = GracefulShutdown()
+    release = Event()
+
+    async def _noop_graceful_shutdown():
+        pass
+
+    server = SimpleNamespace(graceful_shutdown=_noop_graceful_shutdown)
+
+    async def serve(_server):
+        await release.wait()
+
+    watcher = graceful.watcher()
+    assert graceful.count() == 1
+    async with scope() as s:
+        s.spawn(watcher.watch(server, serve))
+        finished = Event()
+
+        async def shut():
+            await graceful.shutdown()
+            finished.set()
+
+        s.spawn(shut())
+        await sleep(0)
+        assert not finished.is_set()  # a live watch: shutdown waits
+        release.set()
+        await finished.wait()
+    watcher._release()  # a second release (a duplicate teardown path) is a no-op
+    assert graceful.count() == 0
+    await graceful.shutdown()  # nothing live: returns at once

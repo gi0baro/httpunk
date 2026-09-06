@@ -35,7 +35,11 @@ async def connect(
 
     - **https** → TLS-dial with ALPN; `selected == "h2"` is the *upgrade* to
       `H2Connection`, anything else (incl. no ALPN, per RFC 7301) is the *fallback*
-      to `H1Connection`.
+      to `H1Connection`. `alpn` is the offer configured on the context httpunk
+      creates when `ssl_context` is None; a caller-supplied context is NEVER
+      mutated (a context is shared by every connect that uses it, and two
+      concurrent dials configuring it would negotiate each other's offer): its
+      own ALPN setting is the offer, `alpn` is ignored for it.
     - **http** → plain TCP → `H1Connection` (no ALPN on cleartext; h2c is out of
       scope, matching hyper-util).
 
@@ -54,7 +58,8 @@ async def connect(
         raise ValueError(f"no host in URL {url!r}")
 
     if scheme == "https":
-        stream, selected = await backend.connect_tls(host, port, alpn=alpn, ssl_context=ssl_context)
+        offer = alpn if ssl_context is None else None  # a caller's context is never mutated
+        stream, selected = await backend.connect_tls(host, port, alpn=offer, ssl_context=ssl_context)
         if selected == "h2":
             return H2Connection(stream, authority=authority, scheme="https", backend=backend)
         return H1Connection(stream, authority=authority, backend=backend)

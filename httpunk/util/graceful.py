@@ -34,6 +34,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .. import _backend
+from .._httpunk import OnceLatch
 
 
 class GracefulShutdown:
@@ -47,7 +48,8 @@ class GracefulShutdown:
 
     def count(self) -> int:
         """Number of connections currently being watched (≈ `receiver_count`)."""
-        return self._live
+        with self._lock:
+            return self._live
 
     def watcher(self) -> _Watcher:
         """Register a watch slot SYNCHRONOUSLY and return a `Watcher` whose async
@@ -71,9 +73,15 @@ class GracefulShutdown:
 
     async def shutdown(self) -> None:
         """Signal every watched connection to shut down gracefully and wait until
-        they have all finished their in-flight work and closed."""
-        self._signal.set()
-        await self._all_done.wait()
+        they have all finished their in-flight work and closed. The signal and the
+        "anyone live?" sample are one step under the lock, so a watch registered
+        right before the signal is always waited for (one registered after it is
+        the caller's own ordering, as with hyper-util)."""
+        with self._lock:
+            self._signal.set()
+            live = self._live
+        if live:
+            await self._all_done.wait()
 
 
 class _Watcher:
@@ -85,7 +93,7 @@ class _Watcher:
 
     def __init__(self, graceful):
         self._graceful = graceful
-        self._released = False
+        self._released = OnceLatch()  # the count drops exactly once, whichever path gets there first
 
     async def watch(self, server, serve):
         """Drive `serve(server)` — the connection future — to completion. If
@@ -114,9 +122,8 @@ class _Watcher:
             self._release()
 
     def _release(self):
-        if self._released:
+        if not self._released.try_acquire():
             return
-        self._released = True
         g = self._graceful
         with g._lock:
             g._live -= 1

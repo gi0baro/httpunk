@@ -3,10 +3,12 @@ the h1 server's unread-body drain; it must read *decrypted plaintext* over TLS
 (via the SSLObject), not the raw socket — a `TLSStream` carries ciphertext and
 has no `.socket`, so the plain-socket path would be wrong (and would AttributeError)."""
 
+import threading
+
 from httpunk._backend.tonio import TonioBackend
 
 
-class _FakeSSLObject:
+class _FakeInnerSSL:
     """Enough of `ssl.SSLObject` for `receive_nowait`: a plaintext buffer that
     `pending()` counts and `read(n)` drains — never touching a BIO/socket."""
 
@@ -19,6 +21,15 @@ class _FakeSSLObject:
     def read(self, n):
         chunk, self._buf = self._buf[:n], self._buf[n:]
         return chunk
+
+
+class _FakeSSLObject:
+    """The shape of tonio's `_SSLProxy`: the `SSLObject` behind `_inner`, every use
+    of it under `_lock` — the peek takes that lock for its pending-then-read."""
+
+    def __init__(self, plaintext):
+        self._lock = threading.Lock()
+        self._inner = _FakeInnerSSL(plaintext)
 
 
 class _FakeUnderlyingSocket:

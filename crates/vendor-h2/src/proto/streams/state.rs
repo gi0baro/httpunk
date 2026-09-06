@@ -3,7 +3,7 @@ use std::io;
 
 use crate::codec::UserError;
 use crate::frame::{self, Reason, StreamId};
-use crate::proto::{self, Error, Initiator};
+use crate::proto::{self, Error, Initiator, PollReset};
 
 use self::Inner::*;
 use self::Peer::*;
@@ -457,6 +457,27 @@ impl State {
         }
     }
 
+    /// Returns a reason if the stream has been reset.
+    pub fn ensure_reason(&self, mode: PollReset) -> Result<Option<Reason>, crate::Error> {
+        match self.inner {
+            Closed(Cause::Error(Error::Reset(_, reason, _)))
+            | Closed(Cause::ErrorAfterEndStream(Error::Reset(_, reason, _)))
+            | Closed(Cause::Error(Error::GoAway(_, reason, _)))
+            | Closed(Cause::ErrorAfterEndStream(Error::GoAway(_, reason, _)))
+            | Closed(Cause::ScheduledLibraryReset(reason)) => Ok(Some(reason)),
+            Closed(Cause::Error(ref e) | Cause::ErrorAfterEndStream(ref e)) => {
+                Err(e.clone().into())
+            }
+            Open {
+                local: Streaming, ..
+            }
+            | HalfClosedRemote(Streaming) => match mode {
+                PollReset::AwaitingHeaders => Err(UserError::PollResetAfterSendResponse.into()),
+                PollReset::Streaming => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
 }
 
 impl Default for State {

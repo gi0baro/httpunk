@@ -75,14 +75,23 @@ class TonioBackend:
           would bypass decryption (and a `TLSStream` has no `.socket` anyway). The
           non-blocking-plaintext equivalent is the SSLObject's already-decrypted
           buffer: `pending()` bytes can be `read()` without touching the BIO/socket.
+          tonio's `_SSLProxy` serialises EVERY use of its `SSLObject` — the parked
+          reader's `_read` included — under one `threading.Lock`; the peek takes that
+          same lock (private API, tonio and httpunk share an author) so its
+          pending-then-read is ONE step against a reader decrypting on another thread,
+          never a `read()` of bytes the reader just consumed.
           (Necessarily conservative — tonio exposes no non-blocking "decrypt more",
           so unread ciphertext on the socket reads as "nothing ready"; the drain
           then closes rather than reuses, which matches hyper's cheap-drain-or-close.
-          EOF is never reported for TLS either — it is only knowable by decrypting.)"""
+          EOF is never reported for TLS either — it is only knowable by decrypting.)
+        - A peek beside a parked plain-socket reader is safe: both are one `recv`
+          syscall on the same non-blocking socket, the bytes go to exactly one of
+          them, and the loser's `EAGAIN` sends it back to waiting (tonio `recv`)."""
         ssl_obj = getattr(transport, "_ssl", None)
         if ssl_obj is not None:  # a TLSStream — peek only already-decrypted plaintext
-            pending = ssl_obj.pending()
-            return ssl_obj.read(min(max_bytes, pending)) if pending else None
+            with ssl_obj._lock:  # tonio `_SSLProxy._lock`: the SSLObject's one lock
+                pending = ssl_obj._inner.pending()
+                return ssl_obj._inner.read(min(max_bytes, pending)) if pending else None
         try:
             return transport.socket._sock.recv(max_bytes)  # b"" only at EOF
         except (BlockingIOError, InterruptedError):

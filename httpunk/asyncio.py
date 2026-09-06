@@ -234,21 +234,29 @@ class ServerConnections:
         """Signal every live connection to shut down gracefully and await them to
         drain; past `timeout`, force-close the stragglers (transport close + cancel
         their serve task) so this always returns."""
-        conns = list(self._live)
-        if not conns:
-            return
-        # return_exceptions so ONE connection whose graceful_shutdown() raises can't
-        # abort the whole shutdown — every other connection must still be drained and
-        # the force-close path below must still run (F54).
-        await asyncio.gather(*(c.graceful_shutdown() for c in conns), return_exceptions=True)
-        waits = [asyncio.ensure_future(c.wait_closed()) for c in conns]
-        _done, pending = await asyncio.wait(waits, timeout=timeout)
-        if pending:
-            for c in conns:
-                c.close()  # unblock IO-bound waits
-                if c._serve_task is not None:
-                    c._serve_task.cancel()  # hard-cancel a stuck handler / accept loop
-            await asyncio.wait(pending)
+        # Connections accepted while a drain round is in flight (the host closes its
+        # listener first, but an already-accepted socket may still register) get
+        # their own round: loop until no new live connection appears.
+        drained = set()
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        while True:
+            conns = [c for c in self._live if c not in drained]
+            if not conns:
+                return
+            drained.update(conns)
+            # return_exceptions so ONE connection whose graceful_shutdown() raises can't
+            # abort the whole shutdown — every other connection must still be drained and
+            # the force-close path below must still run (F54).
+            await asyncio.gather(*(c.graceful_shutdown() for c in conns), return_exceptions=True)
+            waits = [asyncio.ensure_future(c.wait_closed()) for c in conns]
+            remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
+            _done, pending = await asyncio.wait(waits, timeout=remaining)
+            if pending:
+                for c in conns:
+                    c.close()  # unblock IO-bound waits
+                    if c._serve_task is not None:
+                        c._serve_task.cancel()  # hard-cancel a stuck handler / accept loop
+                await asyncio.wait(pending)
 
 
 class _ClientProtocol(_AsyncioStream):
@@ -290,9 +298,16 @@ class _ClientProtocol(_AsyncioStream):
 
     async def aclose(self) -> None:
         """Close the connection — drops the read/write scopes and the transport. A no-op if the
-        connection was never established (`connection_made` not yet called)."""
-        if self._client is not None:
-            await self._client.__aexit__(None, None, None)
+        connection was never established (`connection_made` not yet called). A handshake
+        still in flight is cancelled and joined first, so nothing of it outlives the close."""
+        if self._client is None:
+            return
+        task = self._connect_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+        await self._client.__aexit__(None, None, None)
 
 
 class H1ClientProtocol(_ClientProtocol):

@@ -1,5 +1,6 @@
 //! Hand-written glue: exposes the two vendored synchronous stream modules.
-//! The rest of h2's `proto/streams/*` (the async orchestration) lives in Python.
+//! The rest of h2's `proto/streams/*` (the store + orchestration) is re-expressed
+//! in httpunk's `src/h2/conn.rs` (state) and Python (async machinery).
 
 #![allow(dead_code)]
 
