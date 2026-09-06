@@ -207,16 +207,10 @@ async def _raw_handshake(host, port):
 
 
 async def _read_goaway(transport, codec):
-    """Read frames (acking the server's SETTINGS) until a GOAWAY arrives, or None on EOF."""
-    while True:
-        data = await transport.receive_some(65536)
-        if not data:
-            return None
-        for f in codec.receive(data):
-            if isinstance(f, Settings) and not f.ack:
-                await transport.send_all(codec.serialize_settings_ack())
-            elif isinstance(f, GoAway):
-                return f
+    """Read frames (acking the server's SETTINGS) until a GOAWAY arrives, or None on EOF.
+    Shares `_read_frame`'s leftover buffer: a GOAWAY batched behind an earlier frame is
+    not lost."""
+    return await _read_frame(transport, codec, GoAway)
 
 
 async def _serve_forever(listener):
@@ -227,18 +221,27 @@ async def _serve_forever(listener):
                 await req.respond(200)
 
 
+_leftover_frames = {}  # per raw client codec: frames parsed but not yet consumed
+
+
 async def _read_frame(transport, codec, kind):
     """Read frames (acking the server's SETTINGS) until one of type `kind` arrives,
-    or None on EOF."""
+    or None on EOF. Frames parsed AFTER the match are kept for the next call: the
+    server's write pump batches consecutive frames into one write (HEADERS + DATA
+    arrive in one `receive_some`), and an earlier version of this helper dropped them —
+    a reader then waited forever for a frame it had already received."""
+    pending = _leftover_frames.setdefault(id(codec), [])
     while True:
-        data = await transport.receive_some(65536)
-        if not data:
-            return None
-        for f in codec.receive(data):
+        while pending:
+            f = pending.pop(0)
             if isinstance(f, Settings) and not f.ack:
                 await transport.send_all(codec.serialize_settings_ack())
             elif isinstance(f, kind):
                 return f
+        data = await transport.receive_some(65536)
+        if not data:
+            return None
+        pending.extend(codec.receive(data))
 
 
 @pytest.mark.tonio

@@ -429,7 +429,15 @@ class ServerStreamManager(StreamManager):
         # state transition, so a rejected call leaves the stream untouched and
         # still able to send a valid response.
         self.check_send_headers(hdrs)
-        st.state.send_open(eos=end_stream)  # send response HEADERS
+        try:
+            st.state.send_open(eos=end_stream)  # send response HEADERS
+        except Exception:
+            # The `is_closed()` check above and this transition are two mutex acquisitions:
+            # a reset landing in between (read pump, another thread) fails the transition
+            # with a state error — surface the reset, not the internal error.
+            if st.reset_evt.is_set():
+                raise self._send_stopped_error(st) from None
+            raise
         # Encoded + queued as ONE step under the pump's buffer lock: the HPACK encoder's
         # dynamic table mutates on encode, so encode order MUST equal wire order — two
         # handlers encoding here and then racing for the socket desynchronized the peer's

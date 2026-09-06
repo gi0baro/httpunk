@@ -542,6 +542,10 @@ class ServerConnection(H1ConnectionBase):
             finally:
                 if not done.is_set():
                     scope.cancel()  # leave with the pump gone, whatever ended the wait
+        # The scope exit does not wait for a CANCELLED child to unwind (see the h2 manager's
+        # `_send_async_body`): wait for the pump's own `done`, set in its `finally` after
+        # the producer unwound and the generator was closed.
+        await done.wait()
         if abandoned:
             req._response_done = True
             self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))

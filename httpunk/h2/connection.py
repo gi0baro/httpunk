@@ -114,6 +114,8 @@ class H2ConnectionBase:
         self._transport = transport
         self._settings = settings  # SETTINGS sync (proto/settings.rs)
         self._goaway_replied = False  # sent our acknowledging GOAWAY after a peer GOAWAY (F23)
+        # Makes that flag's check-and-set one step: two threads can reach `_maybe_goaway_reply`.
+        self._goaway_reply_lock = threading.Lock()
 
     # ----- role hooks -----
 
@@ -352,8 +354,14 @@ class H2ConnectionBase:
             # no longer occupy the send buffer): credit each stream back and wake its
             # sender, which re-checks its budget — or the connection error (h2: the
             # connection task's `poll_complete` releases `buffered_send_data`).
-            for st, n in batch.items():
-                st.send_buffered -= n
+            # Under the buffer lock: `enqueue_data` increments `send_buffered` under it, and an
+            # unsynchronized decrement here (free-threaded Python, another worker thread) is a
+            # lost update that leaves the counter permanently high -> the sender waits for
+            # buffer room that never comes. The wake stays outside the lock (a leaf).
+            with self._write_buf_lock:
+                for st, n in batch.items():
+                    st.send_buffered -= n
+            for st in batch:
                 st.window_evt.set()
             if failed is not None:
                 self._fail(failed)
@@ -394,16 +402,20 @@ class H2ConnectionBase:
         followed by a shutdown PING then the real GOAWAY. Reacting to it by stopping the
         pump would skip answering that PING and stall the peer's two-phase graceful
         (h2's `should_close_on_idle` excludes `StreamId::MAX` for the same reason)."""
-        if (
-            self._goaway_replied
-            or self.error is not None
-            or self.streams._goaway is None
-            or self.streams._streams
-            or self.streams._goaway_last_id is None
-            or self.streams._goaway_last_id >= _MAX_STREAM_ID
-        ):
-            return False
-        self._goaway_replied = True
+        # Reachable from the read pump AND from a user task's stream close (`_on_stream_gone`),
+        # on different threads: the check-and-set of `_goaway_replied` must be one step,
+        # or both send a GOAWAY and both `_fail`.
+        with self._goaway_reply_lock:
+            if (
+                self._goaway_replied
+                or self.error is not None
+                or self.streams._goaway is None
+                or self.streams._streams
+                or self.streams._goaway_last_id is None
+                or self.streams._goaway_last_id >= _MAX_STREAM_ID
+            ):
+                return False
+            self._goaway_replied = True
         self.enqueue_frame(self.codec.serialize_go_away(self._goaway_last_stream_id(), int(H2Reason.NO_ERROR)))
         self._fail(ConnectionClosedError("connection closed: GOAWAY exchanged"))
         return True

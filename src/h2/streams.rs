@@ -192,10 +192,21 @@ impl H2StreamState {
         self.inner.lock().unwrap().recv_eof();
     }
 
-    fn send_close(&self) {
-        // h2 panics on an invalid state; the driver only calls this when the
-        // state permits, mirroring h2's own invariant.
-        self.inner.lock().unwrap().send_close();
+    /// Close the send half IF it is still streaming; returns whether it did. The
+    /// check and the transition run under ONE acquisition of the state mutex: the
+    /// read pump's `recv_reset` may move the state on another thread, and a Python
+    /// `is_send_streaming()` check followed by a separate `send_close()` call could
+    /// land on a Closed state — where the vendored `send_close` panics, and with
+    /// `panic = "abort"` that takes the process down. A `false` return is the
+    /// driver's cue to surface the reset instead.
+    fn send_close(&self) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        if state.is_send_streaming() {
+            state.send_close();
+            true
+        } else {
+            false
+        }
     }
 
     #[pyo3(signature = (stream_id, reason, initiator))]

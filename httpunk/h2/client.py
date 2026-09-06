@@ -148,7 +148,14 @@ class ClientStreamManager(StreamManager):
             )
             st.holds_slot = True
             self._streams[stream_id] = st
-            st.state.send_open(eos=end_stream)
+            try:
+                st.state.send_open(eos=end_stream)
+            except Exception:
+                # A reset / connection failure racing this transition (see the server's
+                # `send_response_head`): surface that, not the internal state error.
+                if st.reset_evt.is_set():
+                    raise self._send_stopped_error(st) from None
+                raise
             # Encoded + queued as one step under the pump's buffer lock (HPACK encode order
             # must equal wire order — see the server's `send_response_head`).
             codec = self._conn.codec

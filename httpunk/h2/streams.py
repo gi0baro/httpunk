@@ -269,6 +269,13 @@ class StreamManager:
             finally:
                 if not done.is_set():
                     scope.cancel()  # leave with the pump gone, whatever ended the wait
+        # The scope exit does not wait for a CANCELLED child to unwind (tonio `Scope._exit`
+        # sets the child's join event itself before aborting it; the abort is delivered
+        # asynchronously). The pump sets `done` in its `finally`, after the producer
+        # unwound and the generator was closed — wait for THAT, so the guarantee
+        # "the producer's cleanup ran before this raises" holds (measured: without this
+        # the cleanup landed up to ~200 ms after `respond()` had raised, in ~25% of runs).
+        await done.wait()
         if abandoned:
             raise self._send_stopped_error(st)
         if box:
@@ -297,8 +304,10 @@ class StreamManager:
         transitions the state to Closed, and the vendored `send_close()` PANICS on a
         non-streaming state — with PyO3 `panic = "abort"` that aborts the whole process.
         If the stream died under us, surface the reset instead."""
-        if st.state.is_send_streaming():
-            st.state.send_close()
+        # ONE atomic check-and-transition in Rust: a separate `is_send_streaming()` check
+        # followed by `send_close()` let the read pump's `recv_reset` slip in between on
+        # another thread, and `send_close` on a Closed state panics -> process abort.
+        if st.state.send_close():
             self._close_stream(st)  # may already be recv-closed (fully done)
         else:
             self._close_stream(st)
