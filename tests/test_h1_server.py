@@ -1213,7 +1213,8 @@ async def test_server_half_close_option_ignores_mid_request_fin():
 async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_requests():
     """A request without `Upgrade` has a mid-message read parked, which cannot be handed
     to a caller (one reader per transport) -> `detach()` refuses. An Upgrade request is
-    never watched (a task cannot stand in for hyper's poll there) -> `detach()` works."""
+    not watched before its response head (a task cannot stand in for hyper's poll while
+    a detach / switch is still possible) -> `detach()` works."""
     listener, host, port = await _listener()
     seen = []
 
@@ -1236,12 +1237,13 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
         s.cancel()
     assert len(seen) == 1 and "mid-message read is parked" in seen[0]
 
-    # An Upgrade request is never watched, so `detach()` hands the transport over cleanly.
+    # An Upgrade request is not watched before its head, so `detach()` hands the transport over cleanly.
     stub = _StubTransport(b"GET /ws HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nWSDATA")
     conn = ServerConnection(stub)
     await conn.start()
     req = await conn.next_request()
-    assert conn._watcher_handle is None  # upgrade requests are not watched
+    conn._arm_watcher(req)  # a no-op here: the head is not negotiated yet
+    assert conn._watcher_handle is None
     assert req.detach() == b"WSDATA"
 
 
@@ -1479,3 +1481,154 @@ async def test_server_body_iterable_exception_propagates_as_itself():
     with pytest.raises(AppError):
         await req.respond(200, body=body())
     assert stub.closed
+
+
+# ----- `peer_closed()` always resolves; upgrade requests are watched once answered (R-2, 0.3.0) -----
+
+_UPGRADE_WS = b"GET /ws HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n"
+# What `curl --http2` sends to a plain `http://` URL, and Go's h2c client: served as HTTP/1.1
+# (httpunk implements no h2c upgrade), but hyper's `wants_upgrade` is set all the same.
+_UPGRADE_H2C = (
+    b"GET / HTTP/1.1\r\nhost: x\r\nconnection: Upgrade, HTTP2-Settings\r\nupgrade: h2c\r\n"
+    b"http2-settings: AAMAAABkAAQCAAAAAAIAAAAA\r\n\r\n"
+)
+
+
+@pytest.mark.tonio
+async def test_server_peer_closed_after_response_done_returns_false_at_once():
+    """The mid-message window is closed: hyper no longer polls `mid_message_detect_eof`,
+    so there is nothing to wait for — `peer_closed()` returns `False` immediately instead
+    of parking on an event nobody would ever set."""
+    stub = _StubTransport(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    await req.respond(200, body=b"ok")
+    assert await req.peer_closed() is False
+
+
+@pytest.mark.tonio
+async def test_server_peer_closed_parked_resolves_false_when_the_response_completes():
+    """A `peer_closed()` awaited in one task while another completes the response (the
+    ASGI receive/send split): the window's close wakes it with `False` — it is not left
+    parked forever holding the request."""
+    stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    seen = []
+
+    async def watch():
+        seen.append(await req.peer_closed())
+
+    async with scope() as s:
+        s.spawn(watch())
+        await sleep(0.02)  # the watcher's read is parked on the silent client
+        assert conn._watcher_handle is not None and seen == []
+        await req.respond(200, body=b"ok")
+    assert seen == [False]
+    assert stub.sent.endswith(b"ok")
+    await conn.close()  # the parked read ends with the transport (R-3's path)
+
+
+@pytest.mark.tonio
+async def test_server_peer_closed_resolves_false_under_half_close():
+    """`half_close=True`: hyper does not read mid-message, so a FIN is never observed — but
+    the await still ends with the exchange, reporting `False`."""
+    stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub, half_close=True)
+    await conn.start()
+    req = await conn.next_request()
+    seen = []
+
+    async def watch():
+        seen.append(await req.peer_closed())
+
+    async with scope() as s:
+        s.spawn(watch())
+        await sleep(0.02)
+        assert conn._watcher_handle is None  # no read parked, as hyper
+        await req.respond(200, body=b"ok")
+    assert seen == [False]
+
+
+@pytest.mark.tonio
+async def test_server_h2c_upgrade_request_is_watched_once_answered():
+    """An `Upgrade: h2c` request served as HTTP/1.1: not watched before its head (it might
+    still be detached), watched from the head on — a client hang-up mid-stream fails the
+    streamed `respond()` with `H1IncompleteMessageError` and resolves a racing
+    `peer_closed()` with `True`, exactly as for a plain request (hyper's
+    `mid_message_detect_eof` never looked at `Upgrade`)."""
+    listener, host, port = await _listener()
+    seen, done = [], Event()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                assert req.is_upgrade
+
+                async def watch(req=req):
+                    seen.append(("peer_closed", await req.peer_closed()))
+
+                async def body():
+                    yield b"first"
+                    await Event().wait()
+
+                async with scope() as inner:
+                    inner.spawn(watch())
+                    await sleep(0.02)
+                    assert server._conn._watcher_handle is None  # deferred: no head yet
+                    try:
+                        await req.respond(200, body=body())
+                    except H1IncompleteMessageError:
+                        seen.append("failed")
+                done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        await transport.send_all(_UPGRADE_H2C)
+        data = await _read_until(transport, b"5\r\nfirst\r\n")
+        assert data.startswith(b"HTTP/1.1 200")
+        transport.close()
+        await done.wait()
+        s.cancel()
+    assert sorted(seen, key=str) == [("peer_closed", True), "failed"]
+
+
+@pytest.mark.tonio
+async def test_server_upgrade_request_peer_closed_is_deferred_until_the_head():
+    """Before the head an Upgrade request is unwatched, so `peer_closed()` parks without a
+    read and `detach()` still works — the detach closes the window, resolving it `False`.
+    Answered without a switch instead, the deferred `peer_closed()` arms the read at the
+    head (a bytes body alone would not have), and the exchange resolves it `False`."""
+    stub = _SilentStub(_UPGRADE_WS + b"WSDATA")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    seen = []
+
+    async def watch():
+        seen.append(await req.peer_closed())
+
+    async with scope() as s:
+        s.spawn(watch())
+        await sleep(0.02)
+        assert conn._watcher_handle is None  # no read parked: the transport can still be handed over
+        assert req.detach() == b"WSDATA"
+    assert seen == [False]
+
+    stub = _SilentStub(_UPGRADE_WS)
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    seen = []
+    async with scope() as s:
+        s.spawn(watch())
+        await sleep(0.02)
+        assert conn._watcher_handle is None
+        await req.respond(200, body=b"no switch")  # 200 to an upgrade request: served as plain HTTP/1.1
+        assert conn._watcher_handle is not None  # armed at the head, honouring the earlier `peer_closed()`
+    assert seen == [False]
+    await conn.close()

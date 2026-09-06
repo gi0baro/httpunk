@@ -211,8 +211,12 @@ A reset also fails an in-flight `respond()` / `send_data` with `StreamResetError
 client's reason, including while the body is waiting on the app's next chunk. The HTTP/1 twin
 is `await request.peer_closed()`: once the request body is complete, a client that closes the
 connection before the response is done is detected (hyper's `mid_message_detect_eof`), the
-in-flight `respond()` / `send_data` fail with `ConnectionClosedError`, and the accept loop ends.
-`H1Server(half_close=True)` turns that off, as hyper's `half_close` does.
+in-flight `respond()` / `send_data` fail with `H1IncompleteMessageError`, and the accept loop
+ends. The await resolves either way and never hangs: `True` when the client closed
+mid-request, `False` once the exchange completed (or failed) first, at once if it already had.
+`H1Server(half_close=True)` turns the detection off, as hyper's `half_close` does. A request
+announcing an upgrade (`Upgrade: h2c`, `Upgrade: websocket`, CONNECT) is watched only from its
+response head on, when it can no longer be detached or switched.
 
 When `respond()` fails this way while streaming an async body, the failure is raised at once
 even if the body is parked waiting for its next chunk: the producer is cancelled at that
