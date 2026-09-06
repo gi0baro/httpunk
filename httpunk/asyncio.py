@@ -129,8 +129,7 @@ class _ServerProtocol(_AsyncioStream):
                 await request.reset()
 
     async def handle(self, request: Any) -> None:
-        """Override: produce the response for `request` via `request.respond(...)`.
-        This is where uvicorn/hypercorn bridge to ASGI."""
+        """Override: produce the response for `request` via `request.respond(...)`."""
         raise NotImplementedError("subclass must implement `async def handle(self, request)`")
 
     # ----- host-coordinated graceful shutdown -----

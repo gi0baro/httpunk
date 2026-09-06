@@ -110,16 +110,43 @@ class _SilentStub(_StubTransport):
     def __init__(self, data):
         super().__init__(data)
         self._closed_evt = Event()
+        self.parked = Event()  # a read is parked on the silent client (the watcher's)
 
     async def receive_some(self, max_bytes=65536):
         if self._data:
             return await super().receive_some(max_bytes)
+        self.parked.set()
         await self._closed_evt.wait()
         return b""
 
     def close(self):
         super().close()
         self._closed_evt.set()
+
+
+class _ReadSpy:
+    """A real transport, with a hook on `receive_some` ENTRY: `expect_read()` hands back an
+    event set by the next read issued after the call — the deterministic "the watcher's
+    read is parked" point for tests that need it (between a parsed head and the arm no
+    other read is issued, so the next entry IS the watcher's, at the runtime boundary).
+    Everything else (`send_all`, `close`, `socket`) is the wrapped transport's."""
+
+    def __init__(self, transport):
+        self._transport = transport
+        self._expected = None
+
+    def expect_read(self):
+        self._expected = Event()
+        return self._expected
+
+    async def receive_some(self, max_bytes=65536):
+        expected, self._expected = self._expected, None
+        if expected is not None:
+            expected.set()
+        return await self._transport.receive_some(max_bytes)
+
+    def __getattr__(self, name):
+        return getattr(self._transport, name)
 
 
 async def _echo_server(listener, seen=None):
@@ -640,7 +667,7 @@ async def test_server_oversized_head_rejected_with_431():
     assert stub.closed
 
 
-# ----- hyper `http1::Builder` options (FR-5 parity pass) -----
+# ----- hyper `http1::Builder` options -----
 
 
 @pytest.mark.tonio
@@ -772,7 +799,7 @@ def test_response_date_is_refreshed_at_encode_time_per_thread():
     assert delta.total_seconds() >= 1
 
 
-# ----- push-style responses: `send_response` -> `SendStream` (FR-3) -----
+# ----- push-style responses: `send_response` -> `SendStream` -----
 
 
 @pytest.mark.tonio
@@ -945,7 +972,7 @@ async def test_server_next_request_refuses_while_push_body_is_open():
     assert nxt is not None and nxt.target == "/b"
 
 
-# ----- response trailers (FR-6) -----
+# ----- response trailers -----
 
 
 @pytest.mark.tonio
@@ -1037,7 +1064,7 @@ async def test_server_respond_trailers_dropped_on_http10():
             s.cancel()
 
 
-# ----- mid-message peer EOF (FR-2; hyper conn.rs `mid_message_detect_eof`) -----
+# ----- mid-message peer EOF (hyper conn.rs `mid_message_detect_eof`) -----
 
 
 @pytest.mark.tonio
@@ -1483,7 +1510,7 @@ async def test_server_body_iterable_exception_propagates_as_itself():
     assert stub.closed
 
 
-# ----- `peer_closed()` always resolves; upgrade requests are watched once answered (R-2, 0.3.0) -----
+# ----- `peer_closed()` always resolves; upgrade requests are watched once answered -----
 
 _UPGRADE_WS = b"GET /ws HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n"
 # What `curl --http2` sends to a plain `http://` URL, and Go's h2c client: served as HTTP/1.1
@@ -1509,9 +1536,8 @@ async def test_server_peer_closed_after_response_done_returns_false_at_once():
 
 @pytest.mark.tonio
 async def test_server_peer_closed_parked_resolves_false_when_the_response_completes():
-    """A `peer_closed()` awaited in one task while another completes the response (the
-    ASGI receive/send split): the window's close wakes it with `False` — it is not left
-    parked forever holding the request."""
+    """A `peer_closed()` awaited in one task while another completes the response:
+    the window's close wakes it with `False` — it is not left parked forever holding the request."""
     stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
     conn = ServerConnection(stub)
     await conn.start()
@@ -1523,33 +1549,37 @@ async def test_server_peer_closed_parked_resolves_false_when_the_response_comple
 
     async with scope() as s:
         s.spawn(watch())
-        await sleep(0.02)  # the watcher's read is parked on the silent client
-        assert conn._watcher_handle is not None and seen == []
+        await stub.parked.wait()  # the watcher's read is parked on the silent client
+        assert seen == []
         await req.respond(200, body=b"ok")
     assert seen == [False]
     assert stub.sent.endswith(b"ok")
-    await conn.close()  # the parked read ends with the transport (R-3's path)
+    await conn.close()  # the parked read ends with the transport (the server-side close path below)
 
 
 @pytest.mark.tonio
 async def test_server_peer_closed_resolves_false_under_half_close():
     """`half_close=True`: hyper does not read mid-message, so a FIN is never observed — but
-    the await still ends with the exchange, reporting `False`."""
+    the await still ends with the exchange, reporting `False`. There is no read to wait
+    on here, so the `peer_closed()` task and the response run in whichever order the
+    scheduler picks; both orders (parked then woken, or returned at once) must give the
+    same verdict, and neither parks a read."""
     stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
     conn = ServerConnection(stub, half_close=True)
     await conn.start()
     req = await conn.next_request()
-    seen = []
+    seen, started = [], Event()
 
     async def watch():
+        started.set()
         seen.append(await req.peer_closed())
 
     async with scope() as s:
         s.spawn(watch())
-        await sleep(0.02)
-        assert conn._watcher_handle is None  # no read parked, as hyper
+        await started.wait()
         await req.respond(200, body=b"ok")
     assert seen == [False]
+    assert conn._watcher_handle is None and not stub.parked.is_set()  # no read parked, as hyper
 
 
 @pytest.mark.tonio
@@ -1576,9 +1606,9 @@ async def test_server_h2c_upgrade_request_is_watched_once_answered():
                     await Event().wait()
 
                 async with scope() as inner:
+                    server._conn._arm_watcher(req)  # `peer_closed()`'s arm, synchronously: deferred, no head yet
+                    assert server._conn._watcher_handle is None
                     inner.spawn(watch())
-                    await sleep(0.02)
-                    assert server._conn._watcher_handle is None  # deferred: no head yet
                     try:
                         await req.respond(200, body=body())
                     except H1IncompleteMessageError:
@@ -1612,10 +1642,10 @@ async def test_server_upgrade_request_peer_closed_is_deferred_until_the_head():
     async def watch():
         seen.append(await req.peer_closed())
 
+    conn._arm_watcher(req)  # `peer_closed()`'s arm, synchronously
+    assert conn._watcher_handle is None  # no read parked: the transport can still be handed over
     async with scope() as s:
-        s.spawn(watch())
-        await sleep(0.02)
-        assert conn._watcher_handle is None  # no read parked: the transport can still be handed over
+        s.spawn(watch())  # parks (or, if it runs after the detach, returns at once): `False` either way
         assert req.detach() == b"WSDATA"
     assert seen == [False]
 
@@ -1624,11 +1654,63 @@ async def test_server_upgrade_request_peer_closed_is_deferred_until_the_head():
     await conn.start()
     req = await conn.next_request()
     seen = []
+    conn._arm_watcher(req)  # the ask is recorded (`_watch_wanted`), nothing parked yet
+    assert conn._watcher_handle is None
     async with scope() as s:
         s.spawn(watch())
-        await sleep(0.02)
-        assert conn._watcher_handle is None
         await req.respond(200, body=b"no switch")  # 200 to an upgrade request: served as plain HTTP/1.1
-        assert conn._watcher_handle is not None  # armed at the head, honouring the earlier `peer_closed()`
+        await stub.parked.wait()  # armed at the head, honouring the earlier ask; its read is parked
     assert seen == [False]
     await conn.close()
+
+
+# ----- server-side close with the watcher parked -----
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize("arm", ["push", "peer_closed"])
+async def test_server_close_with_watcher_parked_on_silent_client(arm):
+    """The order no other watcher test covers: the SERVER closes while its mid-message
+    read is parked on a silent client — a host's forced close after a graceful-shutdown
+    timeout, with the app still mid-response. `ServerConnection.close()` closes the
+    transport and then JOINS the watcher (never cancels it), relying on the close waking
+    the parked `receive_some` (tonio `io_deregister` re-dispatches the parked reader).
+    The `async with` exit must return, a `peer_closed()` parked on that watcher resolves
+    (`True`: the read ended without a response), and the client sees EOF."""
+    listener, host, port = await _listener()
+    seen, exited = [], Event()
+
+    async def serve():
+        transport = _ReadSpy(await listener.accept())
+        async with scope() as inner:
+            async with H1Server(transport) as server:
+                req = await server.accept()
+                parked = transport.expect_read()  # the next read issued is the watcher's
+                if arm == "push":
+                    stream = await req.send_response(200)  # a push response arms the watcher
+                    await stream.send_data(b"tick")
+                else:
+                    inner.spawn(_watch(req, seen))  # `peer_closed()` arms it
+                await parked.wait()
+                seen.append("exiting")
+                # leave with the exchange unfinished and the client silent: `close()`
+        seen.append("exited")
+        exited.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+            if arm == "push":
+                await _read_until(transport, b"4\r\ntick\r\n")
+            await exited.wait()  # would hit the conftest deadline if the join never returned
+            assert await _drain_all(transport) == b""  # EOF (or RST) — the server is gone
+        finally:
+            transport.close()
+            s.cancel()
+    assert seen == ["exiting", "exited"] if arm == "push" else ["exiting", True, "exited"]
+
+
+async def _watch(req, seen):
+    seen.append(await req.peer_closed())

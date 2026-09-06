@@ -65,8 +65,7 @@ class TonioBackend:
         """A synchronous, non-blocking read: whatever bytes are immediately
         available without suspending, `b""` at EOF, or `None` if nothing is ready
         right now. The readiness primitive hyper's server drain (`poll_read_body`
-        inside `poll_drain_or_close_read`) relies on. EOF and not-ready are distinct
-        (the seam contract `tonio/NOTES_WAIT_READABLE.md` asks for).
+        inside `poll_drain_or_close_read`) relies on. EOF and not-ready are distinct.
 
         - **Plain socket**: tonio's sockets are non-blocking under the hood (its own
           `recv` does exactly this `_sock.recv` inline before ever suspending), so

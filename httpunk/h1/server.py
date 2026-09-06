@@ -199,8 +199,8 @@ class ServerRequest:
         """Wait for the end of this request's mid-message window and report how it ended:
         `True` = the client closed its side (a FIN mid-request, or a transport error)
         while the response was still being produced — the signal a long-running or
-        streaming handler races against its own completion to stop early (ASGI
-        `http.disconnect`); `False` = the exchange completed (or failed) first. Returns
+        streaming handler races against its own completion to stop early;
+        `False` = the exchange completed (or failed) first. Returns
         `False` at once when awaited after the response is done. Never hangs: the window
         hyper polls `mid_message_detect_eof` over is finite, so is this await.
 
@@ -317,7 +317,7 @@ class SendStream:
         """Write one body chunk; `end_stream=True` finishes the body (the chunked
         terminator for a chunked body). On a bodyless framing (HEAD / 204 / 304 — the
         encoder `body_is_eof`) chunks are DISCARDED, not an error: hyper never polls the
-        body then, so an app that produces one anyway (ASGI allows it) is harmless.
+        body then, so an app that produces one anyway is harmless.
         Fails with `ConnectionClosedError` once the client closed its side mid-request
         (hyper: the connection errored with `IncompleteMessage`, nothing more is written)."""
         self._check_open()

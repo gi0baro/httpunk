@@ -25,7 +25,7 @@ from httpunk.util.graceful import GracefulShutdown
 pytestmark = pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.TaskGroup is 3.11+")
 
 
-async def _listen(*, ssl_ctx=None):
+async def _listen(*, ssl_ctx=None, stream_cls=_AsyncioStream):
     """Listen on loopback; hand back the first accepted connection as our
     `_AsyncioStream` (via a capturing `create_server` factory). Returns
     `(host, port, accept_coro, listener)`. The stream is enqueued from
@@ -35,7 +35,7 @@ async def _listen(*, ssl_ctx=None):
     loop = asyncio.get_running_loop()
     incoming = asyncio.Queue()
 
-    class _Captured(_AsyncioStream):
+    class _Captured(stream_cls):
         def connection_made(self, transport):
             super().connection_made(transport)
             incoming.put_nowait(self)
@@ -60,6 +60,24 @@ async def _run_server(handler, make_server, *, ssl_ctx=None):
             listener.close()
 
     return host, port, serve
+
+
+class _ReadSpyStream(_AsyncioStream):
+    """`_AsyncioStream` with a hook on `receive_some` ENTRY: `expect_read()` hands back an
+    event set by the next read issued after the call — the deterministic "the watcher's
+    read is parked" point (see test_h1_server.py's `_ReadSpy`)."""
+
+    _expected = None
+
+    def expect_read(self):
+        self._expected = asyncio.Event()
+        return self._expected
+
+    async def receive_some(self, max_bytes=65536):
+        expected, self._expected = self._expected, None
+        if expected is not None:
+            expected.set()
+        return await super().receive_some(max_bytes)
 
 
 async def _echo_path(req):
@@ -138,6 +156,49 @@ async def test_h1_idle_fin_closes_connection_promptly():
             with pytest.raises(HTTPunkError) as excinfo:
                 await conn.request("GET", "/b", headers={"host": host})
             assert getattr(excinfo.value, "request_unsent", False) is True
+
+
+@pytest.mark.asyncio
+async def test_h1_server_close_with_watcher_parked_on_silent_client():
+    """The asyncio twin of test_h1_server.py's server-side close: the server exits its
+    `async with` while the mid-message watcher (armed by a push response) is parked on a
+    silent client. `ServerConnection.close()` closes the transport then joins the
+    watcher — the local close must wake the parked `_AsyncioStream` read — and the
+    client sees EOF."""
+    backend = AsyncioBackend()
+    host, port, accept, listener = await _listen(stream_cls=_ReadSpyStream)
+    exited = asyncio.Event()
+
+    async def serve():
+        try:
+            transport = await accept()
+            server = H1Server(transport, backend=backend)
+            async with server:
+                req = await server.accept()
+                parked = transport.expect_read()  # the next read issued is the watcher's
+                stream = await req.send_response(200)  # arms the watcher
+                await stream.send_data(b"tick")
+                await parked.wait()
+            exited.set()
+        finally:
+            listener.close()
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(serve())
+        transport = await backend.connect_tcp(host, port)
+        await transport.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        buf = b""
+        while b"4\r\ntick\r\n" not in buf:
+            buf += await transport.receive_some(65536)
+        await asyncio.wait_for(exited.wait(), 5)  # the exit returned: the join ended
+        rest = b""
+        try:
+            while chunk := await transport.receive_some(65536):
+                rest += chunk
+        except ConnectionError:
+            pass  # an abortive close (RST) counts as closed too
+        assert rest == b""
+        transport.close()
 
 
 @pytest.mark.asyncio

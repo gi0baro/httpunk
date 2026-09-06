@@ -615,7 +615,7 @@ async def test_server_respond_with_trailers():
     assert len(rejected) == 1
 
 
-# ----- post-END_STREAM reset observation (FR-1; h2 `poll_reset` / `ensure_reason`) -----
+# ----- post-END_STREAM reset observation (h2 `poll_reset` / `ensure_reason`) -----
 
 
 @pytest.mark.tonio

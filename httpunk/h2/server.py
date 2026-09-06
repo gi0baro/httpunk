@@ -164,8 +164,8 @@ class ServerRequest:
         common case (a GET, or a fully uploaded body): the body reader saw a complete
         message, and only this tells the handler the client is gone. Never resolves for a
         request that completes normally (hyper's `poll_reset` stays Pending), so a host
-        races it against its own completion (ASGI `http.disconnect`). If the connection
-        died with no reason (transport error / EOF) the connection error is raised."""
+        races it against its own completion. If the connection died with no reason
+        (transport error / EOF) the connection error is raised."""
         st = self._stream
         await st.reset_evt.wait()
         if st.reset_reason is not None:
