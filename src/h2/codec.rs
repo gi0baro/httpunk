@@ -9,16 +9,19 @@
 //! can never be observed; in debug a poisoned lock surfaces as a clean panic.)
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use http::header::{CONTENT_LENGTH, DATE, HeaderValue};
 use http::{Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Mutex;
 
-use super::errors::{H2ProtocolError, user_payload_too_big};
+use super::errors::{H2ProtocolError, map_user_err, user_payload_too_big};
 use crate::http::HeaderMap;
+use vendor_h2::codec::UserError;
 use vendor_h2::frame::{self, HEADER_LEN, Head, Kind};
 use vendor_h2::hpack;
+use vendor_hyper::{H2_PREFACE, date_header_value};
 
 /// Default HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE, RFC 7540 §6.5.2).
 const DEFAULT_HEADER_TABLE_SIZE: usize = 4096;
@@ -153,6 +156,17 @@ struct Partial {
 fn headers_event(py: Python<'_>, h: frame::Headers) -> PyResult<Py<PyAny>> {
     let stream_id = u32::from(h.stream_id());
     let end_stream = h.is_end_stream();
+    let is_informational = h.is_informational();
+    // h2 recv.rs `recv_headers` (L157-175): the FIRST `content-length` value, via
+    // `frame::parse_u64` (ASCII digits only, > 19 digits rejected outright); a value
+    // that does not parse is a stream PROTOCOL_ERROR — flagged for the driver.
+    let (content_length, content_length_invalid) = match h.fields().get(CONTENT_LENGTH) {
+        None => (None, false),
+        Some(v) => match frame::parse_u64(v.as_bytes()) {
+            Ok(n) => (Some(n), false),
+            Err(_) => (None, true),
+        },
+    };
     let (pseudo, fields) = h.into_parts();
     // The decoded frame already owns an `http::HeaderMap`; wrap it directly.
     let headers = Py::new(py, HeaderMap::from_inner(fields))?;
@@ -168,6 +182,9 @@ fn headers_event(py: Python<'_>, h: frame::Headers) -> PyResult<Py<PyAny>> {
             path: pseudo.path.map(|s| s.as_str().to_string()),
             status: pseudo.status.map(|s| s.as_u16()),
             headers,
+            content_length,
+            content_length_invalid,
+            is_informational,
         },
     )?
     .into_any())
@@ -196,6 +213,16 @@ pub struct Headers {
     /// Regular header fields as a `httpunk.http.HeaderMap`.
     #[pyo3(get)]
     pub headers: Py<HeaderMap>,
+    /// The first `content-length` value, parsed as h2's `recv_headers` does
+    /// (`frame::parse_u64`); `None` when absent or unparsable.
+    #[pyo3(get)]
+    pub content_length: Option<u64>,
+    /// A `content-length` was present but did not parse — h2: stream PROTOCOL_ERROR.
+    #[pyo3(get)]
+    pub content_length_invalid: bool,
+    /// A 1xx response head (h2 `frame::Headers::is_informational`).
+    #[pyo3(get)]
+    pub is_informational: bool,
 }
 
 #[pymethods]
@@ -224,6 +251,11 @@ pub struct Data {
     /// driver must account windows on this, not `len(data)` (h2 recv.rs L643).
     #[pyo3(get)]
     pub flow_controlled_len: usize,
+    /// The flow-controlled overhead the app never sees: `flow_controlled_len` minus the
+    /// payload (the padding + its length byte, 0 when unpadded) — what h2's `recv_data`
+    /// releases back to the windows on the app's behalf (recv.rs L740-750).
+    #[pyo3(get)]
+    pub padding: usize,
 }
 
 #[pymethods]
@@ -331,6 +363,9 @@ struct Codec {
     /// SETTINGS_MAX_FRAME_SIZE; updated when our own SETTINGS is ACKed). h2
     /// rejects an over-size declared length with GOAWAY(FRAME_SIZE_ERROR) before
     /// buffering the payload (framed_read.rs / LengthDelimitedCodec).
+    /// Server side: the client connection preface being matched (`feed_preface`),
+    /// `None` once matched — h2 server.rs `Handshaking::ReadPreface`.
+    preface_buf: Option<BytesMut>,
     max_recv_frame_size: usize,
     /// Peer's advertised SETTINGS_MAX_FRAME_SIZE — the per-frame budget when we
     /// serialize (HEADERS/CONTINUATION splitting, DATA size check).
@@ -369,6 +404,7 @@ impl H2Codec {
                     DEFAULT_MAX_HEADER_LIST_SIZE,
                     DEFAULT_MAX_FRAME_SIZE,
                 ),
+                preface_buf: None,
                 max_recv_frame_size: DEFAULT_MAX_FRAME_SIZE,
                 send_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
                 partial: None,
@@ -415,6 +451,81 @@ impl H2Codec {
     /// Number of bytes currently buffered awaiting a complete frame.
     fn buffered(&self) -> usize {
         self.inner.lock().unwrap().buf.len()
+    }
+
+    /// Feed bytes of the client connection preface (RFC 9113 §3.4) — h2 server.rs
+    /// L1427-1441: `None` while the bytes so far match but the 24 are not all in yet,
+    /// `Some(True)` once the whole preface matched (any bytes past it are already in
+    /// the frame buffer: `receive(b"")` decodes them), `Some(False)` on a mismatch
+    /// (h2: "read_preface: invalid preface" -> PROTOCOL_ERROR).
+    fn feed_preface(&self, data: &[u8]) -> Option<bool> {
+        let mut c = self.inner.lock().unwrap();
+        let buf = c.preface_buf.get_or_insert_with(BytesMut::new);
+        buf.extend_from_slice(data);
+        let n = buf.len().min(H2_PREFACE.len());
+        if buf[..n] != H2_PREFACE[..n] {
+            return Some(false);
+        }
+        if buf.len() < H2_PREFACE.len() {
+            return None;
+        }
+        let mut full = c.preface_buf.take().unwrap_or_default();
+        let rest = full.split_off(H2_PREFACE.len());
+        c.buf.extend_from_slice(&rest);
+        Some(true)
+    }
+
+    /// Classify a prefix of a connection's first bytes against the client preface —
+    /// hyper-util `server::conn::auto` `read_version`: `None` = matches so far but
+    /// incomplete, `Some(True)` = the full preface, `Some(False)` = diverged (HTTP/1).
+    #[staticmethod]
+    fn match_preface(data: &[u8]) -> Option<bool> {
+        let n = data.len().min(H2_PREFACE.len());
+        if data[..n] != H2_PREFACE[..n] {
+            return Some(false);
+        }
+        if data.len() < H2_PREFACE.len() {
+            return None;
+        }
+        Some(true)
+    }
+
+    /// h2 send.rs `check_headers` (RFC 9113 §8.2.2): connection-specific fields in an
+    /// outbound HEADERS block, and a `te` other than exactly `trailers`, are
+    /// `UserError::MalformedHeaders` (`H2UserError`). A caller error, not a protocol
+    /// one: the connection and stream stay usable.
+    #[staticmethod]
+    fn check_send_headers(headers: &HeaderMap) -> PyResult<()> {
+        headers.with_inner(|fields| {
+            if fields.contains_key(http::header::CONNECTION)
+                || fields.contains_key(http::header::TRANSFER_ENCODING)
+                || fields.contains_key(http::header::UPGRADE)
+                || fields.contains_key("keep-alive")
+                || fields.contains_key("proxy-connection")
+            {
+                return Err(map_user_err(UserError::MalformedHeaders));
+            }
+            if fields
+                .get(http::header::TE)
+                .is_some_and(|te| te != "trailers")
+            {
+                return Err(map_user_err(UserError::MalformedHeaders));
+            }
+            Ok(())
+        })
+    }
+
+    /// `method == Method::HEAD` on the parsed `http::Method` (hyper proto/h2/client.rs
+    /// `is_head`): case-sensitive, as HTTP methods are.
+    #[staticmethod]
+    fn method_is_head(method: &str) -> bool {
+        Method::from_bytes(method.as_bytes()).is_ok_and(|m| m == Method::HEAD)
+    }
+
+    /// h2 `StreamId::is_client_initiated` (odd ids).
+    #[staticmethod]
+    fn is_client_initiated(stream_id: u32) -> bool {
+        frame::StreamId::from(stream_id).is_client_initiated()
     }
 
     // ===== settings application (HPACK table sizes) =================
@@ -528,19 +639,42 @@ impl H2Codec {
         PyBytes::new(py, &dst).unbind()
     }
 
-    #[pyo3(signature = (stream_id, method, url, headers=None, end_stream=false))]
+    #[pyo3(signature = (stream_id, method, target, headers=None, end_stream=false, *, scheme=None, authority=None))]
+    #[allow(clippy::too_many_arguments)] // the request's URI parts, as hyper's h2 client takes them
     fn serialize_request_headers(
         &self,
         py: Python<'_>,
         stream_id: u32,
         method: &str,
-        url: &str,
+        target: &str,
         headers: Option<&HeaderMap>,
         end_stream: bool,
+        scheme: Option<&str>,
+        authority: Option<&str>,
     ) -> PyResult<Py<PyBytes>> {
         let method =
             Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
-        let uri: Uri = url.parse().map_err(|e| value_err("invalid url", e))?;
+        // The request-target as `http::Uri` sees it: absolute-form carries its own
+        // scheme + authority; origin-form (a bare path) takes the connection's, which
+        // hyper's h2 client fills in the same way (proto/h2/client.rs, the `:scheme` /
+        // `:authority` pseudo-headers come from the request's URI parts).
+        let uri: Uri = target.parse().map_err(|e| value_err("invalid url", e))?;
+        let uri = if uri.scheme().is_some() && uri.authority().is_some() {
+            uri
+        } else {
+            let (Some(scheme), Some(authority)) = (scheme, authority) else {
+                return Err(PyValueError::new_err(
+                    "request target is a bare path but the connection has no authority; \
+                     pass authority=... to H2Connection or use an absolute-URL target",
+                ));
+            };
+            Uri::builder()
+                .scheme(scheme)
+                .authority(authority)
+                .path_and_query(target)
+                .build()
+                .map_err(|e| value_err("invalid url", e))?
+        };
         let pseudo = frame::Pseudo::request(method, uri, None);
         let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
         let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
@@ -555,7 +689,7 @@ impl H2Codec {
         Ok(PyBytes::new(py, &dst).unbind())
     }
 
-    #[pyo3(signature = (stream_id, status, headers=None, end_stream=false))]
+    #[pyo3(signature = (stream_id, status, headers=None, end_stream=false, auto_date=false))]
     fn serialize_response_headers(
         &self,
         py: Python<'_>,
@@ -563,10 +697,19 @@ impl H2Codec {
         status: u16,
         headers: Option<&HeaderMap>,
         end_stream: bool,
+        auto_date: bool,
     ) -> PyResult<Py<PyBytes>> {
         let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
         let pseudo = frame::Pseudo::response(status);
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let mut fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        if auto_date {
+            // hyper proto/h2/server.rs L484: `entry(DATE).or_insert_with(date::
+            // update_and_header_value)` — the same cached value the h1 encoder writes.
+            fields.entry(DATE).or_insert_with(|| {
+                HeaderValue::from_bytes(&date_header_value())
+                    .expect("IMF-fixdate is a valid header value")
+            });
+        }
         let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
         // A bodyless response carries END_STREAM on HEADERS (e.g. a HEAD response,
         // 204/304), rather than a trailing empty DATA frame.
@@ -828,6 +971,7 @@ impl Codec {
                         stream_id: u32::from(d.stream_id()),
                         end_stream: d.is_end_stream(),
                         flow_controlled_len: d.flow_controlled_len(),
+                        padding: d.flow_controlled_len() - d.payload().len(),
                         data: PyBytes::new(py, d.payload().as_ref()).unbind(),
                     },
                 )?

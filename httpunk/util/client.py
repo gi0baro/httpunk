@@ -9,9 +9,9 @@ fidelity constraint; the reference is hyper-util's non-legacy behavior/shape.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
 
 from .. import _backend
+from .._httpunk import uri_parts
 from ..h1.client import H1Connection
 from ..h2.client import H2Connection
 
@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_ALPN = ("h2", "http/1.1")
-_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 async def connect(
@@ -46,15 +45,13 @@ async def connect(
     a pool / friendly client builds on (§11.6).
     """
     backend = _backend.resolve(backend)
-    parts = urlsplit(url)
-    scheme = parts.scheme
-    if scheme not in _DEFAULT_PORTS:
+    # The `http` crate's `Uri` (what hyper parses every target with) splits the
+    # destination — an IPv6 host keeps its brackets, the scheme supplies the default port.
+    scheme, host, port, authority = uri_parts(url)
+    if scheme not in ("http", "https"):
         raise ValueError(f"unsupported scheme {scheme!r} (expected 'http' or 'https')")
-    host = parts.hostname
     if host is None:
         raise ValueError(f"no host in URL {url!r}")
-    port = parts.port or _DEFAULT_PORTS[scheme]
-    authority = f"{host}:{port}"
 
     if scheme == "https":
         stream, selected = await backend.connect_tls(host, port, alpn=alpn, ssl_context=ssl_context)

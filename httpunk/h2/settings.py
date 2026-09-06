@@ -15,13 +15,14 @@ vendored version — see src/h2/UPSTREAM_VERSION), path relative to its `src/`.
 
 from enum import Enum
 
-from .._httpunk import H2ProtocolError, H2Reason as Reason, H2UserError
-
-
-# RFC 7540 §6.5.2 defaults.
-DEFAULT_HEADER_TABLE_SIZE = 4096
-DEFAULT_INITIAL_WINDOW_SIZE = 65_535
-DEFAULT_MAX_FRAME_SIZE = 16_384
+from .._httpunk import (
+    H2_DEFAULT_HEADER_TABLE_SIZE as DEFAULT_HEADER_TABLE_SIZE,
+    H2_DEFAULT_INITIAL_WINDOW_SIZE as DEFAULT_INITIAL_WINDOW_SIZE,
+    H2_DEFAULT_MAX_FRAME_SIZE as DEFAULT_MAX_FRAME_SIZE,
+    H2ProtocolError,
+    H2Reason as Reason,
+    H2UserError,
+)
 
 
 class _Local(Enum):

@@ -163,7 +163,9 @@ async with await conn.request("GET", "/big") as resp:
 
 `body` may be `bytes`, or a sync/async iterable of `bytes` (streamed as it is produced).
 `trailers` are header fields sent after the body — chunked trailers on HTTP/1, a trailing
-`HEADERS` frame on HTTP/2:
+`HEADERS` frame on HTTP/2. As in hyper, HTTP/1 trailers ride only on a chunked body (a
+streamed one; a `bytes` body is `Content-Length`-framed and drops them) and only the fields
+the request's own `Trailer` header declares are sent — undeclared ones are dropped:
 
 ```python
 async def chunks():
@@ -172,7 +174,7 @@ async def chunks():
 
 resp = await conn.request(
     "POST", "/upload",
-    headers={"host": "example.com", "content-type": "application/octet-stream"},
+    headers={"host": "example.com", "content-type": "application/octet-stream", "trailer": "x-checksum"},
     body=chunks(),
     trailers={"x-checksum": "..."},
 )
@@ -201,9 +203,10 @@ async with H1Server(transport, backend=Backend.asyncio) as server:
 Each `request` carries `method`, `target`/`path`, `headers`, `version`, and a streamable body
 (`request.read()` / `request.aiter_bytes()`). Answer it with `request.respond(status, *,
 headers=None, body=None, trailers=None)` — `trailers` are sent after the body (HTTP/1.1
-chunked trailers, declared in a `Trailer` header; an HTTP/2 trailing HEADERS frame), like the
-client's `Request.trailers`. On HTTP/1.1 they go out only if the request declared
-`TE: trailers`; otherwise they are dropped and the body ends normally, as hyper's server does.
+chunked trailers; an HTTP/2 trailing HEADERS frame), like the client's `Request.trailers` and
+under hyper's rules: on HTTP/1.1 they need a chunked (streamed) body and a `Trailer` header
+declaring the fields, and go out only if the request declared `TE: trailers`; otherwise they
+are dropped and the body ends normally, as hyper's server does.
 On HTTP/2 you can also abort a single stream with `request.reset()` instead of responding
 (e.g. when a handler fails) — the connection and its other streams keep running — and
 `await request.reset_received()` resolves with the reason

@@ -125,9 +125,9 @@ class H1ResponseBody:
         silently dropping them and reusing a corrupted stream (was G35)."""
         if self._released:
             return
-        leftover = self._decoder.take_buffered()
+        leftover = self._decoder.buffered
         if leftover:
-            self._driver.poison_unexpected(len(leftover))
+            self._driver.poison_unexpected(leftover)
             await self._release(keep_alive=False)
         else:
             await self._release()

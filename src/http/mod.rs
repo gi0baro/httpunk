@@ -9,6 +9,7 @@
 //! never be observed.)
 
 use http::HeaderMap as HttpHeaderMap;
+use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -294,8 +295,38 @@ fn http_date(py: Python<'_>) -> Py<PyBytes> {
     PyBytes::new(py, &vendor_hyper::date_header_value()).unbind()
 }
 
+/// Split a URL into `(scheme, host, port, authority)` with the `http` crate's `Uri`
+/// — the parser hyper uses for every request target (`src/h1/codec.rs`,
+/// `src/h2/codec.rs`), so the util layer's destination handling agrees with it.
+/// `host` is the host to DIAL: an IPv6 literal without its brackets, as hyper-util's
+/// connector strips them (`client/legacy/connect/http.rs`, `trim_matches`); `port`
+/// is the explicit port, else the scheme's default (http/ws 80, https/wss 443); and
+/// `authority` is `Uri::host` (brackets kept) + `:port` — httpunk's `:authority` /
+/// `Host` form. A `None` host or unknown scheme leaves the dependent parts `None`.
+#[pyfunction]
+fn uri_parts(url: &str) -> PyResult<(Option<String>, Option<String>, Option<u16>, Option<String>)> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|e| PyValueError::new_err(format!("invalid url {url:?}: {e}")))?;
+    let scheme = uri.scheme_str().map(str::to_owned);
+    let port = uri.port_u16().or(match uri.scheme_str() {
+        Some("http" | "ws") => Some(80),
+        Some("https" | "wss") => Some(443),
+        _ => None,
+    });
+    let authority = match (uri.host(), port) {
+        (Some(h), Some(p)) => Some(format!("{h}:{p}")),
+        _ => None,
+    };
+    let host = uri
+        .host()
+        .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_owned());
+    Ok((scheme, host, port, authority))
+}
+
 pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<HeaderMap>()?;
     m.add_function(wrap_pyfunction!(http_date, m)?)?;
+    m.add_function(wrap_pyfunction!(uri_parts, m)?)?;
     Ok(())
 }

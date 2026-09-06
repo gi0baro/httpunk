@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .._httpunk import H2Codec
 from ..h1.server import H1Server
 from ..h2.connection import PREFACE
 from ..h2.server import H2Server
@@ -130,7 +131,7 @@ class Builder:
 
         # Peek up to the full preface, stopping early the moment the bytes diverge
         # from it (→ definitely h1) or the peer stops sending (EOF).
-        buf = b""
+        buf, matched = b"", None
         while len(buf) < len(PREFACE):
             chunk = await _sniff_read(transport, len(PREFACE) - len(buf), self._backend, cancel)
             if chunk is _CANCELLED:
@@ -138,11 +139,12 @@ class Builder:
             if not chunk:
                 break  # EOF before a full preface -> treat as h1 (a truncated request)
             buf += chunk
-            if not PREFACE.startswith(buf):
-                break  # diverged from the h2 preface -> h1
+            matched = H2Codec.match_preface(buf)  # hyper-util `read_version`, in the Rust core
+            if matched is not None:
+                break  # the full preface (-> h2), or diverged from it (-> h1)
 
         prewound = _PrewoundTransport(transport, buf)
-        if buf == PREFACE:
+        if matched:
             return self._build_h2(prewound)
         return self._build_h1(prewound)
 

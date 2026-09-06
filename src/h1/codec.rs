@@ -9,7 +9,7 @@
 //! body decode (`H1BodyDecoder`) — is all Rust, over the vendored hyper core.
 
 use bytes::BytesMut;
-use http::{HeaderName, Method, StatusCode, Uri};
+use http::{Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -18,8 +18,9 @@ use std::sync::Mutex;
 use super::errors::map_hyper_err;
 use crate::http::HeaderMap;
 use vendor_hyper::{
-    BodyDecode, BodyDecoder, BodyEncoder, connection_any_close, encode_request, encode_response,
-    parse_request, parse_response,
+    BodyDecode, BodyDecoder, BodyEncoder, CONTINUE_RESPONSE, DEFAULT_MAX_BUFFER_SIZE,
+    MINIMUM_MAX_BUFFER_SIZE, connection_any_close, encode_request, encode_response, parse_request,
+    parse_response, server_parse_failure, too_large_error,
 };
 
 /// Map a facade `BodyDecode` to the `(body_kind, content_length)` a Python driver
@@ -42,7 +43,9 @@ fn value_err<E: std::fmt::Display>(what: &str, e: E) -> PyErr {
 }
 
 struct State {
-    /// Accumulates received bytes until a full response head parses.
+    /// Received bytes not yet consumed by a head parse — hyper's persistent
+    /// `read_buf`: it outlives a message (`reset` keeps it), so pipelined bytes are
+    /// never copied out and back in.
     buf: BytesMut,
     /// Method of the in-flight request (a response's bodyless-ness can depend
     /// on it, e.g. a response to HEAD).
@@ -52,6 +55,18 @@ struct State {
     /// The in-flight request carried `Connection: close` (any line): hyper's client
     /// `encode_head` -> `connection_any_close` -> `disable_keep_alive` (1.11.1).
     request_connection_close: bool,
+    /// hyper conn.rs `state.allow_trailer_fields` (L328): the parsed request declared
+    /// `TE: trailers`. True until a request head is parsed, so a client-role codec
+    /// (which never parses one) always sends its trailers (`write_trailers` gates on
+    /// `T::is_server()`).
+    allow_trailer_fields: bool,
+    /// After a failed `receive_request_head`: the automatic response status hyper's
+    /// `Server::on_error` picks, `None` when hyper answers nothing (h2 preface).
+    parse_error_status: Option<u16>,
+    /// The encoder verdicts of the last `serialize_response` (hyper `Encoder::is_last`
+    /// / `is_close_delimited`), read by the driver for its reuse decision.
+    response_is_last: bool,
+    response_close_delimited: bool,
 }
 
 /// A synchronous HTTP/1 codec (client + server roles).
@@ -61,44 +76,88 @@ pub struct H1Codec {
     /// Server-role parse/encode options (hyper `server::conn::http1::Builder`):
     /// `max_headers` (None = hyper's default 100), `ignore_invalid_headers`
     /// (httparse `ignore_invalid_headers_in_requests`), `title_case_headers`,
-    /// `date_header` (`auto_date_header`). Immutable per codec; the driver builds
-    /// one codec per request from the connection's configuration.
+    /// `date_header` (`auto_date_header`), `max_buf_size` (hyper io.rs: the read
+    /// buffer cap a still-incomplete head may reach before `Parse::TooLarge`; both
+    /// roles). Immutable per codec; the driver builds one codec per connection.
     max_headers: Option<usize>,
     ignore_invalid_headers: bool,
     title_case_headers: bool,
     date_header: bool,
+    max_buf_size: usize,
 }
 
 #[pymethods]
 impl H1Codec {
     #[new]
-    #[pyo3(signature = (*, max_headers=None, ignore_invalid_headers=false, title_case_headers=false, date_header=true))]
+    #[pyo3(signature = (*, max_headers=None, ignore_invalid_headers=false, title_case_headers=false, date_header=true, max_buf_size=DEFAULT_MAX_BUFFER_SIZE))]
     fn new(
         max_headers: Option<usize>,
         ignore_invalid_headers: bool,
         title_case_headers: bool,
         date_header: bool,
-    ) -> Self {
-        H1Codec {
+        max_buf_size: usize,
+    ) -> PyResult<Self> {
+        if max_buf_size < MINIMUM_MAX_BUFFER_SIZE {
+            // hyper io.rs `set_max_buf_size` asserts this (L86-90).
+            return Err(PyValueError::new_err(format!(
+                "the max_buf_size cannot be smaller than {MINIMUM_MAX_BUFFER_SIZE}"
+            )));
+        }
+        Ok(H1Codec {
             inner: Mutex::new(State {
                 buf: BytesMut::new(),
                 req_method: None,
                 encoder: None,
                 request_connection_close: false,
+                allow_trailer_fields: true,
+                parse_error_status: None,
+                response_is_last: false,
+                response_close_delimited: false,
             }),
             max_headers,
             ignore_invalid_headers,
             title_case_headers,
             date_header,
-        }
+            max_buf_size,
+        })
+    }
+
+    /// Start the next message on this connection: drop the per-message state, keep
+    /// the read buffer (hyper's `read_buf` persists across messages, so bytes of a
+    /// pipelined request already received stay right here).
+    fn reset(&self) {
+        let mut st = self.inner.lock().unwrap();
+        st.req_method = None;
+        st.encoder = None;
+        st.request_connection_close = false;
+        st.allow_trailer_fields = true;
+        st.parse_error_status = None;
+        st.response_is_last = false;
+        st.response_close_delimited = false;
+    }
+
+    /// Append received bytes to the read buffer WITHOUT parsing — bytes another
+    /// reader took past a message (the body decoder's leftover, a watcher's read) go
+    /// back where hyper's single `read_buf` would have kept them.
+    fn feed(&self, data: &[u8]) {
+        self.inner.lock().unwrap().buf.extend_from_slice(data);
+    }
+
+    /// The interim response hyper's server writes for `Expect: 100-continue`
+    /// (conn.rs L409).
+    #[staticmethod]
+    fn continue_response(py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new(py, CONTINUE_RESPONSE).unbind()
     }
 
     /// Serialize a request head (request line + headers). `content_length` /
     /// `chunked` pick the body framing (mutually exclusive; neither = no body);
     /// the returned bytes are the head, and the body `Encoder` is retained for
-    /// `serialize_data`/`serialize_end`.
-    #[pyo3(signature = (method, url, headers=None, *, http10=false, content_length=None, chunked=false, trailer_fields=Vec::new()))]
-    #[allow(clippy::too_many_arguments)] // faithful mirror of hyper's request Encode inputs
+    /// `serialize_data`/`serialize_end`. `http10` = the peer is known to speak
+    /// HTTP/1.0 (hyper `enforce_version`: keep-alive re-asserted, request line
+    /// downgraded). Chunked trailers are allow-listed from the request's own
+    /// `Trailer` header, as hyper's `Client::encode` does.
+    #[pyo3(signature = (method, url, headers=None, *, http10=false, content_length=None, chunked=false))]
     fn serialize_request(
         &self,
         py: Python<'_>,
@@ -108,7 +167,6 @@ impl H1Codec {
         http10: bool,
         content_length: Option<u64>,
         chunked: bool,
-        trailer_fields: Vec<String>,
     ) -> PyResult<Py<PyBytes>> {
         let m =
             Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
@@ -119,16 +177,9 @@ impl H1Codec {
         } else {
             content_length.map(Some)
         };
-        // The declared chunked trailer field names (from the request's `Trailer`
-        // header) — the body may then emit them via `serialize_trailers` (F45).
-        let trailers = trailer_fields
-            .iter()
-            .map(|n| HeaderName::from_bytes(n.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| value_err("invalid trailer field name", e))?;
         let connection_close = connection_any_close(&fields);
-        let (dst, encoder) = encode_request(m.clone(), uri, fields, body, http10, trailers)
-            .map_err(map_hyper_err)?;
+        let (dst, encoder) =
+            encode_request(m.clone(), uri, fields, body, http10).map_err(map_hyper_err)?;
         let mut st = self.inner.lock().unwrap();
         st.req_method = Some(m);
         st.encoder = Some(encoder);
@@ -177,17 +228,55 @@ impl H1Codec {
         Ok(PyBytes::new(py, &out).unbind())
     }
 
-    /// Finish a chunked body with trailing headers instead of a bare terminator (F45).
-    /// Only the fields declared as trailer fields at `serialize_request` (the `Trailer`
-    /// header) are emitted; the rest are dropped by hyper's `encode_trailers`.
+    /// Finish a chunked body with trailing headers instead of a bare terminator.
+    /// Only the fields the message's own `Trailer` header declared are emitted; the
+    /// rest are dropped by hyper's `encode_trailers`, and a non-chunked body gets the
+    /// bare terminator. On the server, trailers go out only if the request declared
+    /// `TE: trailers` (conn.rs `write_trailers` L740: "trailers not allowed to be
+    /// sent"), the body then ending as usual (`end_body`).
     fn serialize_trailers(&self, py: Python<'_>, trailers: &HeaderMap) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
+        let allowed = st.allow_trailer_fields;
         let out = match st.encoder.take() {
-            Some(enc) => enc
+            Some(enc) if allowed => enc
                 .end_with_trailers(trailers.snapshot())
                 .map_err(map_hyper_err)?,
+            Some(enc) => enc.end().map_err(map_hyper_err)?,
             None => Vec::new(),
         };
+        Ok(PyBytes::new(py, &out).unbind())
+    }
+
+    /// One message in one buffer: `head` + the framed `body` (if any) + the body's end
+    /// (`trailers`, else the bare terminator) — hyper's `WriteBuf` flatten strategy for
+    /// a small immediate body, so the driver issues a single write and copies nothing.
+    /// A bodyless framing (`body_is_eof`) writes no body, whatever `body` holds.
+    #[pyo3(signature = (head, body=None, trailers=None))]
+    fn serialize_head_and_body(
+        &self,
+        py: Python<'_>,
+        head: &[u8],
+        body: Option<&[u8]>,
+        trailers: Option<&HeaderMap>,
+    ) -> PyResult<Py<PyBytes>> {
+        let mut st = self.inner.lock().unwrap();
+        let allowed = st.allow_trailer_fields;
+        let mut out = Vec::with_capacity(head.len() + body.map_or(0, <[u8]>::len) + 16);
+        out.extend_from_slice(head);
+        match st.encoder.take() {
+            None => {}
+            Some(enc) if enc.is_eof() => out.extend(enc.end().map_err(map_hyper_err)?),
+            Some(mut enc) => {
+                if let Some(chunk) = body {
+                    out.extend(enc.encode(chunk));
+                }
+                let end = match trailers {
+                    Some(t) if allowed => enc.end_with_trailers(t.snapshot()),
+                    _ => enc.end(),
+                };
+                out.extend(end.map_err(map_hyper_err)?);
+            }
+        }
         Ok(PyBytes::new(py, &out).unbind())
     }
 
@@ -213,6 +302,9 @@ impl H1Codec {
         st.buf.extend_from_slice(data);
         let req_method = st.req_method.clone();
         match parse_response(&mut st.buf, &req_method).map_err(map_hyper_err)? {
+            // hyper io.rs L202-207: a head still incomplete at `max_buf_size` is
+            // `Parse::TooLarge` (the client just fails the connection).
+            None if st.buf.len() >= self.max_buf_size => Err(map_hyper_err(too_large_error())),
             Some(head) => {
                 let (kind, content_length) = body_kind(&head.body);
                 let headers = Py::new(py, HeaderMap::from_inner(head.headers))?;
@@ -243,14 +335,30 @@ impl H1Codec {
     fn receive_request_head(&self, py: Python<'_>, data: &[u8]) -> PyResult<Option<Py<PyAny>>> {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
-        match parse_request(&mut st.buf, self.max_headers, self.ignore_invalid_headers)
-            .map_err(map_hyper_err)?
+        let parsed = match parse_request(&mut st.buf, self.max_headers, self.ignore_invalid_headers)
         {
+            // hyper io.rs L202-207: a head still incomplete at `max_buf_size` is
+            // `Parse::TooLarge` -> `Server::on_error` answers 431.
+            Ok(None) if st.buf.len() >= self.max_buf_size => Err(too_large_error()),
+            other => other,
+        };
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // conn.rs `on_parse_error`: the h2 preface becomes `VersionH2` (no
+                // response); otherwise `Server::on_error` picks the automatic status.
+                let (e, status) = server_parse_failure(&st.buf, e);
+                st.parse_error_status = status;
+                return Err(map_hyper_err(e));
+            }
+        };
+        match parsed {
             Some(head) => {
                 let (kind, content_length) = body_kind(&head.body);
                 // Remember the method so a response's bodyless-ness (HEAD/204/304)
                 // is computed correctly by `encode_response`.
                 st.req_method = Method::from_bytes(head.method.as_bytes()).ok();
+                st.allow_trailer_fields = head.allow_trailers; // conn.rs `read_head` L328
                 let headers = Py::new(py, HeaderMap::from_inner(head.headers))?;
                 let event = Py::new(
                     py,
@@ -276,9 +384,13 @@ impl H1Codec {
     /// Serialize a response head (status line + headers) via the facade's
     /// `encode_response` (hyper `Server::encode`), retaining the body `Encoder`
     /// for `serialize_data`/`serialize_end`. Uses the request method recorded by
-    /// `receive_request_head` for bodyless-ness (HEAD/204/304), `keep_alive` to
-    /// decide `Connection: close`, and `http10` to set the response version
-    /// (an unknown-length 1.0 body is close-delimited, not chunked). Writes a
+    /// `receive_request_head` for bodyless-ness (HEAD/204/304). `keep_alive` is
+    /// hyper's `wants_keep_alive()` (the request was keep-alive, no shutdown,
+    /// keep-alive enabled) and `http10` whether the request was HTTP/1.0: conn.rs
+    /// `enforce_version` runs over the head first (`Connection: close` inserted when
+    /// keep-alive is off, keep-alive re-asserted to a 1.0 peer, version downgraded —
+    /// an unknown-length 1.0 body is then close-delimited). The encoder's verdicts
+    /// are read back via `response_is_last` / `response_close_delimited`. Writes a
     /// `Date` header unless the codec was built with `date_header=False`.
     #[pyo3(signature = (status, headers=None, *, keep_alive=true, http10=false, content_length=None, chunked=false))]
     #[allow(clippy::too_many_arguments)] // faithful mirror of hyper's Encode fields
@@ -315,8 +427,34 @@ impl H1Codec {
             self.date_header,
         )
         .map_err(map_hyper_err)?;
-        self.inner.lock().unwrap().encoder = Some(encoder);
+        let mut st = self.inner.lock().unwrap();
+        st.response_is_last = encoder.is_last();
+        st.response_close_delimited = encoder.is_close_delimited();
+        st.encoder = Some(encoder);
         Ok(PyBytes::new(py, &dst).unbind())
+    }
+
+    /// hyper `Encoder::is_last` of the last `serialize_response`: the connection
+    /// closes after this response (keep-alive off, a response `Connection: close`, a
+    /// 101, or a 2xx to CONNECT) — conn.rs `try_keep_alive`.
+    #[getter]
+    fn response_is_last(&self) -> bool {
+        self.inner.lock().unwrap().response_is_last
+    }
+
+    /// hyper `Encoder::is_close_delimited` of the last `serialize_response`: the body
+    /// ends by closing the connection (an unknown-length HTTP/1.0 response).
+    #[getter]
+    fn response_close_delimited(&self) -> bool {
+        self.inner.lock().unwrap().response_close_delimited
+    }
+
+    /// After a failed `receive_request_head`: the automatic response status hyper's
+    /// server writes (`Server::on_error`: 400 / 414 / 431), or `None` when it answers
+    /// nothing and just closes (an HTTP/2 preface: `Parse::VersionH2`).
+    #[getter]
+    fn parse_error_status(&self) -> Option<u16> {
+        self.inner.lock().unwrap().parse_error_status
     }
 
     /// Drain the bytes buffered after the head — the body bytes already received,
@@ -457,9 +595,16 @@ impl H1BodyDecoder {
 
     /// Drain and return the bytes buffered past the completed body — the start of
     /// the next pipelined request (hyper keeps these in its persistent read
-    /// buffer). The server driver carries them into the next request's codec.
+    /// buffer). The server driver feeds them back to the codec (`H1Codec.feed`).
     fn take_buffered(&self, py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, &self.inner.lock().unwrap().take_buffered()).unbind()
+    }
+
+    /// Bytes buffered past the body, without moving them — hyper's
+    /// `!read_buf().is_empty()` (`require_empty_read`, conn.rs L463-465).
+    #[getter]
+    fn buffered(&self) -> usize {
+        self.inner.lock().unwrap().buffered()
     }
 
     /// The chunked trailers (a `httpunk.http.HeaderMap`) once the body is

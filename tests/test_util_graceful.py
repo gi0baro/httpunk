@@ -112,6 +112,9 @@ def _req_frame(stream_id):
         headers=HeaderMap(),
         end_stream=True,
         status=None,
+        content_length=None,
+        content_length_invalid=False,
+        is_informational=False,
     )
 
 

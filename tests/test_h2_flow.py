@@ -12,6 +12,9 @@ from tonio.colored.sync import Lock
 
 from httpunk import H2Reason, StreamResetError
 from httpunk._httpunk import (
+    H2_DEFAULT_DATA_FRAME_BUDGET as _DATA_FRAME_BUDGET,
+    H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD as _DATA_FRAME_OVERHEAD_THRESHOLD,
+    H2_MAX_RECV_EMPTY_DATA_FRAMES as _MAX_RECV_EMPTY_DATA_FRAMES,
     H2Codec,
     H2FrameData as Data,
     H2FrameHeaders as Headers,
@@ -23,7 +26,6 @@ from httpunk.h2.client import Connection
 from httpunk.h2.connection import PREFACE
 from httpunk.h2.share import H2ResponseBody
 from httpunk.h2.stream import Stream
-from httpunk.h2.streams import _DATA_FRAME_BUDGET, _DATA_FRAME_OVERHEAD_THRESHOLD, _MAX_RECV_EMPTY_DATA_FRAMES
 from httpunk.http import HeaderMap
 
 
@@ -369,11 +371,11 @@ async def test_consumed_small_frames_return_budget():
         mgr.release_data_frame(st, 1)
     for _ in range(50):  # now leave 50 tiny frames unconsumed
         await mgr.recv_data(data(b"x"))
-    drained = mgr._data_frame_budget
+    drained = mgr._data_frame_budget.available
     await mgr.recv_data(data(b"y" * 1000))  # a large frame replenishes...
-    assert mgr._data_frame_budget == drained + (1000 - _DATA_FRAME_OVERHEAD_THRESHOLD)
+    assert mgr._data_frame_budget.available == drained + (1000 - _DATA_FRAME_OVERHEAD_THRESHOLD)
     mgr.release_data_frame(st, 2**20)  # ...and replenishing never exceeds the cap
-    assert mgr._data_frame_budget <= _DATA_FRAME_BUDGET
+    assert mgr._data_frame_budget.available <= _DATA_FRAME_BUDGET
 
 
 @pytest.mark.tonio
@@ -384,8 +386,8 @@ async def test_empty_nonfinal_data_dropped_and_capped():
     `num_recv_empty_data_frames` — a flood dies with ENHANCE_YOUR_CALM)."""
     mgr, st, data = _recv_streaming_manager()
     await mgr.recv_data(data(b""))  # dropped
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET  # byte budget untouched
-    assert mgr._num_recv_empty_data_frames == 1
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET  # byte budget untouched
+    assert mgr._data_frame_budget.empty_frames == 1
     await mgr.recv_data(data(b"real"))
     assert await st.body_recv.receive() == (b"real", True)  # the empty frame never surfaced
     # An empty FINAL frame is the message end and IS delivered, unbudgeted
@@ -393,7 +395,7 @@ async def test_empty_nonfinal_data_dropped_and_capped():
     await mgr.recv_data(data(b"", end=True))
     assert await st.body_recv.receive() == (b"", False)
     assert await st.body_recv.receive() is None  # EOF sentinel follows
-    assert mgr._num_recv_empty_data_frames == 1  # the final empty frame doesn't count
+    assert mgr._data_frame_budget.empty_frames == 1  # the final empty frame doesn't count
 
 
 @pytest.mark.tonio
@@ -407,7 +409,7 @@ async def test_empty_data_frame_flood_dies_at_cap():
     with pytest.raises(H2ProtocolError) as exc:
         await mgr.recv_data(data(b""))
     assert exc.value.args[0] == int(H2Reason.ENHANCE_YOUR_CALM)
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET
 
 
 @pytest.mark.tonio
@@ -418,7 +420,7 @@ async def test_final_data_frame_never_budgeted():
     reader doesn't release a charge that was never made."""
     mgr, st, data = _recv_streaming_manager()
     await mgr.recv_data(data(b"x", end=True))  # tiny AND final -> no charge
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET
     assert await st.body_recv.receive() == (b"x", False)
     assert await st.body_recv.receive() is None
 
@@ -434,13 +436,13 @@ async def test_reset_releases_buffered_frames_budget():
     for _ in range(50):  # 50 unconsumed tiny frames
         await mgr.recv_data(data(b"x"))
     charged = 50 * (_DATA_FRAME_OVERHEAD_THRESHOLD - 1)
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET - charged
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET - charged
     assert st.data_budget_charged == charged
     await mgr.reset_stream(st, int(H2Reason.CANCEL))
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET  # fully restored
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET  # fully restored
     assert st.data_budget_charged == 0
     mgr.release_data_frame(st, 1)  # a straggling reader release after the reclaim...
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET  # ...credits nothing (no double release)
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET  # ...credits nothing (no double release)
 
 
 @pytest.mark.tonio
@@ -458,12 +460,12 @@ async def test_aclose_after_eos_reclaims_window_and_budget():
     await mgr.recv_data(data(b"end", end=True))  # ...then EOS arrives, all unread
     assert st.state.is_recv_end_stream()
     charged = 50 * (_DATA_FRAME_OVERHEAD_THRESHOLD - 1)  # the final frame is unbudgeted
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET - charged
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET - charged
     assert st.recv_unreleased == 53  # 50x b"x" + b"end", none released
     before = mgr._conn_recv.available()
 
     await H2ResponseBody(st, mgr).aclose()
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET  # budget fully restored
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET  # budget fully restored
     assert mgr._conn_recv.available() == before + 53  # connection window fully restored
     assert st.recv_unreleased == 0 and st.recv_reclaimed is True
 
@@ -471,7 +473,7 @@ async def test_aclose_after_eos_reclaims_window_and_budget():
     await mgr.release_capacity(st, 1)  # a straggling reader release...
     mgr.release_data_frame(st, 1)
     assert mgr._conn_recv.available() == restored  # ...credits neither window...
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET  # ...nor budget, twice
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET  # ...nor budget, twice
 
 
 @pytest.mark.tonio
@@ -480,10 +482,10 @@ async def test_data_frame_budget_resolve():
     configured value as-is; Auto = half the connection recv window, floored at
     DEFAULT_DATA_FRAME_BUDGET."""
     conn = Connection(None)  # client Auto: _CONN_WINDOW (5 MB) / 2
-    assert conn.streams._data_frame_budget == 5 * 1024 * 1024 // 2
+    assert conn.streams._data_frame_budget.available == 5 * 1024 * 1024 // 2
     conn = Connection(None, data_frame_budget=123)  # configured wins, unscaled
-    assert conn.streams._data_frame_budget == 123
+    assert conn.streams._data_frame_budget.available == 123
     mgr = Connection(None).streams  # a tiny window floors at the default
     mgr._conn_recv_target = 1000
     mgr._resolve_data_frame_budget()
-    assert mgr._data_frame_budget == _DATA_FRAME_BUDGET
+    assert mgr._data_frame_budget.available == _DATA_FRAME_BUDGET

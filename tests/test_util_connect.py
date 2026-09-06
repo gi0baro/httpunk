@@ -84,5 +84,18 @@ async def test_rejects_unknown_scheme():
 
 @pytest.mark.tonio
 async def test_rejects_url_without_host():
-    with pytest.raises(ValueError, match="no host"):
+    # The `http` crate's `Uri` (hyper's parser) rejects an empty authority outright.
+    with pytest.raises(ValueError, match="invalid url"):
         await connect("https:///path", backend=_StubBackend())
+
+
+@pytest.mark.tonio
+async def test_ipv6_literal_keeps_its_brackets_in_the_authority():
+    """`Uri::host` keeps an IPv6 literal bracketed, so the `:authority` / `Host` value
+    is well-formed (`urlsplit().hostname` used to strip them: `::1:8443`), while the
+    host handed to the transport is bare, as hyper-util's connector dials it."""
+    backend = _StubBackend(selected_alpn="h2")
+    conn = await connect("https://[::1]:8443/", backend=backend)
+    assert isinstance(conn, H2Connection)
+    assert conn._conn.authority == "[::1]:8443"
+    assert backend.tls_calls == [("::1", 8443, ("h2", "http/1.1"), None)]  # dialed without brackets

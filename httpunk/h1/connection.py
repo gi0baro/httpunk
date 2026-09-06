@@ -107,14 +107,7 @@ class H1ConnectionBase:
         would cost more than the saved syscall. The coalesced branch mirrors
         `_send_body` exactly (aiter_body yields a bytes body as one chunk)."""
         if body is None or (isinstance(body, (bytes, bytearray)) and len(body) <= _COALESCE_MAX):
-            buf = bytearray(head)
-            if codec.body_is_eof():
-                buf += codec.serialize_end()
-            else:
-                if body is not None:
-                    buf += codec.serialize_data(bytes(body))
-                buf += codec.serialize_trailers(trailers) if trailers is not None else codec.serialize_end()
-            await self.write(bytes(buf))
+            await self.write(codec.serialize_head_and_body(head, body, trailers))
             return
         await self.write(head)
         await self._send_body(codec, body, trailers)

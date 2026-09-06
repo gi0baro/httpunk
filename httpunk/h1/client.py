@@ -21,11 +21,9 @@ from .._httpunk import H1BodyDecoder, H1Codec
 from ..exceptions import (
     ConnectionClosedError,
     H1IncompleteMessageError,
-    H1ParseError,
     H1UnexpectedMessageError,
     fresh_exc,
 )
-from ..http import HeaderMap
 from ..types import Response, Version
 from .connection import H1ConnectionBase
 from .share import H1ResponseBody, H1Upgraded
@@ -34,12 +32,6 @@ from .share import H1ResponseBody, H1Upgraded
 if TYPE_CHECKING:
     from .._backend import BackendLike
     from ..types import Request
-
-
-# Max bytes of a still-incomplete response head before failing the connection —
-# hyper's `DEFAULT_MAX_BUFFER_SIZE` (io.rs: 8192 + 4096*100), the same cap the
-# server role applies to request heads (`h1/server.py` `_MAX_HEAD_SIZE`).
-_MAX_HEAD_SIZE = 8192 + 4096 * 100
 
 
 def _version_of(head):
@@ -326,37 +318,17 @@ class Connection(H1ConnectionBase):
             # downgrade this request to 1.0 and re-assert keep-alive — 1.0 defaults
             # to close, so hyper's `fix_keep_alive` injects `Connection: keep-alive`
             # (conn.rs L662-673) and `enforce_version` sets the version (L682-702).
-            http10 = self._peer_http10
-            if http10:
-                # hyper `fix_keep_alive`: re-assert keep-alive UNLESS the request's
-                # `Connection` header already carries the keep-alive token, and NOT when
-                # it asks to close (an explicit close disables keep-alive, so hyper
-                # leaves it). Value-checked (a token, not mere header presence) and set —
-                # not appended — matching hyper's `insert` so no duplicate token (F58).
-                headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
-                tokens = {
-                    part.strip().lower() for value in headers.get_all("connection") for part in bytes(value).split(b",")
-                }
-                if b"keep-alive" not in tokens and b"close" not in tokens:
-                    headers["connection"] = "keep-alive"
-            # Request trailers (F45) require a chunked body (RFC 9112 §7.1.2): force
-            # chunked framing and declare the fields in the `Trailer` header, which hyper
-            # reads to allow-list what `serialize_trailers` may emit after the body.
-            trailer_fields = []
-            if trailers is not None:
-                headers = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
-                content_length, chunked = None, True
-                trailer_fields = list(trailers.keys())
-                if "trailer" not in headers:
-                    headers["trailer"] = ", ".join(trailer_fields)
+            # The codec runs hyper's `enforce_version` / `fix_keep_alive` (conn.rs L662-702)
+            # for a 1.0 peer, and — as hyper's `Client::encode` — allow-lists chunked
+            # trailers from the request's own `Trailer` header: a known-length body
+            # cannot carry them, undeclared fields are dropped.
             head = codec.serialize_request(
                 method,
                 url,
                 headers,
-                http10=http10,
+                http10=self._peer_http10,
                 content_length=content_length,
                 chunked=chunked,
-                trailer_fields=trailer_fields,
             )
             # hyper's `poll_loop` drives reads and writes INDEPENDENTLY each turn
             # (dispatch.rs L172-211): a response head can arrive while the request
@@ -478,7 +450,6 @@ class Connection(H1ConnectionBase):
     async def _read_head(self, codec, write_error=None):
         # hyper: conn.rs `can_read_head` (L175) + `read_head` -> role.rs
         # `Client::parse` (L1013), which loops past 1xx informational responses.
-        buffered = 0
         data = None
         if self._watcher_handle is not None:
             # An idle watcher is armed: its parked `receive_some` is the
@@ -518,18 +489,13 @@ class Connection(H1ConnectionBase):
                 # hyper: `Parse::Eof` on a mid-message read -> `IncompleteMessage`
                 # (conn.rs `read_head` L245-252) — the HTTP state expected a response.
                 raise H1IncompleteMessageError("connection closed before message completed: no response head")
-            buffered += len(data)
             head = codec.receive_head(data)
+            # The codec caps a still-incomplete head at hyper's max_buf_size (io.rs
+            # L202-207, enforcement tightened in 1.11.0 #4093): past it the connection
+            # fails with `Parse::TooLarge` — a server streaming an endless header
+            # section must not grow this connection's buffer without bound.
             if head is not None:
                 return head
-            # Cap the still-incomplete head at hyper's max_buf_size (io.rs
-            # L202-205, enforcement tightened in 1.11.0 #4093): a server
-            # streaming an endless header section must not grow this
-            # connection's buffer without bound. The server role already
-            # enforces the same cap (`_MAX_HEAD_SIZE` + auto-431); the client
-            # just fails the connection (hyper `Parse::TooLarge`).
-            if buffered >= _MAX_HEAD_SIZE:
-                raise H1ParseError("too_large", "message head is too large")
             data = None
 
     async def _await_body_failure(self, body_failed, write_error):

@@ -111,9 +111,9 @@ async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picke
     assert h1._conn._header_read_timeout == 5.0
     assert h1._conn._keep_alive_enabled is False
     assert h1._conn._half_close is True
-    assert h1._conn._max_buf_size == 16384
     assert h1._conn._codec_options == {
         "max_headers": 50,
+        "max_buf_size": 16384,
         "ignore_invalid_headers": True,
         "title_case_headers": True,
         "date_header": False,

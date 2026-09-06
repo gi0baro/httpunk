@@ -23,6 +23,8 @@ import threading
 
 from .. import _backend
 from .._httpunk import (
+    H2_MAX_STREAM_ID,
+    H2_PREFACE,
     H2Codec,
     H2FrameData as Data,
     H2FrameGoAway as GoAway,
@@ -44,11 +46,10 @@ _READ_SIZE = 65536
 # The HTTP/2 client connection preface (RFC 7540 §3.5). A fixed, protocol-level
 # constant (not HPACK, not runtime-specific) — it belongs with the h2 driver that
 # sends it, not the transport backend.
-PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+PREFACE = H2_PREFACE  # the client connection preface (RFC 9113 §3.4), from the Rust core
 
 # h2 `StreamId::MAX` (u32::MAX >> 1). A GOAWAY carrying this as last-stream-id is the
 # phase-1 "graceful, keep going" signal, not a real last-processed id.
-_MAX_STREAM_ID = 2**31 - 1
 
 
 class H2ConnectionBase:
@@ -412,7 +413,7 @@ class H2ConnectionBase:
                 or self.streams._goaway is None
                 or self.streams._streams
                 or self.streams._goaway_last_id is None
-                or self.streams._goaway_last_id >= _MAX_STREAM_ID
+                or self.streams._goaway_last_id >= H2_MAX_STREAM_ID
             ):
                 return False
             self._goaway_replied = True

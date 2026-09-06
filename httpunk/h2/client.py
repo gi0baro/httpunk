@@ -23,6 +23,7 @@ from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
+from .._httpunk import H2_MAX_STREAM_ID, H2Codec
 from ..exceptions import ConnectionClosedError, H2ProtocolError, H2Reason, fresh_exc
 from ..types import Response, Version
 from .connection import PREFACE, H2ConnectionBase
@@ -48,7 +49,6 @@ _CONN_WINDOW = 5 * 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
 _MAX_SEND_BUF_SIZE = 1024 * 1024  # hyper proto/h2/client.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
-_MAX_STREAM_ID = 2**31 - 1  # h2 StreamId::MAX — the last id `next_id()` will hand out
 
 
 class ClientStreamManager(StreamManager):
@@ -82,7 +82,7 @@ class ClientStreamManager(StreamManager):
         # Client-initiated streams are odd; we never enable push (no even ids).
         # An odd id >= our next id was never opened by us.
         # h2: proto/streams/streams.rs `ensure_not_idle` (L1714).
-        if stream_id % 2 == 0 or stream_id >= self._next_id:
+        if not H2Codec.is_client_initiated(stream_id) or stream_id >= self._next_id:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"frame on idle stream {stream_id}")
 
     def _release_slot(self, st):
@@ -132,7 +132,7 @@ class ClientStreamManager(StreamManager):
             raise fresh_exc(src) from src
         async with self._new_stream_lock:
             stream_id = self._next_id
-            if stream_id > _MAX_STREAM_ID:
+            if stream_id > H2_MAX_STREAM_ID:
                 # Client stream ids are exhausted (past 2^31-1). h2's `StreamId::next_id`
                 # returns `StreamIdOverflow` and hyper surfaces it as a user error — the
                 # connection stays alive, this request just can't get an id (F43).
@@ -159,8 +159,14 @@ class ClientStreamManager(StreamManager):
             # Encoded + queued as one step under the pump's buffer lock (HPACK encode order
             # must equal wire order — see the server's `send_response_head`).
             codec = self._conn.codec
+            # The target as given: absolute-form carries its own scheme + authority, a bare
+            # path takes the connection's (`http::Uri` decides, in the codec).
+            scheme, authority = self._conn.scheme, self._conn.authority
             self._conn.enqueue_headers(
-                st, lambda: codec.serialize_request_headers(stream_id, method, url, headers, end_stream=end_stream)
+                st,
+                lambda: codec.serialize_request_headers(
+                    stream_id, method, url, headers, end_stream=end_stream, scheme=scheme, authority=authority
+                ),
             )
         # The connection may have failed / GOAWAY'd between our pre-lock check and
         # inserting the stream, so `fail_all`/`handle_go_away`'s fan-out could have
@@ -439,10 +445,10 @@ class H2Connection(BaseClientConnection):
         # request with trailers never ends the stream on the request HEADERS even when
         # its body is empty/None (F45).
         end_stream = bodyless and request.trailers is None
-        is_head = request.method.upper() == "HEAD"
+        is_head = H2Codec.method_is_head(request.method)
         stream = await self._conn.streams.open_stream(
             request.method,
-            self._resolve(request.target),
+            request.target,
             request.headers,
             end_stream=end_stream,
             is_head=is_head,
@@ -471,15 +477,3 @@ class H2Connection(BaseClientConnection):
         return Response(
             stream.status, stream.headers, H2ResponseBody(stream, self._conn.streams), version=Version.HTTP_2
         )
-
-    def _resolve(self, target):
-        # An absolute URL passes through; a bare path is resolved against the
-        # connection's authority (the codec splits it into :scheme/:authority/:path).
-        if "://" in target:
-            return target
-        if self._conn.authority is None:
-            raise ValueError(
-                "request target is a bare path but the connection has no authority; "
-                "pass authority=... to H2Connection or use an absolute-URL target"
-            )
-        return f"{self._conn.scheme}://{self._conn.authority}{target}"

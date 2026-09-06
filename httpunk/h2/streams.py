@@ -25,54 +25,21 @@ mirrors, not a line-for-line port.
 import threading
 
 from .._common import PUMP_ABANDONED, PUMP_DONE, aclose_body, aiter_body, event_result
-from .._httpunk import H2FlowControl
+from .._httpunk import (
+    H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD,
+    H2_DEFAULT_INITIAL_WINDOW_SIZE,
+    H2Codec,
+    H2DataFrameBudget,
+    H2FlowControl,
+)
 from ..exceptions import GoAwayError, H2FlowControlError, H2ProtocolError, H2Reason, StreamResetError, fresh_exc
 from .settings import PeerSettings
 
 
-_DEFAULT_WINDOW = 65_535
 _LOCAL_MAX_ERROR_RESETS = 1024  # h2 DEFAULT_LOCAL_RESET_COUNT_MAX
 _RESET_STREAM_MAX = 50  # h2 DEFAULT_RESET_STREAM_MAX (streams kept for late frames)
 _RESET_STREAM_SECS = 1.0  # h2 DEFAULT_RESET_STREAM_SECS (how long to keep them)
-# DATA-framing budget (h2 0.4.16 #935, revised in 0.4.19): flow control bounds
-# payload BYTES, not frame COUNT — a peer fragmenting data into tiny frames
-# bloats the buffered chunk queue while staying inside every window. Non-final
-# frames smaller than the threshold consume budget (the bookkeeping overhead
-# they impose beyond their payload); larger frames earn it back, capped at the
-# resolved budget; consuming a buffered small chunk returns its charge.
-# Exhaustion is a connection error. Since 0.4.19 (GHSA-4jgw-qjmp-9rmr):
-# - the budget resolves to half the connection recv window, floored at
-#   DEFAULT_DATA_FRAME_BUDGET, and is configurable (`DataFrameBudget::resolve`,
-#   proto/connection.rs L90-106);
-# - a final (END_STREAM) DATA frame is never budgeted — a stream receives at
-#   most one, so it can't create unbounded overhead (streams.rs L640-649);
-# - empty non-final frames have their own per-connection lifetime cap and do
-#   not touch the byte budget (counts.rs `record_data_frame` L97-113).
-_DATA_FRAME_OVERHEAD_THRESHOLD = 256  # h2 DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD
-_DATA_FRAME_BUDGET = _DATA_FRAME_OVERHEAD_THRESHOLD * 100  # h2 DEFAULT_DATA_FRAME_BUDGET
-_MAX_RECV_EMPTY_DATA_FRAMES = 100  # h2 0.4.19 MAX_RECV_EMPTY_DATA_FRAMES (proto/mod.rs L40)
-
-_INVALID_CONTENT_LENGTH = object()  # sentinel: content-length header failed to parse
 _UNSET = object()  # sentinel: no chunk buffered yet (send_body one-ahead lookahead)
-
-
-def _is_informational(status):
-    return status is not None and 100 <= status < 200
-
-
-def _parse_content_length(headers):
-    """First content-length value as an int, `None` if absent, or the
-    `_INVALID_CONTENT_LENGTH` sentinel if it isn't a bare decimal (h2 uses
-    `frame::parse_u64`, which accepts only ASCII digits and rejects >19 digits
-    outright as an overflow risk — headers.rs L329)."""
-    raw = headers.get("content-length")
-    if raw is None:
-        return None
-    # bytes.isdigit(): ASCII 0-9 only, non-empty. >19 digits can overflow u64, so
-    # `parse_u64` rejects them before even parsing — mirror that (F37).
-    if not raw or len(raw) > 19 or not raw.isdigit():
-        return _INVALID_CONTENT_LENGTH
-    return int(raw)
 
 
 class _StreamError(Exception):
@@ -106,21 +73,21 @@ class StreamManager:
         # open streams are adjusted (h2 recv.rs: `init_window_sz` +
         # `apply_local_settings`, RFC 7540 §6.9.2). Applying it earlier would let
         # the peer legitimately overrun a stream we advertised as smaller.
-        self._recv_init = _DEFAULT_WINDOW
+        self._recv_init = H2_DEFAULT_INITIAL_WINDOW_SIZE
 
         # Connection-level flow control (h2 keeps this in the streams layer).
         # SETTINGS_INITIAL_WINDOW_SIZE does *not* affect the connection window.
         self._conn_send = H2FlowControl()
-        self._conn_send.inc_window(_DEFAULT_WINDOW)
+        self._conn_send.inc_window(H2_DEFAULT_INITIAL_WINDOW_SIZE)
         self._conn_recv = H2FlowControl()
-        self._conn_recv.inc_window(_DEFAULT_WINDOW)
-        self._conn_recv.assign_capacity(_DEFAULT_WINDOW)
+        self._conn_recv.inc_window(H2_DEFAULT_INITIAL_WINDOW_SIZE)
+        self._conn_recv.assign_capacity(H2_DEFAULT_INITIAL_WINDOW_SIZE)
         # The connection-level recv window we ultimately advertise. Starts at the
         # protocol default (65535, what the peer assumes) and, if a role configures a
         # larger target, is raised via an initial WINDOW_UPDATE(0) right after the
         # preface (`raise_connection_window`), like h2's `initial_connection_window_size`
         # (hyper: 5MB client / 1MB server).
-        self._conn_recv_target = _DEFAULT_WINDOW
+        self._conn_recv_target = H2_DEFAULT_INITIAL_WINDOW_SIZE
         self._conn_window_evt = conn.backend.event()
         # Serializes the check-and-decrement of the shared send windows so two
         # streams can't both observe capacity and over-commit the connection
@@ -152,18 +119,12 @@ class StreamManager:
         self._max_local_error_resets = _LOCAL_MAX_ERROR_RESETS
         # Connection-level DATA-framing budget (h2 counts.rs `data_frame_budget`,
         # #935 — see the constants above). Charged in the pump (`recv_data`),
-        # released by the body readers, which run on other tasks/threads -> lock.
-        # `_data_frame_budget_max` is both the starting amount and the replenish
-        # cap; the role connection re-resolves it once `_conn_recv_target` is
-        # known (h2 0.4.19 `DataFrameBudget::resolve`, see
-        # `_resolve_data_frame_budget`).
-        self._data_frame_budget_max = _DATA_FRAME_BUDGET
-        self._data_frame_budget = _DATA_FRAME_BUDGET
+        # released by the body readers, which run on other tasks/threads -> lock
+        # (it also guards each stream's `data_budget_charged` against the budget).
+        # The role connection re-resolves the budget once `_conn_recv_target` is
+        # known (h2 0.4.19 `DataFrameBudget::resolve`, see `_resolve_data_frame_budget`).
+        self._data_frame_budget = H2DataFrameBudget()
         self._data_budget_lock = threading.Lock()
-        # Empty non-final DATA frames received over the connection's lifetime —
-        # capped separately from the byte budget (h2 0.4.19 counts.rs
-        # `num_recv_empty_data_frames`, L74-76).
-        self._num_recv_empty_data_frames = 0
 
     # ===== role hooks (mirror h2's `Peer` trait + `Dyn` role discriminant) =====
 
@@ -332,14 +293,9 @@ class StreamManager:
         0.4.16 (#925): the receive path treats such a field as malformed, so the
         library must not GENERATE a block the peer is required to reject. `te`
         is allowed only with the exact value "trailers" (h2 compares strictly).
-        Raises ValueError (h2 `UserError::MalformedHeaders` — a caller error,
-        NOT a protocol error: the connection and stream stay usable)."""
-        for name in ("connection", "transfer-encoding", "upgrade", "keep-alive", "proxy-connection"):
-            if fields.get(name) is not None:
-                raise ValueError(f"connection-specific header field {name!r} is forbidden in HTTP/2")
-        te = fields.get("te")
-        if te is not None and bytes(te) != b"trailers":
-            raise ValueError('the `te` header may only carry the value "trailers" in HTTP/2')
+        Raises `H2UserError(kind="malformed_headers")` — a caller error, NOT a
+        protocol error: the connection and stream stay usable."""
+        H2Codec.check_send_headers(fields)
 
     async def _send_trailers(self, st, trailers):
         # A trailing HEADERS frame (END_STREAM) sent after the body (h2 share.rs
@@ -526,7 +482,7 @@ class StreamManager:
         WINDOW_UPDATE(0) — h2's `Builder::initial_connection_window_size`
         (set_target_connection_window; the connection window, unlike streams', is
         never carried in SETTINGS). No-op if the target is the default."""
-        delta = self._conn_recv_target - _DEFAULT_WINDOW
+        delta = self._conn_recv_target - H2_DEFAULT_INITIAL_WINDOW_SIZE
         if delta > 0:
             await self._release_conn_capacity(delta)
 
@@ -647,11 +603,7 @@ class StreamManager:
         at DEFAULT_DATA_FRAME_BUDGET. Called by the role connection once
         `_conn_recv_target` is set (upstream resolves at handshake from
         `initial_target_connection_window_size`)."""
-        if configured is None:
-            window = self._conn_recv_target if self._conn_recv_target is not None else _DEFAULT_WINDOW
-            configured = max(window // 2, _DATA_FRAME_BUDGET)
-        self._data_frame_budget_max = configured
-        self._data_frame_budget = configured
+        self._data_frame_budget = H2DataFrameBudget(configured, self._conn_recv_target)
 
     def _record_data_frame(self, st, payload_len):
         """Charge the budget for a received non-final DATA frame (final frames
@@ -666,21 +618,7 @@ class StreamManager:
         also recorded on `st` so teardown can release what its reader never
         consumed (see `_release_stream_budget`)."""
         with self._data_budget_lock:
-            if payload_len == 0:
-                self._num_recv_empty_data_frames += 1
-                if self._num_recv_empty_data_frames > _MAX_RECV_EMPTY_DATA_FRAMES:
-                    raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too_many_data_frames")
-            elif payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
-                cost = _DATA_FRAME_OVERHEAD_THRESHOLD - payload_len
-                if cost > self._data_frame_budget:
-                    raise H2ProtocolError(int(H2Reason.ENHANCE_YOUR_CALM), "too_many_data_frames")
-                self._data_frame_budget -= cost
-                st.data_budget_charged += cost
-            else:
-                self._data_frame_budget = min(
-                    self._data_frame_budget + (payload_len - _DATA_FRAME_OVERHEAD_THRESHOLD),
-                    self._data_frame_budget_max,
-                )
+            st.data_budget_charged += self._data_frame_budget.record(payload_len)
 
     def release_data_frame(self, st, payload_len):
         """Return a consumed BUDGETED chunk's buffering charge — called by the
@@ -693,11 +631,11 @@ class StreamManager:
         charge so it can never double-credit against a concurrent teardown's
         bulk release (`recv_unreleased`'s F22 discipline; upstream needs no
         clamp — its consume and clear paths share one store mutex)."""
-        if 0 < payload_len < _DATA_FRAME_OVERHEAD_THRESHOLD:
+        if 0 < payload_len < H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD:
             with self._data_budget_lock:
-                charge = min(_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len, st.data_budget_charged)
+                charge = min(H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len, st.data_budget_charged)
                 st.data_budget_charged -= charge
-                self._data_frame_budget = min(self._data_frame_budget + charge, self._data_frame_budget_max)
+                self._data_frame_budget.release(charge)
 
     def _release_stream_budget(self, st):
         """Return the budget still charged for a stream's buffered-but-unread
@@ -708,7 +646,7 @@ class StreamManager:
         with self._data_budget_lock:
             charge, st.data_budget_charged = st.data_budget_charged, 0
             if charge:
-                self._data_frame_budget = min(self._data_frame_budget + charge, self._data_frame_budget_max)
+                self._data_frame_budget.release(charge)
 
     # ===== SETTINGS application (h2: proto/streams/streams.rs apply_*_settings) =====
 
@@ -869,7 +807,7 @@ class StreamManager:
 
     def _recv_response_head(self, st, frame):
         # A response head (or an interim 1xx). recv_open fully applies END_STREAM.
-        informational = _is_informational(frame.status)
+        informational = frame.is_informational
         if informational and frame.end_stream:
             # A 1xx interim response cannot carry END_STREAM: it is not the final
             # response, so ending the stream on it is malformed (RFC 9113 §8.1). Reset
@@ -897,7 +835,7 @@ class StreamManager:
             # Trailers that don't set END_STREAM are malformed -> stream error.
             raise _StreamError(frame.stream_id, int(H2Reason.PROTOCOL_ERROR))
         st.state.recv_close()
-        if not st.content_length_satisfied():
+        if not st.content_length.is_satisfied():
             raise _StreamError(frame.stream_id, int(H2Reason.PROTOCOL_ERROR))
         st.trailers = frame.headers
         st.body_send.send(None)  # EOF (trailers available via Response.trailers)
@@ -909,14 +847,14 @@ class StreamManager:
         # A response to HEAD is fully exempt (h2 guards the whole block with
         # `if !stream.content_length.is_head()`, recv.rs L175). The exemptions are
         # inert for a request (is_head is False, status is None), so this is shared.
-        if st.is_head():
+        if st.content_length.is_head():
             return
-        cl = _parse_content_length(frame.headers)
+        if frame.content_length_invalid:
+            raise _StreamError(st.id, int(H2Reason.PROTOCOL_ERROR))
+        cl = frame.content_length  # parsed by the codec (`frame::parse_u64`, first value)
         if cl is None:
             return
-        if cl is _INVALID_CONTENT_LENGTH:
-            raise _StreamError(st.id, int(H2Reason.PROTOCOL_ERROR))
-        st.set_content_length(cl)
+        st.content_length.set(cl)
         if frame.end_stream and cl > 0 and frame.status not in (204, 304):
             raise _StreamError(st.id, int(H2Reason.PROTOCOL_ERROR))
 
@@ -976,13 +914,13 @@ class StreamManager:
         if not self._consume_recv(st, sz):
             await self._release_conn_capacity(sz)
             raise _StreamError(st.id, int(H2Reason.FLOW_CONTROL_ERROR))
-        if not st.dec_content_length(payload_len):  # more data than content-length declared
+        if not st.content_length.dec(payload_len):  # more data than declared (or any on a HEAD response)
             await self._release_conn_capacity(sz)
             raise _StreamError(st.id, int(H2Reason.PROTOCOL_ERROR))
         # On END_STREAM, verify the declared length is fully satisfied *before*
         # delivering the final chunk (h2 checks + recv_close before pushing the
         # Data event, recv.rs L705-750).
-        if frame.end_stream and not st.content_length_satisfied():  # less data than declared
+        if frame.end_stream and not st.content_length.is_satisfied():  # less data than declared
             await self._release_conn_capacity(sz)
             raise _StreamError(st.id, int(H2Reason.PROTOCOL_ERROR))
         with self._recv_window_lock:
@@ -991,9 +929,8 @@ class StreamManager:
         # only ever sees `frame.data` and can release only that much. Auto-release
         # the padding overhead now so it isn't leaked from the stream + connection
         # recv windows (h2 recv.rs L740-750). No-op for unpadded DATA.
-        padding = sz - payload_len
-        if padding:
-            await self.release_capacity(st, padding)
+        if frame.padding:
+            await self.release_capacity(st, frame.padding)
         # DATA-framing budget (#935, revised h2 0.4.19). A final (END_STREAM)
         # frame is never budgeted — a stream receives at most one, so it can't
         # create unbounded overhead (streams.rs L640-649: `!is_end_stream`

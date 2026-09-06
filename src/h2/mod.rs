@@ -58,8 +58,49 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
 
     m.add_class::<streams::H2StreamState>()?;
     m.add_class::<streams::H2FlowControl>()?;
+    m.add_class::<streams::H2ContentLength>()?;
+    m.add_class::<streams::H2DataFrameBudget>()?;
     errors::register(m)?;
     m.add("H2Reason", build_reason(m.py())?)?;
+    // The vendored h2's protocol constants (frame/settings.rs, frame/stream_id.rs) and
+    // the proto/mod.rs budget constants mirrored in `streams`: the single source of
+    // truth for the driver's defaults and range checks.
+    m.add(
+        "H2_DEFAULT_HEADER_TABLE_SIZE",
+        vendor_h2::frame::DEFAULT_SETTINGS_HEADER_TABLE_SIZE,
+    )?;
+    m.add(
+        "H2_DEFAULT_INITIAL_WINDOW_SIZE",
+        vendor_h2::frame::DEFAULT_INITIAL_WINDOW_SIZE,
+    )?;
+    m.add(
+        "H2_DEFAULT_MAX_FRAME_SIZE",
+        vendor_h2::frame::DEFAULT_MAX_FRAME_SIZE,
+    )?;
+    m.add(
+        "H2_MAX_MAX_FRAME_SIZE",
+        vendor_h2::frame::MAX_MAX_FRAME_SIZE,
+    )?;
+    m.add(
+        "H2_MAX_STREAM_ID",
+        u32::from(vendor_h2::frame::StreamId::MAX),
+    )?;
+    m.add(
+        "H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD",
+        streams::DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD,
+    )?;
+    m.add(
+        "H2_DEFAULT_DATA_FRAME_BUDGET",
+        streams::DEFAULT_DATA_FRAME_BUDGET,
+    )?;
+    m.add(
+        "H2_MAX_RECV_EMPTY_DATA_FRAMES",
+        streams::MAX_RECV_EMPTY_DATA_FRAMES,
+    )?;
+    m.add(
+        "H2_PREFACE",
+        pyo3::types::PyBytes::new(m.py(), vendor_hyper::H2_PREFACE),
+    )?;
 
     Ok(())
 }

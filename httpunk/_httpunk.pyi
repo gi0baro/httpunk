@@ -136,6 +136,12 @@ class HeaderMap:
 # HTTP/1 codec  (src/py/h1/codec.rs)
 # ===========================================================================
 
+def uri_parts(url: str) -> tuple[str | None, str | None, int | None, str | None]:
+    """`(scheme, host, port, authority)` of `url` via the `http` crate's `Uri` (hyper's
+    parser): `host` is the host to dial (an IPv6 literal without brackets); `port` is
+    the explicit one or the scheme's default (http/ws 80, https/wss 443); `authority`
+    is `Uri::host` (brackets kept) + `:port`. Raises `ValueError` on an unparsable URL."""
+
 def http_date() -> bytes:
     """The current `Date` header value (IMF-fixdate) from hyper's cached per-second clock."""
 
@@ -150,10 +156,26 @@ class H1Codec:
         ignore_invalid_headers: bool = ...,
         title_case_headers: bool = ...,
         date_header: bool = ...,
+        max_buf_size: int = ...,
     ) -> None:
-        """Server-role options (hyper `server::conn::http1::Builder`): `max_headers`
-        (None = hyper's 100), `ignore_invalid_headers`, `title_case_headers`,
-        `date_header` (`auto_date_header`). Client-role calls ignore them."""
+        """Options (hyper `server::conn::http1::Builder`): `max_headers` (None = hyper's
+        100), `ignore_invalid_headers`, `title_case_headers`, `date_header`
+        (`auto_date_header`) — server role only; `max_buf_size` (hyper io.rs: the read
+        buffer cap a still-incomplete head may reach before `Parse::TooLarge`, default
+        8192 + 4096 * 100, minimum 8192 — raises `ValueError` below it) — both roles.
+        One codec per connection: see `reset`."""
+
+    def reset(self) -> None:
+        """Start the next message on this connection: drop the per-message state, keep
+        the read buffer (hyper's `read_buf` persists across messages)."""
+
+    def feed(self, data: bytes) -> None:
+        """Append received bytes to the read buffer without parsing — bytes another
+        reader took past a message (a body decoder's leftover, a watcher's read)."""
+
+    @staticmethod
+    def continue_response() -> bytes:
+        """`HTTP/1.1 100 Continue\r\n\r\n` — hyper conn.rs L409."""
 
     def serialize_request(
         self,
@@ -164,12 +186,12 @@ class H1Codec:
         http10: bool = ...,
         content_length: int | None = ...,
         chunked: bool = ...,
-        trailer_fields: list[str] = ...,
     ) -> bytes:
         """Serialize a request head (request line + headers); retains the body
-        encoder for `serialize_data`/`serialize_end`/`serialize_trailers`.
-        `trailer_fields` declares chunked trailer field names (the `Trailer` header)
-        that `serialize_trailers` may then emit."""
+        encoder for `serialize_data`/`serialize_end`/`serialize_trailers`. `http10`:
+        the peer is known to speak HTTP/1.0 (hyper `enforce_version` / `fix_keep_alive`
+        run first: keep-alive re-asserted, request line downgraded). Chunked trailers
+        are allow-listed from the request's own `Trailer` header (hyper `Client::encode`)."""
 
     @property
     def request_connection_close(self) -> bool:
@@ -200,8 +222,15 @@ class H1Codec:
     def serialize_end(self) -> bytes:
         """Finish the body: the chunked terminator, or empty for content-length."""
 
+    def serialize_head_and_body(self, head: bytes, body: bytes | None = ..., trailers: HeaderMap | None = ...) -> bytes:
+        """One message in one buffer: `head` + the framed `body` (if any) + its end
+        (`trailers`, else the bare terminator) — hyper's `WriteBuf` flatten for a small
+        immediate body. A bodyless framing (`body_is_eof`) writes no body."""
+
     def serialize_trailers(self, trailers: HeaderMap) -> bytes:
-        """Finish a chunked body with a trailer block (the declared `trailer_fields`)
+        """Finish a chunked body with a trailer block (the fields the message's own
+        `Trailer` header declared; on the server only if the request said `TE: trailers`,
+        else the bare terminator)
         instead of a bare terminator; falls back to `serialize_end` if none apply."""
 
     def body_is_eof(self) -> bool:
@@ -215,6 +244,23 @@ class H1Codec:
     def receive_request_head(self, data: bytes) -> H1RequestHead | None:
         """Feed received bytes (server side); return the request head once a full
         one is available, else None."""
+
+    @property
+    def response_is_last(self) -> bool:
+        """hyper `Encoder::is_last` of the last `serialize_response`: the connection
+        closes after this response (keep-alive off, a response `Connection: close`,
+        a 101, or a 2xx to CONNECT)."""
+
+    @property
+    def response_close_delimited(self) -> bool:
+        """hyper `Encoder::is_close_delimited` of the last `serialize_response`: an
+        unknown-length HTTP/1.0 body, ended by closing the connection."""
+
+    @property
+    def parse_error_status(self) -> int | None:
+        """After a failed `receive_request_head`: the automatic response status hyper's
+        `Server::on_error` picks (400 / 414 / 431), or None when it answers nothing
+        and just closes (an HTTP/2 preface: `Parse::VersionH2`)."""
 
     def take_body(self) -> bytes:
         """Drain the bytes buffered after the head (the body bytes already read)."""
@@ -272,6 +318,11 @@ class H1BodyDecoder:
     def take_trailers(self) -> HeaderMap | None:
         """The chunked trailers once the body is complete, if any; taken (moved)."""
 
+    @property
+    def buffered(self) -> int:
+        """Bytes buffered past the body, without moving them (hyper's
+        `!read_buf().is_empty()`, `require_empty_read`)."""
+
     def take_buffered(self) -> bytes:
         """Bytes buffered past the completed body (the start of the next pipelined
         request) — carried into the next codec / used to reject stray bytes."""
@@ -290,12 +341,17 @@ class H2FrameHeaders:
     path: str | None
     status: int | None
     headers: HeaderMap
+    content_length: int | None  # the first `content-length`, via h2 `frame::parse_u64`; None if absent/unparsable
+    content_length_invalid: bool  # a `content-length` was present but did not parse (h2: stream PROTOCOL_ERROR)
+    is_informational: bool  # a 1xx response head (h2 `Headers::is_informational`)
     def __repr__(self) -> str: ...
 
 class H2FrameData:
     stream_id: int
     end_stream: bool
     data: bytes
+    flow_controlled_len: int  # payload + padding + the pad-length byte (what flow control charges)
+    padding: int  # `flow_controlled_len - len(data)`: the overhead the app never sees (0 when unpadded)
     def __repr__(self) -> str: ...
 
 class H2FrameSettings:
@@ -390,17 +446,50 @@ class H2Codec:
         self,
         stream_id: int,
         method: str,
-        url: str,
+        target: str,
         headers: HeaderMap | None = ...,
         end_stream: bool = ...,
-    ) -> bytes: ...
+        *,
+        scheme: str | None = ...,
+        authority: str | None = ...,
+    ) -> bytes:
+        """`target` as `http::Uri` sees it: absolute-form carries its own scheme +
+        authority; a bare path takes `scheme`/`authority` (raises `ValueError` when
+        those are missing)."""
+
     def serialize_response_headers(
         self,
         stream_id: int,
         status: int,
         headers: HeaderMap | None = ...,
         end_stream: bool = ...,
-    ) -> bytes: ...
+        auto_date: bool = ...,
+    ) -> bytes:
+        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L484)."""
+
+    def feed_preface(self, data: bytes) -> bool | None:
+        """Server side: feed bytes of the client connection preface. None = matches so
+        far but incomplete; True = matched (bytes past it are in the frame buffer —
+        `receive(b"")` decodes them); False = mismatch (PROTOCOL_ERROR)."""
+
+    @staticmethod
+    def match_preface(data: bytes) -> bool | None:
+        """Classify a connection's first bytes against the client preface (hyper-util
+        `read_version`): None = incomplete prefix, True = the full preface, False = diverged."""
+
+    @staticmethod
+    def check_send_headers(headers: HeaderMap) -> None:
+        """h2 send.rs `check_headers`: raises `H2UserError(kind="malformed_headers")` for a
+        connection-specific field or a `te` other than exactly `trailers`."""
+
+    @staticmethod
+    def method_is_head(method: str) -> bool:
+        """`method == Method::HEAD` on the parsed `http::Method` (case-sensitive)."""
+
+    @staticmethod
+    def is_client_initiated(stream_id: int) -> bool:
+        """h2 `StreamId::is_client_initiated` (odd ids)."""
+
     def serialize_trailers(self, stream_id: int, trailers: HeaderMap) -> bytes:
         """A trailing HEADERS frame (no pseudo-headers, END_STREAM) — request/response
         trailers after the DATA frames."""
@@ -504,6 +593,50 @@ class ProxyIntercept:
     def basic_auth(self) -> str | None: ...
     def raw_auth(self) -> tuple[str, str] | None: ...
     def __repr__(self) -> str: ...
+
+class H2ContentLength:
+    """h2 stream.rs `ContentLength`: the declared body length of a message,
+    decremented per DATA frame and checked at END_STREAM."""
+
+    def __init__(self, is_head: bool = ...) -> None: ...
+    def is_head(self) -> bool: ...
+    def set(self, value: int) -> None:
+        """Record a parsed `content-length` (no-op for a HEAD response)."""
+
+    def dec(self, len: int) -> bool:
+        """Consume body bytes; False = more data than declared, or any data on a HEAD response."""
+
+    def is_satisfied(self) -> bool:
+        """False = a declared length still unsatisfied at END_STREAM."""
+
+class H2DataFrameBudget:
+    """h2 0.4.19 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`)
+    over `DataFrameBudget::resolve`."""
+
+    def __init__(self, configured: int | None = ..., connection_window: int | None = ...) -> None: ...
+    def record(self, payload_len: int) -> int:
+        """Charge a received non-final DATA frame; returns the charge taken (0 for an
+        empty or large frame). Raises `H2ProtocolError(ENHANCE_YOUR_CALM)` on exhaustion."""
+
+    def release(self, charge: int) -> None:
+        """Give a charge back (saturating at the resolved budget)."""
+
+    @property
+    def available(self) -> int: ...
+    @property
+    def empty_frames(self) -> int: ...
+
+# The vendored h2's protocol constants (frame/settings.rs, frame/stream_id.rs,
+# proto/mod.rs) and hyper's client connection preface.
+H2_DEFAULT_HEADER_TABLE_SIZE: int
+H2_DEFAULT_INITIAL_WINDOW_SIZE: int
+H2_DEFAULT_MAX_FRAME_SIZE: int
+H2_MAX_MAX_FRAME_SIZE: int
+H2_MAX_STREAM_ID: int
+H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD: int
+H2_DEFAULT_DATA_FRAME_BUDGET: int
+H2_MAX_RECV_EMPTY_DATA_FRAMES: int
+H2_PREFACE: bytes
 
 class H2Reason(enum.IntEnum):
     NO_ERROR = 0

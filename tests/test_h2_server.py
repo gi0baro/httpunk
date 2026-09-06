@@ -22,7 +22,7 @@ from httpunk._httpunk import (
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
 )
-from httpunk.exceptions import ConnectionClosedError, StreamResetError
+from httpunk.exceptions import ConnectionClosedError, H2UserError, StreamResetError
 from httpunk.h2 import H2Server
 from httpunk.h2.connection import PREFACE
 from httpunk.http import HeaderMap
@@ -592,7 +592,7 @@ async def test_server_respond_with_trailers():
                 if req.path == "/bad":
                     try:
                         await req.respond(200, body=b"x", trailers={"connection": "close"})
-                    except ValueError as exc:
+                    except H2UserError as exc:
                         rejected.append(str(exc))
                         await req.respond(200, body=b"recovered")
                 elif req.path == "/empty":
@@ -935,9 +935,9 @@ async def test_h2_connection_specific_trailers_rejected():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            with pytest.raises(ValueError):
+            with pytest.raises(H2UserError):
                 await conn.request("POST", "/", body=b"data", trailers={"connection": "close"})
-            with pytest.raises(ValueError):  # `te` may only carry "trailers"
+            with pytest.raises(H2UserError):  # `te` may only carry "trailers"
                 await conn.request("POST", "/", body=b"data", trailers={"te": "gzip"})
             # The rejected calls never touched the wire — the SAME connection
             # still carries a valid-trailer request end to end.
@@ -965,9 +965,9 @@ async def test_h2_connection_specific_request_headers_rejected():
     async with scope() as s:
         s.spawn(server())
         async with open_h2(host, port) as conn:
-            with pytest.raises(ValueError):
+            with pytest.raises(H2UserError):
                 await conn.request("GET", "/", headers={"connection": "keep-alive"})
-            with pytest.raises(ValueError):  # `te` may only carry "trailers"
+            with pytest.raises(H2UserError):  # `te` may only carry "trailers"
                 await conn.request("GET", "/", headers={"te": "gzip"})
             resp = await conn.request("GET", "/", headers={"te": "trailers"})  # the one legal `te`
             assert await resp.read() == b"ok"
@@ -986,7 +986,7 @@ async def test_h2_connection_specific_response_headers_rejected():
         async with H2Server(transport) as srv:
             async for req in srv:
                 await req.read()
-                with pytest.raises(ValueError):
+                with pytest.raises(H2UserError):
                     await req.respond(200, headers={"connection": "close"}, body=b"nope")
                 await req.respond(200, body=b"ok")  # stream untouched -> still respondable
 

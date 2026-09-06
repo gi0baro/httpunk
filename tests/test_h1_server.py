@@ -12,6 +12,7 @@ from tonio.colored.net import open_tcp_listeners
 from httpunk import Version
 from httpunk._backend.asyncio import AsyncioBackend
 from httpunk._backend.tonio import TonioBackend
+from httpunk._httpunk import H1Codec
 from httpunk.exceptions import ConnectionClosedError, H1BodyError, H1IncompleteMessageError, H1UserError
 from httpunk.h1 import H1Server
 from httpunk.h1.server import ServerConnection
@@ -976,10 +977,12 @@ async def test_server_next_request_refuses_while_push_body_is_open():
 
 
 @pytest.mark.tonio
-async def test_server_respond_trailers_force_chunked_and_declare_trailer_header():
-    """`respond(trailers=)` mirrors the client's `Request.trailers` (F45): even a `bytes`
-    body is framed chunked, a `Trailer` header declares the fields, and the trailers
-    arrive after the body. Same for a streamed body; an app-set `Trailer` header is kept."""
+async def test_server_respond_trailers_need_chunked_framing_and_a_trailer_declaration():
+    """`respond(trailers=)` is hyper's `Body` with trailer frames: the framing is the body's
+    and only fields the response's own `Trailer` header declares are emitted (role.rs
+    `Server::encode` -> `Kind::Chunked(Some(fields))`, `Encoder::encode_trailers`). A
+    known-length `bytes` body is `Content-Length`-framed and carries none — dropped, no
+    error; a streamed body with a `Trailer` declaration carries them."""
     listener, host, port = await _listener()
 
     async def serve():
@@ -1002,11 +1005,12 @@ async def test_server_respond_trailers_force_chunked_and_declare_trailer_header(
         s.spawn(serve())
         async with open_h1(host, port) as conn:
             r = await conn.request("GET", "/bytes", headers={"host": "x", "te": "trailers"})
-            assert r.headers["transfer-encoding"] == b"chunked"  # forced chunked for a bytes body
-            assert r.headers["trailer"] == b"x-checksum"  # declared for the app
+            assert r.headers["content-length"] == b"7"  # the body's framing: no room for trailers
+            assert "trailer" not in r.headers
             assert await r.read() == b"payload"
-            assert r.trailers["x-checksum"] == b"abc"
+            assert r.trailers is None
             r = await conn.request("GET", "/stream", headers={"host": "x", "te": "trailers"})
+            assert r.headers["transfer-encoding"] == b"chunked"
             assert r.headers["trailer"] == b"x-checksum"
             assert await r.read() == b"payload"
             assert r.trailers["x-checksum"] == b"def"
@@ -1051,9 +1055,12 @@ async def test_server_trailers_dropped_without_te_trailers(path):
     conn = ServerConnection(stub)
     await conn.start()
     req = await conn.next_request()
-    assert not req._allow_trailer_fields
     if path == "pull":
-        await req.respond(200, body=b"payload", trailers={"x-checksum": "abc"})
+
+        async def chunks():
+            yield b"payload"
+
+        await req.respond(200, headers={"trailer": "x-checksum"}, body=chunks(), trailers={"x-checksum": "abc"})
     else:
         stream = await req.send_response(200, headers={"trailer": "x-checksum"})
         await stream.send_data(b"payload")
@@ -1080,12 +1087,16 @@ async def test_server_te_trailers_token_forms(te_lines, allowed):
     """hyper 1.11.1 `headers::te_is_trailers`: the `trailers` token may sit in any `TE` line,
     at any position of its comma list, in any case — earlier hyper only matched a first
     line equal to `trailers`."""
-    stub = _StubTransport(b"GET / HTTP/1.1\r\nhost: x\r\n" + te_lines + b"\r\n")
+    stub = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n" + te_lines + b"\r\n")
     conn = ServerConnection(stub)
     await conn.start()
     req = await conn.next_request()
-    assert req._allow_trailer_fields is allowed
-    await req.respond(200, body=b"payload", trailers={"x-checksum": "abc"})
+
+    async def chunks():
+        yield b"payload"
+
+    await req.respond(200, headers={"trailer": "x-checksum"}, body=chunks(), trailers={"x-checksum": "abc"})
+    await conn.close()
     assert (b"\r\n0\r\nx-checksum: abc\r\n\r\n" in stub.sent) is allowed
 
 
@@ -1351,25 +1362,75 @@ async def test_body_io_after_close_raises_clean_error():
         await conn.write(b"data")
 
 
-def test_negotiate_connection_header_replaces_not_appends():
-    """The wire `Connection` header REPLACES a user-set value (hyper `insert`), never
-    appending a second/contradictory token (F48)."""
-    closing = HeaderMap()
-    closing.add("connection", "keep-alive")  # user asked keep-alive, but we must close
-    out = ServerConnection._negotiate_connection_header(closing, keep_alive=False, http10=False, resp_close=False)
-    assert out.get_all("connection") == [b"close"]  # replaced, not [keep-alive, close]
+def test_enforce_version_connection_header_replaces_not_appends():
+    """hyper conn.rs `enforce_version` / `fix_keep_alive` (run by the codec before
+    `Server::encode`) use `HeaderMap::insert`: the wire `Connection` header REPLACES a
+    user-set value, never appending a second/contradictory token (F48)."""
+    codec = H1Codec(date_header=False)
+    head = codec.serialize_response(200, HeaderMap([("connection", "keep-alive")]), keep_alive=False)
+    lines = head.lower().split(b"\r\n")
+    assert [line for line in lines if line.startswith(b"connection:")] == [b"connection: close"]
+    assert codec.response_is_last
 
-    keeping = HeaderMap()
-    keeping.add("connection", "x-foo")  # a custom token on a 1.0 keep-alive response
-    out2 = ServerConnection._negotiate_connection_header(keeping, keep_alive=True, http10=True, resp_close=False)
-    assert out2.get_all("connection") == [b"keep-alive"]  # replaced x-foo
+    codec = H1Codec(date_header=False)
+    head = codec.serialize_response(200, HeaderMap([("connection", "x-foo")]), keep_alive=True, http10=True)
+    lines = head.lower().split(b"\r\n")
+    assert lines[0] == b"http/1.0 200 ok"
+    assert [line for line in lines if line.startswith(b"connection:")] == [b"connection: keep-alive"]
+    assert not codec.response_is_last
 
 
 @pytest.mark.tonio
 async def test_h1_request_trailers_round_trip():
-    """Request trailers (F45): the client sends them as chunked trailers after the body
-    (forcing chunked framing + a `Trailer` header); the H1Server decodes them into
-    `req.trailers`."""
+    """Request trailers are hyper's: `Client::encode` allow-lists the fields the request's
+    own `Trailer` header declares (role.rs L1420-1431) and a chunked (streamed) body
+    carries them after the data; the H1Server decodes them into `req.trailers`. A
+    known-length `bytes` body is `Content-Length`-framed and drops them, silently."""
+    listener, host, port = await _listener()
+    seen = {}
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            async for req in server:
+                seen[req.target] = (await req.read(), req.trailers)
+                await req.respond(200, body=b"ok")
+
+    async def chunks():
+        yield b"da"
+        yield b"ta"
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            resp = await conn.request(
+                "POST",
+                "/declared",
+                headers={"host": f"{host}:{port}", "trailer": "x-checksum"},
+                body=chunks(),
+                trailers={"x-checksum": "abc", "x-undeclared": "no"},
+            )
+            assert await resp.read() == b"ok"
+            resp = await conn.request(
+                "POST", "/bytes", headers={"host": f"{host}:{port}"}, body=b"data", trailers={"x-checksum": "abc"}
+            )
+            assert await resp.read() == b"ok"
+        s.cancel()
+
+    body, trailers = seen["/declared"]
+    assert body == b"data"
+    assert trailers is not None
+    assert trailers.get("x-checksum") == b"abc"
+    assert trailers.get("x-undeclared") is None  # not declared -> dropped by the encoder
+    body, trailers = seen["/bytes"]
+    assert body == b"data" and trailers is None  # Content-Length framing: no trailers
+
+
+@pytest.mark.tonio
+async def test_h1_bodyless_request_drops_trailers():
+    """A request with trailers but no body: hyper frames no body at all (`set_length`
+    with no body -> a zero-length encoder), so there is nowhere for trailers to go —
+    they are dropped, exactly as for a `Content-Length` body."""
     listener, host, port = await _listener()
     seen = {}
 
@@ -1379,46 +1440,21 @@ async def test_h1_request_trailers_round_trip():
             async for req in server:
                 seen["body"] = await req.read()
                 seen["trailers"] = req.trailers
+                seen["framing"] = (req.headers.get("transfer-encoding"), req.headers.get("content-length"))
                 await req.respond(200, body=b"ok")
 
     async with scope() as s:
         s.spawn(serve())
         async with open_h1(host, port) as conn:
             resp = await conn.request(
-                "POST", "/", headers={"host": f"{host}:{port}"}, body=b"data", trailers={"x-checksum": "abc"}
+                "POST", "/", headers={"host": f"{host}:{port}", "trailer": "x-done"}, trailers={"x-done": "1"}
             )
             assert await resp.read() == b"ok"
         s.cancel()
 
-    assert seen["body"] == b"data"
-    assert seen["trailers"] is not None
-    assert seen["trailers"].get("x-checksum") == b"abc"
-
-
-@pytest.mark.tonio
-async def test_h1_bodyless_request_with_trailers():
-    """A request with trailers but no body still sends a (chunked, empty) body + trailer
-    block rather than a bodyless framing (F45)."""
-    listener, host, port = await _listener()
-    seen = {}
-
-    async def serve():
-        transport = await listener.accept()
-        async with H1Server(transport) as server:
-            async for req in server:
-                seen["body"] = await req.read()
-                seen["trailers"] = req.trailers
-                await req.respond(200, body=b"ok")
-
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            resp = await conn.request("POST", "/", headers={"host": f"{host}:{port}"}, trailers={"x-done": "1"})
-            assert await resp.read() == b"ok"
-        s.cancel()
-
     assert seen["body"] == b""
-    assert seen["trailers"].get("x-done") == b"1"
+    assert seen["trailers"] is None
+    assert seen["framing"] == (None, None)
 
 
 @pytest.mark.tonio

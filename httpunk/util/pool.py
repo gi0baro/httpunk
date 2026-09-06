@@ -28,9 +28,9 @@ import contextlib
 import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urlsplit
 
 from .. import _backend
+from .._httpunk import uri_parts
 from ..exceptions import fresh_exc
 
 
@@ -239,16 +239,12 @@ class _Lease:
         return False
 
 
-_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
-
-
 def _default_key(url):
     # Normalize the port from the scheme when absent, so `http://x` and `http://x:80`
-    # route to the SAME per-destination pool rather than two (F52) — matching how a
-    # connection's destination key is canonicalized.
-    parts = urlsplit(url)
-    port = parts.port if parts.port is not None else _DEFAULT_PORTS.get(parts.scheme)
-    return (parts.scheme, parts.hostname, port)
+    # route to the SAME per-destination pool rather than two (F52) — the same `Uri`
+    # split `connect()` canonicalizes a connection's destination with.
+    scheme, host, port, _authority = uri_parts(url)
+    return (scheme, host, port)
 
 
 class Map:

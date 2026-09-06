@@ -33,7 +33,7 @@ from collections.abc import AsyncIterator, Awaitable
 from typing import TYPE_CHECKING, Any
 
 from .._common import BaseServer, read_all
-from .._httpunk import http_date
+from .._httpunk import H2_DEFAULT_MAX_FRAME_SIZE, H2_MAX_MAX_FRAME_SIZE, H2_MAX_STREAM_ID, H2Codec
 from ..exceptions import (
     ConnectionClosedError,
     H2ProtocolError,
@@ -43,7 +43,7 @@ from ..exceptions import (
 )
 from ..http import HeaderMap
 from ..types import Version
-from .connection import PREFACE, H2ConnectionBase
+from .connection import H2ConnectionBase
 from .settings import LocalSettings, Settings
 from .stream import Stream
 from .streams import _RESET_STREAM_SECS, StreamManager, _StreamError
@@ -57,8 +57,6 @@ if TYPE_CHECKING:
 _DEFAULT_MAX_CONCURRENT = 200  # hyper server SETTINGS_MAX_CONCURRENT_STREAMS (proto/h2/server.rs)
 _REMOTE_RESET_MAX = 20  # h2 proto/mod.rs DEFAULT_REMOTE_RESET_STREAM_MAX (Rapid-Reset cap)
 _LOCAL_ERROR_RESET_MAX = 1024  # hyper proto/h2/server.rs DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS
-_MIN_MAX_FRAME_SIZE = 16_384  # RFC 9113 §6.5.2 SETTINGS_MAX_FRAME_SIZE range (h2 frame/settings.rs asserts)
-_MAX_MAX_FRAME_SIZE = (1 << 24) - 1
 # hyper's HTTP/2 server profile (hyper `proto/h2/server.rs`): a 1 MB per-stream recv
 # window and 1 MB connection recv window (vs the 65535 default), 16 KB max frame size,
 # 16 KB max header-list size. We ship the hyper stack's tuned profile, not bare-h2
@@ -69,7 +67,6 @@ _CONN_WINDOW = 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
 _MAX_SEND_BUF_SIZE = 400 * 1024  # hyper proto/h2/server.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
-_MAX_STREAM_ID = 2**31 - 1  # h2 StreamId::MAX — the phase-1 graceful GOAWAY last-stream-id
 _SHUTDOWN_PING = b"SHUTDOWN"  # opaque payload of the graceful-shutdown PING (h2 Ping::SHUTDOWN)
 
 
@@ -256,7 +253,7 @@ class ServerStreamManager(StreamManager):
         # higher streams are silently ignored. `_shutdown_final` marks phase 2 reached —
         # only then does draining the last stream end the accept loop.
         self._graceful = False
-        self._max_stream_id = _MAX_STREAM_ID
+        self._max_stream_id = H2_MAX_STREAM_ID
         self._shutdown_final = False
         # Rapid-Reset defence (CVE-2023-44487): stream ids queued to the accept loop
         # but not yet pulled by the app (`_pending_accept`), and the subset of those
@@ -272,7 +269,7 @@ class ServerStreamManager(StreamManager):
         """A frame on a stream the client has never opened (idle): an even id (the
         client can't open one) or an odd id above the highest we've seen. h2:
         proto/peer.rs `ensure_can_open` (L76) / streams.rs `ensure_not_idle`."""
-        if sid % 2 == 0 or sid > self._last_recv_id:
+        if not H2Codec.is_client_initiated(sid) or sid > self._last_recv_id:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"frame on idle stream {sid}")
 
     def _above_goaway(self, sid):
@@ -318,7 +315,7 @@ class ServerStreamManager(StreamManager):
         if sid > self._max_stream_id:
             return None
         # A new request: must be a strictly-increasing client-initiated (odd) id.
-        if sid % 2 == 0 or sid <= self._last_recv_id:
+        if not H2Codec.is_client_initiated(sid) or sid <= self._last_recv_id:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), f"invalid new stream id {sid}")
         self._last_recv_id = sid
         if len(self._streams) >= self._max_concurrent:
@@ -419,11 +416,6 @@ class ServerStreamManager(StreamManager):
                 else ConnectionClosedError("stream already closed")
             )
         hdrs = headers if isinstance(headers, HeaderMap) else HeaderMap(headers)
-        # hyper's h2 server inserts `Date` when the app didn't set one (proto/h2/server.rs
-        # L484 `entry(DATE).or_insert_with(date::update_and_header_value)`), gated by
-        # `auto_date_header`. Same cached value the h1 encoder writes.
-        if self._conn._auto_date_header and hdrs.get("date") is None:
-            hdrs["date"] = http_date()
         # Same RFC 9113 §8.2.2 rejection as the client's request/trailer paths
         # (h2 send.rs `send_headers` -> `check_headers`): checked BEFORE the
         # state transition, so a rejected call leaves the stream untouched and
@@ -443,9 +435,12 @@ class ServerStreamManager(StreamManager):
         # handlers encoding here and then racing for the socket desynchronized the peer's
         # table (a `date` insertion overtaken by later 3-byte blocks referencing it; the
         # peer GOAWAYs PROTOCOL_ERROR). h2 encodes inside its connection task's write path.
-        codec = self._conn.codec
+        # `auto_date`: hyper's h2 server inserts `Date` when the app didn't set one
+        # (proto/h2/server.rs L484 `entry(DATE).or_insert_with(...)`) — in the codec.
+        codec, auto_date = self._conn.codec, self._conn._auto_date_header
         self._conn.enqueue_headers(
-            st, lambda: codec.serialize_response_headers(st.id, status, hdrs, end_stream=end_stream)
+            st,
+            lambda: codec.serialize_response_headers(st.id, status, hdrs, end_stream=end_stream, auto_date=auto_date),
         )
         if end_stream:
             self._close_stream(st)  # bodyless response — HEADERS closed the send half
@@ -507,14 +502,13 @@ class ServerConnection(H2ConnectionBase):
             initial_connection_window_size if initial_connection_window_size is not None else _CONN_WINDOW
         )
         self._max_frame_size = max_frame_size if max_frame_size is not None else _MAX_FRAME_SIZE
-        if not _MIN_MAX_FRAME_SIZE <= self._max_frame_size <= _MAX_MAX_FRAME_SIZE:
+        if not H2_DEFAULT_MAX_FRAME_SIZE <= self._max_frame_size <= H2_MAX_MAX_FRAME_SIZE:
             # Fail at construction, not at the first SETTINGS write (h2 frame/settings.rs
             # `set_max_frame_size` asserts the RFC range).
-            raise ValueError(f"max_frame_size must be in [{_MIN_MAX_FRAME_SIZE}, {_MAX_MAX_FRAME_SIZE}]")
+            raise ValueError(f"max_frame_size must be in [{H2_DEFAULT_MAX_FRAME_SIZE}, {H2_MAX_MAX_FRAME_SIZE}]")
         self._max_header_list_size = max_header_list_size if max_header_list_size is not None else _MAX_HEADER_LIST_SIZE
         # hyper `http2::Builder::auto_date_header` (proto/h2/server.rs `date_header`, default true).
         self._auto_date_header = auto_date_header
-        self._preface_buf = b""
         self._preface_ok = False
         super().__init__(
             transport,
@@ -572,15 +566,13 @@ class ServerConnection(H2ConnectionBase):
         # (h2 reads it in server.rs L1427-1441). Returns None until it's complete.
         if self._preface_ok:
             return data
-        self._preface_buf += data
-        if len(self._preface_buf) < len(PREFACE):
+        matched = self.codec.feed_preface(data)  # bytes past the preface stay in the codec's buffer
+        if matched is None:
             return None
-        if self._preface_buf[: len(PREFACE)] != PREFACE:
+        if not matched:
             raise H2ProtocolError(int(H2Reason.PROTOCOL_ERROR), "bad client connection preface")
-        rest = self._preface_buf[len(PREFACE) :]
-        self._preface_buf = b""
         self._preface_ok = True
-        return rest
+        return b""
 
     def _goaway_last_stream_id(self):
         # The last request we actually *processed* (h2 `last_processed_id`), so the
@@ -605,7 +597,7 @@ class ServerConnection(H2ConnectionBase):
         if self.streams._graceful:
             return
         self.streams._graceful = True
-        await self.send_frame(self.codec.serialize_go_away(_MAX_STREAM_ID, int(H2Reason.NO_ERROR)))
+        await self.send_frame(self.codec.serialize_go_away(H2_MAX_STREAM_ID, int(H2Reason.NO_ERROR)))
         await self.send_frame(self.codec.serialize_ping(_SHUTDOWN_PING))
 
     async def _on_pong(self, frame):
