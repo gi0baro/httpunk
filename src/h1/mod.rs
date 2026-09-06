@@ -3,11 +3,13 @@
 //! The codec drives the vendored hyper h1 sans-IO core (`crate::hyper`).
 
 mod codec;
+mod errors;
 
 use pyo3::prelude::*;
 
 /// Register the HTTP/1 pyclasses on the extension module.
 pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
+    errors::register(m)?;
     m.add_class::<codec::H1Codec>()?;
     m.add_class::<codec::ResponseHead>()?;
     m.add_class::<codec::RequestHead>()?;

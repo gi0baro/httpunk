@@ -9,12 +9,13 @@
 //! body decode (`H1BodyDecoder`) — is all Rust, over the vendored hyper core.
 
 use bytes::BytesMut;
-use http::{HeaderName, Method, Uri};
+use http::{HeaderName, Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Mutex;
 
+use super::errors::map_hyper_err;
 use crate::http::HeaderMap;
 use vendor_hyper::{
     BodyDecode, BodyDecoder, BodyEncoder, encode_request, encode_response, parse_request,
@@ -33,6 +34,9 @@ fn body_kind(body: &BodyDecode) -> (&'static str, Option<u64>) {
     }
 }
 
+/// Caller-argument validation (an invalid method / URL / status / header name is
+/// rejected by the `http` crate before hyper sees it): a plain `ValueError`. Wire
+/// and encoder errors from hyper itself go through `map_hyper_err` instead.
 fn value_err<E: std::fmt::Display>(what: &str, e: E) -> PyErr {
     PyValueError::new_err(format!("{what}: {e}"))
 }
@@ -119,7 +123,7 @@ impl H1Codec {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| value_err("invalid trailer field name", e))?;
         let (dst, encoder) = encode_request(m.clone(), uri, fields, body, http10, trailers)
-            .map_err(|e| value_err("failed to encode request", e))?;
+            .map_err(map_hyper_err)?;
         let mut st = self.inner.lock().unwrap();
         st.req_method = Some(m);
         st.encoder = Some(encoder);
@@ -140,11 +144,12 @@ impl H1Codec {
     }
 
     /// Finish the body: the chunked terminator `0\r\n\r\n`, or empty for a
-    /// content-length body. Errors if a declared Content-Length wasn't filled.
+    /// content-length body. Raises `H1UserError(kind="body_write_aborted")` if a
+    /// declared Content-Length wasn't filled (hyper `end_body` -> `NotEof`).
     fn serialize_end(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
         let out = match st.encoder.take() {
-            Some(enc) => enc.end().map_err(PyValueError::new_err)?,
+            Some(enc) => enc.end().map_err(map_hyper_err)?,
             None => Vec::new(),
         };
         Ok(PyBytes::new(py, &out).unbind())
@@ -158,7 +163,7 @@ impl H1Codec {
         let out = match st.encoder.take() {
             Some(enc) => enc
                 .end_with_trailers(trailers.snapshot())
-                .map_err(PyValueError::new_err)?,
+                .map_err(map_hyper_err)?,
             None => Vec::new(),
         };
         Ok(PyBytes::new(py, &out).unbind())
@@ -185,9 +190,7 @@ impl H1Codec {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
         let req_method = st.req_method.clone();
-        match parse_response(&mut st.buf, &req_method)
-            .map_err(|e| PyValueError::new_err(format!("malformed HTTP/1 response: {e}")))?
-        {
+        match parse_response(&mut st.buf, &req_method).map_err(map_hyper_err)? {
             Some(head) => {
                 let (kind, content_length) = body_kind(&head.body);
                 let headers = Py::new(py, HeaderMap::from_inner(head.headers))?;
@@ -219,7 +222,7 @@ impl H1Codec {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
         match parse_request(&mut st.buf, self.max_headers, self.ignore_invalid_headers)
-            .map_err(|e| PyValueError::new_err(format!("malformed HTTP/1 request: {e}")))?
+            .map_err(map_hyper_err)?
         {
             Some(head) => {
                 let (kind, content_length) = body_kind(&head.body);
@@ -272,7 +275,12 @@ impl H1Codec {
         } else {
             content_length.map(Some)
         };
+        let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
         let req_method = self.inner.lock().unwrap().req_method.clone();
+        // hyper `Server::encode` rejects a 1xx (not 101) status and a
+        // content-length + transfer-encoding pair as `User` errors
+        // (`H1UserError`); the connection then closes (conn.rs `encode_head`
+        // -> `Writing::Closed` + the error stored on the connection).
         let (dst, encoder) = encode_response(
             status,
             fields,
@@ -283,7 +291,7 @@ impl H1Codec {
             self.title_case_headers,
             self.date_header,
         )
-        .map_err(|e| value_err("failed to encode response", e))?;
+        .map_err(map_hyper_err)?;
         self.inner.lock().unwrap().encoder = Some(encoder);
         Ok(PyBytes::new(py, &dst).unbind())
     }
@@ -405,15 +413,11 @@ impl H1BodyDecoder {
     }
 
     /// Pull one body chunk: `bytes` if available, else `None` — end vs. need-more
-    /// is distinguished by `is_complete`.
+    /// is distinguished by `is_complete`. Raises `H1BodyError` (hyper `Kind::Body`)
+    /// on a malformed or truncated body; `io_kind` tells which
+    /// (`unexpected_eof` = the transport closed mid-body).
     fn decode(&self, py: Python<'_>) -> PyResult<Option<Py<PyBytes>>> {
-        match self
-            .inner
-            .lock()
-            .unwrap()
-            .decode()
-            .map_err(|e| PyValueError::new_err(format!("malformed HTTP/1 body: {e}")))?
-        {
+        match self.inner.lock().unwrap().decode().map_err(map_hyper_err)? {
             Some(chunk) => Ok(Some(PyBytes::new(py, &chunk).unbind())),
             None => Ok(None),
         }

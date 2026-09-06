@@ -19,7 +19,73 @@ use super::io::MemRead;
 use super::role::{Client, Server};
 use super::{Encode, Encoder, Http1Transaction, ParseContext};
 use crate::body::DecodedLength;
+use crate::error::{Header, Kind, Parse, User};
 use crate::proto::{BodyLength, MessageHead, RequestLine};
+
+// ===== hyper `Error` classification =====
+//
+// httpunk mirrors hyper's error taxonomy as Python exception classes, one per
+// public `Kind` (`httpunk.exceptions.H1*`). hyper exposes only `is_*` queries
+// plus `Display`/`source()`; the Python side needs a stable discriminant for the
+// kind and its sub-variant. `Kind` / `Parse` / `User` are `pub(super)` in
+// `crate::error` (crate-visible), so this glue reads them here rather than
+// patching the verbatim-vendored error.rs. Tags are the snake_case variant names.
+
+/// The top-level `Kind` of a hyper error as a stable tag.
+pub fn error_kind(e: &crate::Error) -> &'static str {
+    match *e.kind() {
+        Kind::Parse(_) => "parse",
+        Kind::User(_) => "user",
+        Kind::IncompleteMessage => "incomplete_message",
+        Kind::UnexpectedMessage => "unexpected_message",
+        Kind::Canceled => "canceled",
+        Kind::ChannelClosed => "channel_closed",
+        Kind::Io => "io",
+        Kind::HeaderTimeout => "header_timeout",
+        Kind::Body => "body",
+        Kind::BodyWrite => "body_write",
+        Kind::Shutdown => "shutdown",
+    }
+}
+
+/// The `Parse` variant as a stable tag (`None` unless `Kind::Parse`). `Header(h)`
+/// variants are `header_<h>` so the nesting stays visible.
+pub fn error_parse_kind(e: &crate::Error) -> Option<&'static str> {
+    let Kind::Parse(ref p) = *e.kind() else {
+        return None;
+    };
+    Some(match *p {
+        Parse::Method => "method",
+        Parse::Version => "version",
+        Parse::VersionH2 => "version_h2",
+        Parse::Uri => "uri",
+        Parse::UriTooLong => "uri_too_long",
+        Parse::Header(Header::Token) => "header_token",
+        Parse::Header(Header::ContentLengthInvalid) => "header_content_length_invalid",
+        Parse::Header(Header::TransferEncodingInvalid) => "header_transfer_encoding_invalid",
+        Parse::Header(Header::TransferEncodingUnexpected) => "header_transfer_encoding_unexpected",
+        Parse::TooLarge => "too_large",
+        Parse::Status => "status",
+        Parse::Internal => "internal",
+    })
+}
+
+/// The `User` variant as a stable tag (`None` unless `Kind::User`).
+pub fn error_user_kind(e: &crate::Error) -> Option<&'static str> {
+    let Kind::User(ref u) = *e.kind() else {
+        return None;
+    };
+    Some(match *u {
+        User::Body => "body",
+        User::BodyWriteAborted => "body_write_aborted",
+        User::Service => "service",
+        User::UnexpectedHeader => "unexpected_header",
+        User::UnsupportedStatusCode => "unsupported_status_code",
+        User::NoUpgrade => "no_upgrade",
+        User::ManualUpgrade => "manual_upgrade",
+        User::DispatchGone => "dispatch_gone",
+    })
+}
 
 /// How a response body is framed on the wire (mapped from hyper's `DecodedLength`).
 pub enum BodyDecode {
@@ -93,15 +159,18 @@ impl BodyEncoder {
     }
 
     /// Finish the body: chunked terminator `0\r\n\r\n`, or empty for a
-    /// content-length body. `Err` if a declared Content-Length wasn't filled.
-    pub fn end(self) -> Result<Vec<u8>, &'static str> {
+    /// content-length body. `Err` if a declared Content-Length wasn't filled —
+    /// hyper's `end_body` maps the encoder's `NotEof` to
+    /// `Error::new_body_write_aborted()` (`User::BodyWriteAborted`, conn.rs
+    /// `end_body`) and closes the write side; the driver does the same.
+    pub fn end(self) -> Result<Vec<u8>, crate::Error> {
         match self.0.end::<Bytes>() {
             Ok(Some(mut buf)) => {
                 let n = buf.remaining();
                 Ok(buf.copy_to_bytes(n).to_vec())
             }
             Ok(None) => Ok(Vec::new()),
-            Err(_) => Err("request body shorter than declared Content-Length"),
+            Err(not_eof) => Err(crate::Error::new_body_write_aborted().with(not_eof)),
         }
     }
 
@@ -110,7 +179,7 @@ impl BodyEncoder {
     /// `into_chunked_with_trailing_fields` (the `Trailer` header) are sent (hyper's
     /// `encode_trailers` filters + validates). Falls back to the plain terminator when
     /// no declared trailer survives (or the body isn't chunked).
-    pub fn end_with_trailers(self, trailers: HeaderMap) -> Result<Vec<u8>, &'static str> {
+    pub fn end_with_trailers(self, trailers: HeaderMap) -> Result<Vec<u8>, crate::Error> {
         match self.0.encode_trailers::<Bytes>(trailers, false) {
             Some(mut buf) => {
                 let n = buf.remaining();
@@ -146,7 +215,7 @@ pub fn encode_request(
     body: Option<Option<u64>>,
     http10: bool,
     trailer_fields: Vec<HeaderName>,
-) -> Result<(Vec<u8>, BodyEncoder), String> {
+) -> Result<(Vec<u8>, BodyEncoder), crate::Error> {
     // The request-target is serialized *as given* (hyper role.rs L1200 writes
     // `msg.head.subject.1` via its `Display`, "not enforced or validated" —
     // client/conn/http1.rs L194-204): a path-and-query `Uri` yields origin-form
@@ -182,7 +251,7 @@ pub fn encode_request(
         date_header: false,
     };
     let mut dst = Vec::new();
-    let encoder = Client::encode(enc, &mut dst).map_err(|e| format!("{e}"))?;
+    let encoder = Client::encode(enc, &mut dst)?;
     // Declare the chunked trailer fields (from the request's `Trailer` header) so the
     // body may later emit them via `end_with_trailers`. A no-op unless the body is
     // chunked (hyper `Encoder::into_chunked_with_trailing_fields`).
@@ -201,7 +270,7 @@ pub fn encode_request(
 pub fn parse_response(
     buf: &mut BytesMut,
     req_method: &Option<Method>,
-) -> Result<Option<ParsedHead>, String> {
+) -> Result<Option<ParsedHead>, crate::Error> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -217,9 +286,9 @@ pub fn parse_response(
         h09_responses: false,
         on_informational: &mut on_informational,
     };
-    // hyper's `Parse` error type is module-private, so map it to a String here
-    // (the caller in src/py can't name it).
-    match Client::parse(buf, ctx).map_err(|e| format!("{e:?}"))? {
+    // `Parse` is module-private but converts into the public `crate::Error`, whose
+    // `httpunk_*_kind` accessors give the PyO3 layer the variant.
+    match Client::parse(buf, ctx)? {
         Some(parsed) => Ok(Some(ParsedHead {
             status: parsed.head.subject.as_u16(),
             keep_alive: parsed.keep_alive,
@@ -241,7 +310,7 @@ pub fn parse_request(
     buf: &mut BytesMut,
     max_headers: Option<usize>,
     ignore_invalid_headers: bool,
-) -> Result<Option<ParsedRequest>, String> {
+) -> Result<Option<ParsedRequest>, crate::Error> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -259,7 +328,7 @@ pub fn parse_request(
         h09_responses: false,
         on_informational: &mut on_informational,
     };
-    match Server::parse(buf, ctx).map_err(|e| format!("{e:?}"))? {
+    match Server::parse(buf, ctx)? {
         Some(parsed) => {
             let RequestLine(m, uri) = parsed.head.subject;
             Ok(Some(ParsedRequest {
@@ -289,7 +358,7 @@ pub fn parse_request(
 /// hyper's server (common/date.rs; `http1::Builder::auto_date_header`, default on);
 /// `title_case_headers` is `http1::Builder::title_case_headers`.
 pub fn encode_response(
-    status: u16,
+    status: StatusCode,
     headers: HeaderMap,
     body: Option<Option<u64>>,
     req_method: Option<Method>,
@@ -297,8 +366,7 @@ pub fn encode_response(
     http10: bool,
     title_case_headers: bool,
     date_header: bool,
-) -> Result<(Vec<u8>, BodyEncoder), String> {
-    let status = StatusCode::from_u16(status).map_err(|e| format!("{e}"))?;
+) -> Result<(Vec<u8>, BodyEncoder), crate::Error> {
     let mut head = MessageHead {
         version: if http10 {
             Version::HTTP_10
@@ -335,7 +403,10 @@ pub fn encode_response(
         crate::common::date::update();
     }
     let mut dst = Vec::new();
-    let encoder = Server::encode(enc, &mut dst).map_err(|e| format!("{e}"))?;
+    // `Server::encode` fails for the user errors hyper reports on the connection
+    // (`User::UnexpectedHeader`, `User::UnsupportedStatusCode`); `dst` is rewound
+    // to before the half-pushed head, so nothing of it reaches the wire.
+    let encoder = Server::encode(enc, &mut dst)?;
     Ok((dst, BodyEncoder(encoder)))
 }
 
@@ -440,9 +511,12 @@ impl BodyDecoder {
 
     /// One decode step: `Ok(Some(chunk))` = body data; `Ok(None)` = no chunk right
     /// now — end vs. need-more is distinguished by `is_complete()`. `Err` on a
-    /// malformed body. (Trailers terminate the body; they are captured and
-    /// available via `take_trailers`.)
-    pub fn decode(&mut self) -> Result<Option<Bytes>, String> {
+    /// malformed body: the decoder's `io::Error` wrapped as hyper's dispatcher does
+    /// (`Error::new_body(e)`, `Kind::Body`) — a truncated body (`UnexpectedEof`)
+    /// and a framing error (`InvalidInput` / `InvalidData`) are the same kind,
+    /// distinguished by the io kind of the cause. (Trailers terminate the body;
+    /// they are captured and available via `take_trailers`.)
+    pub fn decode(&mut self) -> Result<Option<Bytes>, crate::Error> {
         if self.done {
             return Ok(None);
         }
@@ -476,7 +550,7 @@ impl BodyDecoder {
                     Ok(None)
                 }
             }
-            Poll::Ready(Err(e)) => Err(e.to_string()),
+            Poll::Ready(Err(e)) => Err(crate::Error::new_body(e)),
         }
     }
 }

@@ -4,6 +4,7 @@ Encoder), driven via the `H1Codec` PyO3 glue with zero I/O."""
 import pytest
 
 from httpunk._httpunk import H1Codec, H1ResponseHead
+from httpunk.exceptions import H1ParseError, H1UserError
 from httpunk.http import HeaderMap
 
 
@@ -104,5 +105,81 @@ def test_receive_head_needs_more_bytes():
 def test_receive_malformed_response_raises():
     codec = H1Codec()
     codec.serialize_request("GET", "http://h/", HeaderMap([("host", "h")]))
-    with pytest.raises(ValueError):
+    with pytest.raises(H1ParseError) as ei:
         codec.receive_head(b"NOT-HTTP garbage\r\n\r\n")
+    assert ei.value.args[0] == "version"  # hyper `Parse::Version` (httparse: no `HTTP/` after the status line start)
+
+
+# ----- hyper `Kind::Parse` / `Kind::User` mirrored as `H1ParseError` / `H1UserError` -----
+
+
+def test_parse_error_kinds_mirror_hyper_parse_variants():
+    """`H1ParseError.args[0]` is the hyper `Parse` variant (`Parse::Header(h)` as
+    `header_<h>`), with hyper's `Display` text as the message."""
+    codec = H1Codec()
+    with pytest.raises(H1ParseError) as ei:
+        codec.receive_request_head(b"GET / HTTP/1.1\r\ncontent-length: abc\r\n\r\n")
+    assert ei.value.args[0] == "header_content_length_invalid"
+    assert ei.value.args[1] == "invalid content-length parsed"
+
+    codec = H1Codec()
+    with pytest.raises(H1ParseError) as ei:
+        codec.receive_request_head(b"GET / HTTP/1.1\r\nBad Header Here\r\n\r\n")
+    assert ei.value.args[0] == "header_token"
+    assert ei.value.args[1] == "invalid HTTP header parsed"
+
+    codec = H1Codec()
+    codec.serialize_request("GET", "http://h/", HeaderMap([("host", "h")]))
+    with pytest.raises(H1ParseError) as ei:
+        codec.receive_head(b"HTTP/1.1 12 Nope\r\n\r\n")
+    assert ei.value.args[0] == "status"
+
+
+def test_response_1xx_status_is_user_error_unsupported_status_code():
+    """hyper `Server::encode` refuses a 1xx (not 101) response (role.rs L400-405,
+    `User::UnsupportedStatusCode`) and rewinds `dst`: nothing is encoded."""
+    codec = H1Codec()
+    codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
+    with pytest.raises(H1UserError) as ei:
+        codec.serialize_response(102)
+    assert ei.value.args[0] == "unsupported_status_code"
+    assert ei.value.args[1] == "response has 1xx status code, not supported by server"
+
+
+def test_response_content_length_and_transfer_encoding_is_user_error_unexpected_header():
+    """Both `content-length` and `transfer-encoding` on a response: hyper `Server::encode`
+    cancels with `User::UnexpectedHeader` (role.rs L803-807) and rewinds `dst`."""
+    codec = H1Codec()
+    codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
+    hdrs = HeaderMap([("content-length", "5"), ("transfer-encoding", "chunked")])
+    with pytest.raises(H1UserError) as ei:
+        codec.serialize_response(200, hdrs, content_length=5)
+    assert ei.value.args[0] == "unexpected_header"
+    assert ei.value.args[1] == "user sent unexpected header"
+
+
+def test_body_short_of_content_length_is_user_error_body_write_aborted():
+    """Ending a Content-Length body early: the encoder's `NotEof` -> hyper `end_body`
+    -> `User::BodyWriteAborted` (conn.rs). Both roles, and with trailers."""
+    codec = H1Codec()
+    codec.serialize_request("POST", "http://h/", HeaderMap([("host", "h")]), content_length=5)
+    codec.serialize_data(b"ab")
+    with pytest.raises(H1UserError) as ei:
+        codec.serialize_end()
+    assert ei.value.args[0] == "body_write_aborted"
+    assert ei.value.args[1] == "user body write aborted: early end, expected 3 more bytes"
+
+    codec = H1Codec()
+    codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
+    codec.serialize_response(200, content_length=5)
+    with pytest.raises(H1UserError) as ei:
+        codec.serialize_trailers(HeaderMap([("x-t", "1")]))  # not chunked: falls back to `end()`
+    assert ei.value.args[0] == "body_write_aborted"
+
+
+def test_invalid_status_argument_stays_value_error():
+    """Caller-argument validation (the `http` crate's `StatusCode::from_u16`) is not a
+    hyper error kind: a plain `ValueError`, not an `H1Error`."""
+    codec = H1Codec()
+    with pytest.raises(ValueError, match="invalid status"):
+        codec.serialize_response(1000)

@@ -23,8 +23,8 @@ HeaderNameLike = str | bytes
 HeaderValueLike = str | bytes
 
 # ===========================================================================
-# Errors  (protocol-neutral root + ConnectionClosedError in src/py/errors.rs;
-# the H2* protocol errors in src/py/h2/streams.rs)
+# Errors  (protocol-neutral root + ConnectionClosedError in src/errors.rs; the H1*
+# errors in src/h1/errors.rs; the H2* protocol errors in src/h2/errors.rs)
 # ===========================================================================
 
 class HTTPunkError(Exception):
@@ -47,9 +47,43 @@ class H2FlowControlError(H2Error):
     """Flow-control window over/underflow. args = (reason: int,)."""
 
 class ConnectionClosedError(HTTPunkError):
-    """The transport closed (EOF/reset/IO error) with work still in flight — a
-    transport failure, not a protocol violation (so no GOAWAY). Protocol-neutral:
-    raised on both HTTP/1 and HTTP/2, hence it sits under HTTPunkError, not H2Error."""
+    """The transport failed (reset / IO error) with work still in flight — hyper's
+    `Kind::Io`, h2's `Error::Io`: a transport failure, not a protocol violation (so
+    no GOAWAY) and not the HTTP state noticing an EOF (HTTP/1: `H1IncompleteMessageError`,
+    `H1BodyError`). Protocol-neutral: raised on both HTTP/1 and HTTP/2, hence it sits
+    under HTTPunkError."""
+
+class H1Error(HTTPunkError):
+    """Base class for every httpunk HTTP/1 error — one subclass per public hyper
+    `Error` kind the h1 codec can produce. Messages are hyper's `Display` text."""
+
+class H1ParseError(H1Error):
+    """A malformed HTTP/1 message head (hyper `Kind::Parse`). args = (kind: str, message: str);
+    `kind` is the hyper `Parse` variant: `method`, `version`, `version_h2`, `uri`,
+    `uri_too_long`, `header_token`, `header_content_length_invalid`,
+    `header_transfer_encoding_invalid`, `header_transfer_encoding_unexpected`,
+    `too_large`, `status`, `internal`."""
+
+class H1BodyError(H1Error):
+    """A body that could not be decoded (hyper `Kind::Body`): a framing error, or the
+    transport closing mid-body. args = (io_kind: str, message: str); `io_kind` is the
+    io kind of hyper's cause: `unexpected_eof` = truncated; `invalid_input` /
+    `invalid_data` = malformed chunk framing."""
+
+class H1IncompleteMessageError(H1Error):
+    """The connection closed while a message was still expected (hyper
+    `Kind::IncompleteMessage`): EOF before the response head, or the client closing
+    its side while the server's response is in flight. args = (message: str,)."""
+
+class H1UnexpectedMessageError(H1Error):
+    """Bytes on an idle client connection (hyper `Kind::UnexpectedMessage`): the
+    connection is poisoned; the next `request()` raises it with `request_unsent = True`.
+    args = (message: str,)."""
+
+class H1UserError(H1Error):
+    """Local misuse hyper reports on the wire path (hyper `Kind::User`), closing the
+    connection. args = (kind: str, message: str); `kind`: `body_write_aborted`,
+    `unexpected_header`, `unsupported_status_code`."""
 
 # ===========================================================================
 # HeaderMap  (src/py/http/mod.rs)

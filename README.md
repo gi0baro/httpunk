@@ -273,24 +273,32 @@ h.raw_items()                # [(b'content-type', b'text/plain'), (b'set-cookie'
 
 ### Errors
 
-httpunk's exceptions all derive from a common `HTTPunkError` root. `ConnectionClosedError`
-is **protocol-neutral** — raised on both HTTP/1 and HTTP/2 when the transport closes with
-work in flight — so it sits directly under the root. Every **HTTP/2-specific** error shares
-the `H2Error` sub-base:
+httpunk's exceptions all derive from a common `HTTPunkError` root, with one class per
+public error kind of the upstream crate, so a caller can match on what hyper or h2 would
+have reported. `ConnectionClosedError` is **protocol-neutral** — hyper's `Io` and h2's
+`Io`: the transport failed with work in flight — so it sits directly under the root. The
+**HTTP/1** errors mirror hyper's `Error` kinds under `H1Error`; the **HTTP/2** errors
+mirror the h2 crate's under `H2Error`:
 
 ```
 HTTPunkError
-├── ConnectionClosedError    transport closed / IO error with work in flight  (HTTP/1 + HTTP/2)
-└── H2Error                  base for HTTP/2 protocol errors
-    ├── H2ProtocolError      connection-level protocol violation (-> GOAWAY)
-    ├── H2StreamError        stream-level protocol violation (-> RST_STREAM)
-    ├── H2UserError          local API misuse
-    ├── H2FlowControlError   flow-control window over/underflow
-    ├── GoAwayError          the peer sent GOAWAY
-    └── StreamResetError     the peer sent RST_STREAM for a stream
+├── ConnectionClosedError        transport closed / IO error with work in flight  (hyper Io, h2 Io)
+├── H1Error                      base for HTTP/1 errors (hyper `Error` kinds)
+│   ├── H1ParseError             malformed message head (hyper Parse) — args = (kind, message)
+│   ├── H1BodyError              malformed or truncated body (hyper Body) — args = (io_kind, message)
+│   ├── H1IncompleteMessageError EOF while a message was still expected (hyper IncompleteMessage)
+│   ├── H1UnexpectedMessageError bytes on an idle client connection (hyper UnexpectedMessage)
+│   └── H1UserError              local misuse hyper reports on the wire path (hyper User) — args = (kind, message)
+└── H2Error                      base for HTTP/2 protocol errors
+    ├── H2ProtocolError          connection-level protocol violation (-> GOAWAY)
+    ├── H2StreamError            stream-level protocol violation (-> RST_STREAM)
+    ├── H2UserError              local API misuse
+    ├── H2FlowControlError       flow-control window over/underflow
+    ├── GoAwayError              the peer sent GOAWAY
+    └── StreamResetError         the peer sent RST_STREAM for a stream
 ```
 
-Catch `H2Error` for HTTP/2 protocol failures, `ConnectionClosedError` for a dropped
+Catch `H1Error` / `H2Error` for protocol failures, `ConnectionClosedError` for a dropped
 transport, or `HTTPunkError` for anything httpunk raises.
 
 `GoAwayError` carries `last_stream_id`, `error_code` and `debug_data`; `StreamResetError`
@@ -298,7 +306,7 @@ carries `stream_id` and `error_code`. Error codes are `H2Reason` members (an `In
 they compare equal to plain ints) for known codes, or a raw int otherwise.
 
 ```python
-from httpunk import ConnectionClosedError, GoAwayError, HTTPunkError, StreamResetError
+from httpunk import ConnectionClosedError, GoAwayError, H1BodyError, HTTPunkError, StreamResetError
 
 try:
     resp = await conn.request("GET", "/")
@@ -308,6 +316,9 @@ except StreamResetError as exc:
 except GoAwayError as exc:
     # streams above last_stream_id were not processed and are safe to retry
     print("server going away:", exc.last_stream_id)
+except H1BodyError as exc:
+    io_kind, message = exc.args
+    print("truncated" if io_kind == "unexpected_eof" else "malformed body")
 except ConnectionClosedError:
     print("transport dropped")
 except HTTPunkError:

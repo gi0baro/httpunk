@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Mutex;
 
-use super::streams::H2ProtocolError;
+use super::errors::{H2ProtocolError, user_payload_too_big};
 use crate::http::HeaderMap;
 use vendor_h2::frame::{self, HEADER_LEN, Head, Kind};
 use vendor_h2::hpack;
@@ -608,7 +608,7 @@ impl H2Codec {
         // 3-byte length field would also overflow past 2^24-1.
         let max = self.inner.lock().unwrap().send_max_frame_size;
         if data.len() > max {
-            return Err(super::streams::user_payload_too_big(data.len(), max));
+            return Err(user_payload_too_big(data.len(), max));
         }
         let flags = if end_stream { FLAG_END_STREAM } else { 0 };
         let head = Head::new(Kind::Data, flags, frame::StreamId::from(stream_id));

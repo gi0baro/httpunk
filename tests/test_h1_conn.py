@@ -7,7 +7,7 @@ from _client import open_h1
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
-from httpunk import HTTPunkError, Version
+from httpunk import H1BodyError, H1IncompleteMessageError, H1UnexpectedMessageError, H1UserError, HTTPunkError, Version
 
 
 async def _read_request(stream):
@@ -481,7 +481,7 @@ async def test_unexpected_bytes_past_body_poison_connection():
         async with open_h1(host, port) as conn:
             r1 = await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})
             assert await r1.read() == b"hi"  # the response is intact
-            with pytest.raises(ValueError, match="unexpected"):
+            with pytest.raises(H1UnexpectedMessageError):
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})  # connection poisoned
         await done.wait()
         s.cancel()
@@ -515,7 +515,7 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
             assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
             r1_read.set()
             await junk_sent.wait()  # the junk is now sitting in the client's socket buffer
-            with pytest.raises(ValueError, match="unexpected"):
+            with pytest.raises(H1UnexpectedMessageError):
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
         s.cancel()
 
@@ -585,8 +585,8 @@ async def test_idle_stray_bytes_poison_promptly():
                     break
                 await sleep(0.005)
             assert conn.closed
-            assert isinstance(conn._conn.error, ValueError)
-            with pytest.raises(ValueError, match="unexpected") as excinfo:
+            assert isinstance(conn._conn.error, H1UnexpectedMessageError)
+            with pytest.raises(H1UnexpectedMessageError) as excinfo:
                 await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
             assert getattr(excinfo.value, "request_unsent", False) is True
         s.cancel()
@@ -640,4 +640,80 @@ async def test_body_iterable_error_fails_promptly():
         async with open_h1(host, port) as conn:
             with pytest.raises(_BoomError):
                 await conn.request("POST", "/", headers={"host": f"{host}:{port}"}, body=body())
+        s.cancel()
+
+
+# ----- hyper error kinds on the client (0.3.0) -----
+
+
+@pytest.mark.tonio
+async def test_server_close_before_response_head_is_incomplete_message():
+    """EOF while the response head is expected: hyper `read_head` maps `Parse::Eof` on a
+    mid-message read to `IncompleteMessage` (conn.rs L245-252) — a sibling of the io
+    error kind, so `H1IncompleteMessageError`, not `ConnectionClosedError`."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        stream = await listener.accept()
+        await _read_request(stream)
+        stream.close()  # hang up without answering
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            with pytest.raises(H1IncompleteMessageError):
+                await conn.request("GET", "/", headers={"host": f"{host}:{port}"})
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_response_body_truncated_by_server_close_is_body_error():
+    """The server closes mid-body: hyper's decoder `UnexpectedEof` (`IncompleteBody`)
+    surfaces from the body stream as `Kind::Body` -> `H1BodyError(io_kind=
+    "unexpected_eof")` out of `read()`; the connection is not reused."""
+    listener, host, port = await _listener()
+
+    async def serve():
+        stream = await listener.accept()
+        await _read_request(stream)
+        await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello")
+        stream.close()
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            resp = await conn.request("GET", "/", headers={"host": f"{host}:{port}"})
+            with pytest.raises(H1BodyError) as ei:
+                await resp.read()
+            assert ei.value.args[0] == "unexpected_eof"
+            assert conn.closed
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_request_body_short_of_content_length_is_user_error():
+    """A streamed request body that ends short of its explicit `content-length`: the
+    encoder's `NotEof` -> `User::BodyWriteAborted`. The writer fails promptly (F12) and
+    `request()` raises the `H1UserError`; the connection is poisoned."""
+    listener, host, port = await _listener()
+    done = Event()
+
+    async def serve():
+        try:
+            stream = await listener.accept()
+            while await stream.receive_some(65536):  # read until the client closes
+                pass
+        finally:
+            done.set()
+
+    async def body():
+        yield b"abc"
+
+    async with scope() as s:
+        s.spawn(serve())
+        async with open_h1(host, port) as conn:
+            with pytest.raises(H1UserError) as ei:
+                await conn.request("POST", "/", headers={"host": f"{host}:{port}", "content-length": "10"}, body=body())
+            assert ei.value.args[0] == "body_write_aborted"
+        await done.wait()
         s.cancel()

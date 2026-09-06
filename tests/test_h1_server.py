@@ -12,7 +12,7 @@ from tonio.colored.net import open_tcp_listeners
 from httpunk import Version
 from httpunk._backend.asyncio import AsyncioBackend
 from httpunk._backend.tonio import TonioBackend
-from httpunk.exceptions import ConnectionClosedError
+from httpunk.exceptions import ConnectionClosedError, H1BodyError, H1IncompleteMessageError, H1UserError
 from httpunk.h1 import H1Server
 from httpunk.h1.server import ServerConnection
 from httpunk.http import HeaderMap
@@ -100,6 +100,26 @@ class _PeekableStub(_StubTransport):
             return await super().receive_some(max_bytes)
         chunk, self._buffered = self._buffered[:max_bytes], self._buffered[max_bytes:]
         return chunk
+
+
+class _SilentStub(_StubTransport):
+    """A stub whose client goes SILENT once its bytes are consumed: a read then parks
+    (until `close()` wakes it with EOF) instead of returning EOF at once — so the
+    mid-message watcher a streamed response arms sees an open peer, not a hang-up."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self._closed_evt = Event()
+
+    async def receive_some(self, max_bytes=65536):
+        if self._data:
+            return await super().receive_some(max_bytes)
+        await self._closed_evt.wait()
+        return b""
+
+    def close(self):
+        super().close()
+        self._closed_evt.set()
 
 
 async def _echo_server(listener, seen=None):
@@ -1037,7 +1057,7 @@ async def test_server_peer_closed_resolves_and_fails_the_late_response():
                 seen.append("peer_closed")
                 try:
                     await req.respond(200, body=b"too late")
-                except ConnectionClosedError:
+                except H1IncompleteMessageError:
                     seen.append("respond failed")
             seen.append("loop ended")
             done.set()
@@ -1074,7 +1094,7 @@ async def test_server_streamed_response_fails_fast_on_peer_close():
 
                 try:
                     await req.respond(200, body=body())
-                except ConnectionClosedError:
+                except H1IncompleteMessageError:
                     seen.append("failed")
                 done.set()
 
@@ -1106,7 +1126,7 @@ async def test_server_push_send_data_fails_after_peer_close():
                 await req.peer_closed()
                 try:
                     await stream.send_data(b"tock")
-                except ConnectionClosedError:
+                except H1IncompleteMessageError:
                     seen.append("failed")
                 done.set()
 
@@ -1359,3 +1379,103 @@ async def test_abrupt_client_close_ends_iteration_cleanly():
             transport.close()
     assert served == ["/one"]
     assert not server_errors
+
+
+# ----- hyper error kinds on the server: `H1BodyError` / `H1UserError` (0.3.0) -----
+
+
+@pytest.mark.tonio
+async def test_server_request_body_truncated_by_client_close_is_body_error():
+    """A client that hangs up mid-upload: hyper's decoder returns `UnexpectedEof`
+    (`IncompleteBody`) and the request body stream yields `Error::new_body` — NOT
+    `IncompleteMessage` (that is a mid-HEAD EOF) and not a parse error. Mirrored as
+    `H1BodyError(io_kind="unexpected_eof")` out of `read()`, and the connection is
+    unusable afterwards (hyper `Reading::Closed`)."""
+    stub = _StubTransport(b"POST / HTTP/1.1\r\ncontent-length: 10\r\n\r\nhello")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    assert req is not None
+    with pytest.raises(H1BodyError) as ei:
+        await req.read()
+    assert ei.value.args[0] == "unexpected_eof"
+    assert not conn._reusable
+
+
+@pytest.mark.tonio
+async def test_server_1xx_response_is_user_error_and_closes_without_writing():
+    """`respond(102)`: hyper `Server::encode` fails with `User::UnsupportedStatusCode`,
+    `dst` is rewound (nothing reaches the wire) and the connection closes with the
+    error stored on it (conn.rs `encode_head` -> `Writing::Closed`). `respond()` raises
+    the `H1UserError` itself — not a wrapped `ConnectionClosedError`."""
+    stub = _StubTransport(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    with pytest.raises(H1UserError) as ei:
+        await req.respond(102)
+    assert ei.value.args[0] == "unsupported_status_code"
+    assert stub.sent == b""
+    assert stub.closed
+    assert await conn.next_request() is None
+
+
+@pytest.mark.tonio
+async def test_server_pull_body_short_of_content_length_is_user_error():
+    """An explicit `content-length` with a streamed body that ends early: the encoder
+    honours the declared length (hyper `set_length`'s `existing_con_len`), so the
+    body's end is `NotEof` -> `User::BodyWriteAborted`; the connection closes."""
+    stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+
+    async def body():
+        yield b"abc"
+
+    with pytest.raises(H1UserError) as ei:
+        await req.respond(200, headers={"content-length": "10"}, body=body())
+    assert ei.value.args[0] == "body_write_aborted"
+    assert stub.sent.startswith(b"HTTP/1.1 200")  # the head and the 3 bytes went out; the body never completed
+    assert stub.sent.endswith(b"abc")
+    assert stub.closed
+
+
+@pytest.mark.tonio
+async def test_server_push_body_short_of_content_length_is_user_error():
+    """The push path: `send_data(end_stream=True)` short of the declared length raises
+    the same `H1UserError` and poisons the connection like a failed write."""
+    stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    stream = await req.send_response(200, headers={"content-length": "10"})
+    with pytest.raises(H1UserError) as ei:
+        await stream.send_data(b"abc", end_stream=True)
+    assert ei.value.args[0] == "body_write_aborted"
+    assert stub.closed
+    with pytest.raises(RuntimeError):  # the stream is done
+        await stream.send_data(b"more")
+
+
+@pytest.mark.tonio
+async def test_server_body_iterable_exception_propagates_as_itself():
+    """The app's own body iterable raising: hyper wraps it as `User::Body` because Rust
+    must; Python carries the instance — `respond()` raises it unwrapped (not a
+    `ConnectionClosedError`), and the connection closes (hyper `Writing::Closed`)."""
+
+    class AppError(Exception):
+        pass
+
+    stub = _SilentStub(b"GET / HTTP/1.1\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+
+    async def body():
+        yield b"abc"
+        raise AppError("boom")
+
+    with pytest.raises(AppError):
+        await req.respond(200, body=body())
+    assert stub.closed

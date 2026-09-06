@@ -4,6 +4,12 @@ from ._httpunk import __version__ as __version__
 from .exceptions import (
     ConnectionClosedError as ConnectionClosedError,
     GoAwayError as GoAwayError,
+    H1BodyError as H1BodyError,
+    H1Error as H1Error,
+    H1IncompleteMessageError as H1IncompleteMessageError,
+    H1ParseError as H1ParseError,
+    H1UnexpectedMessageError as H1UnexpectedMessageError,
+    H1UserError as H1UserError,
     H2Error as H2Error,
     H2FlowControlError as H2FlowControlError,
     H2ProtocolError as H2ProtocolError,

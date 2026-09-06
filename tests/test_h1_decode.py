@@ -7,6 +7,7 @@ end vs. need-more is told by `is_complete`."""
 import pytest
 
 from httpunk._httpunk import H1BodyDecoder
+from httpunk.exceptions import H1BodyError
 
 
 def _pull(dec):
@@ -112,15 +113,17 @@ def test_chunked_split_mid_size_and_mid_body():
 def test_chunked_bad_size_raises():
     dec = H1BodyDecoder("chunked")
     dec.feed(b"zz\r\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(H1BodyError) as ei:
         dec.decode()
+    assert ei.value.args[0] == "invalid_input"  # hyper: `Kind::Body` over an `InvalidInput` io error
 
 
 def test_chunked_extension_newline_rejected():
     dec = H1BodyDecoder("chunked")
     dec.feed(b"5;bad\nvalue\r\nhello\r\n0\r\n\r\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(H1BodyError) as ei:
         _pull(dec)
+    assert ei.value.args[0] == "invalid_data"
 
 
 def test_close_delimited_reads_until_eof():
@@ -131,3 +134,55 @@ def test_close_delimited_reads_until_eof():
     dec.mark_eof()
     body, complete = _pull(dec)
     assert body == b"" and complete
+
+
+# ----- hyper `Kind::Body` over an `UnexpectedEof` io error: a truncated body -----
+
+
+def test_length_body_truncated_at_eof_is_body_error_unexpected_eof():
+    """The transport closes before a Content-Length body is complete: hyper's decoder
+    returns `io::Error(UnexpectedEof, IncompleteBody)` (decode.rs L159-165) and the
+    dispatcher surfaces it as `Error::new_body` — the same `Kind::Body` as a framing
+    error, told apart by the io kind of the cause. Mirrored as `H1BodyError` with
+    `args[0] == "unexpected_eof"`."""
+    dec = H1BodyDecoder("length", 10)
+    dec.feed(b"hello")
+    body, complete = _pull(dec)
+    assert body == b"hello" and not complete
+    dec.mark_eof()
+    with pytest.raises(H1BodyError) as ei:
+        dec.decode()
+    assert ei.value.args[0] == "unexpected_eof"
+    assert ei.value.args[1] == "error reading a body from connection: end of file before message length reached"
+
+
+def test_chunked_body_truncated_at_eof_is_body_error_unexpected_eof():
+    """A chunked body cut before its terminator: EOF inside a chunk (decode.rs L484-491,
+    `IncompleteBody`) or inside the size line (L254, "unexpected EOF during chunk size
+    line") are both `UnexpectedEof`."""
+    dec = H1BodyDecoder("chunked")
+    dec.feed(b"5\r\nhel")
+    dec.mark_eof()
+    with pytest.raises(H1BodyError) as ei:
+        _pull(dec)
+    assert ei.value.args[0] == "unexpected_eof"
+
+    dec = H1BodyDecoder("chunked")
+    dec.feed(b"5\r\nhello\r\n")  # a complete chunk, then EOF where the next size line should be
+    dec.mark_eof()
+    with pytest.raises(H1BodyError) as ei:
+        _pull(dec)
+    assert ei.value.args[0] == "unexpected_eof"
+
+
+def test_body_error_is_httpunk_error_and_copies_with_io_kind():
+    """`H1BodyError` sits under `H1Error` / `HTTPunkError`, and `fresh_exc`'s `copy.copy`
+    (used to store/re-raise connection errors) keeps `io_kind`."""
+    import copy
+
+    from httpunk.exceptions import H1Error, HTTPunkError
+
+    exc = H1BodyError("unexpected_eof", "msg")
+    assert isinstance(exc, H1Error) and isinstance(exc, HTTPunkError)
+    dup = copy.copy(exc)
+    assert type(dup) is H1BodyError and dup.args == ("unexpected_eof", "msg")

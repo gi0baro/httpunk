@@ -3,6 +3,7 @@
 //! via each pyclass's `name = "..."`.
 
 mod codec;
+mod errors;
 mod streams;
 
 use pyo3::prelude::*;
@@ -57,17 +58,7 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
 
     m.add_class::<streams::H2StreamState>()?;
     m.add_class::<streams::H2FlowControl>()?;
-    m.add("H2Error", m.py().get_type::<streams::H2Error>())?;
-    m.add(
-        "H2ProtocolError",
-        m.py().get_type::<streams::H2ProtocolError>(),
-    )?;
-    m.add("H2StreamError", m.py().get_type::<streams::H2StreamError>())?;
-    m.add("H2UserError", m.py().get_type::<streams::H2UserError>())?;
-    m.add(
-        "H2FlowControlError",
-        m.py().get_type::<streams::H2FlowControlError>(),
-    )?;
+    errors::register(m)?;
     m.add("H2Reason", build_reason(m.py())?)?;
 
     Ok(())

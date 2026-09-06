@@ -18,7 +18,13 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
 from .._httpunk import H1BodyDecoder, H1Codec
-from ..exceptions import ConnectionClosedError, fresh_exc
+from ..exceptions import (
+    ConnectionClosedError,
+    H1IncompleteMessageError,
+    H1ParseError,
+    H1UnexpectedMessageError,
+    fresh_exc,
+)
 from ..http import HeaderMap
 from ..types import Response, Version
 from .connection import H1ConnectionBase
@@ -502,7 +508,9 @@ class Connection(H1ConnectionBase):
                 # raise's traceback (exceptions.fresh_exc).
                 if write_error:
                     raise fresh_exc(write_error[0]) from write_error[0]
-                raise ConnectionClosedError("connection closed before the response head")
+                # hyper: `Parse::Eof` on a mid-message read -> `IncompleteMessage`
+                # (conn.rs `read_head` L245-252) — the HTTP state expected a response.
+                raise H1IncompleteMessageError("connection closed before message completed: no response head")
             buffered += len(data)
             head = codec.receive_head(data)
             if head is not None:
@@ -514,7 +522,7 @@ class Connection(H1ConnectionBase):
             # enforces the same cap (`_MAX_HEAD_SIZE` + auto-431); the client
             # just fails the connection (hyper `Parse::TooLarge`).
             if buffered >= _MAX_HEAD_SIZE:
-                raise ValueError("response head too large (Parse::TooLarge)")
+                raise H1ParseError("too_large", "message head is too large")
             data = None
 
     async def _await_body_failure(self, body_failed, write_error):
@@ -538,7 +546,9 @@ class Connection(H1ConnectionBase):
         leftover check in share.py). The next `send_request`/`wait_idle` raises
         the recorded error."""
         if self.error is None:
-            self.error = ValueError(f"received {nbytes} unexpected bytes on an idle HTTP/1 connection")
+            self.error = H1UnexpectedMessageError(
+                f"received unexpected message from connection: {nbytes} bytes on an idle HTTP/1 connection"
+            )
         self._closed = True
         self._close_transport()
 

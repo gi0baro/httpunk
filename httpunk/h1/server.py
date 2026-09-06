@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import PUMP_ABANDONED, PUMP_DONE, BaseServer, aclose_body, event_result, read_all
 from .._httpunk import H1BodyDecoder, H1Codec
-from ..exceptions import ConnectionClosedError
+from ..exceptions import ConnectionClosedError, H1IncompleteMessageError, H1ParseError, HTTPunkError
 from ..http import HeaderMap
 from ..types import Version
 from .connection import H1ConnectionBase
@@ -63,7 +63,7 @@ _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (ht
 _H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # The error an in-flight response gets once the client closed its side mid-request —
 # hyper's `IncompleteMessage` from `mid_message_detect_eof` (conn.rs L491-508).
-_PEER_CLOSED_MSG = "client closed the connection before the response completed (IncompleteMessage)"
+_PEER_CLOSED_MSG = "connection closed before message completed: the client closed its side mid-request"
 
 
 def _connection_has(headers, token):
@@ -78,13 +78,14 @@ def _connection_has(headers, token):
     return False
 
 
-def _error_status(message):
-    """Map a request-head parse error to hyper's automatic status (`Server::
-    on_error`, role.rs L466-484): URI too long -> 414, headers too large -> 431,
-    everything else (method/header/uri/version) -> 400."""
-    if "UriTooLong" in message:
+def _error_status(kind):
+    """Map a request-head parse error (`H1ParseError.args[0]`, the hyper `Parse`
+    variant) to hyper's automatic status (`Server::on_error`, role.rs L481-499):
+    `uri_too_long` -> 414, `too_large` -> 431, everything else (method / header /
+    uri / version) -> 400."""
+    if kind == "uri_too_long":
         return 414
-    if "TooLarge" in message:
+    if kind == "too_large":
         return 431
     return 400
 
@@ -295,12 +296,19 @@ class SendStream:
         self._check_open()
         self._conn._check_peer_open(self._req)
         codec = self._codec
-        if codec.body_is_eof():
-            buf = codec.serialize_end() if end_stream else b""
-        else:
-            buf = codec.serialize_data(bytes(chunk))
-            if end_stream:
-                buf += codec.serialize_end()  # one write: last chunk + terminator (hyper flushes them together)
+        try:
+            if codec.body_is_eof():
+                buf = codec.serialize_end() if end_stream else b""
+            else:
+                buf = codec.serialize_data(bytes(chunk))
+                if end_stream:
+                    buf += codec.serialize_end()  # one write: last chunk + terminator (hyper flushes them together)
+        except BaseException as exc:
+            # `serialize_end` on a body short of its Content-Length: hyper `end_body` ->
+            # `User::BodyWriteAborted` + `Writing::Closed`. Same poison as a failed write.
+            self._done = True
+            self._req._response_done = True
+            self._conn._fail_response(exc)
         if end_stream:
             self._done = True
         if buf:
@@ -316,7 +324,12 @@ class SendStream:
         self._conn._check_peer_open(self._req)
         hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
         self._done = True
-        await self._write(self._codec.serialize_trailers(hdrs))
+        try:
+            buf = self._codec.serialize_trailers(hdrs)
+        except BaseException as exc:
+            self._req._response_done = True
+            self._conn._fail_response(exc)
+        await self._write(buf)
         self._conn._finish_response(self._req)
 
     async def send_reset(self, reason: int | None = None) -> None:
@@ -515,7 +528,7 @@ class ServerConnection(H1ConnectionBase):
         # more is written for this exchange. Poison + close, surface `IncompleteMessage`.
         if req._peer_closed:
             req._response_done = True
-            self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))
+            self._fail_response(H1IncompleteMessageError(_PEER_CLOSED_MSG))
 
     async def _send_async_body(self, req, body, trailers):
         """Stream an ASYNC response body and fail fast on a client FIN. hyper polls the
@@ -548,7 +561,7 @@ class ServerConnection(H1ConnectionBase):
         await done.wait()
         if abandoned:
             req._response_done = True
-            self._fail_response(ConnectionClosedError(_PEER_CLOSED_MSG))
+            self._fail_response(H1IncompleteMessageError(_PEER_CLOSED_MSG))
         if box:
             req._response_done = True
             self._fail_response(box[0])
@@ -618,7 +631,7 @@ class ServerConnection(H1ConnectionBase):
         codec = H1Codec(**self._codec_options)
         try:
             head = await self._read_request_head(codec, leftover)
-        except ValueError as exc:
+        except H1ParseError as exc:
             self._closed = True
             self._reusable = False
             if bytes(self._head_raw[: len(_H2_PREFACE)]) == _H2_PREFACE:
@@ -629,8 +642,9 @@ class ServerConnection(H1ConnectionBase):
                 self._close_transport()
                 return None
             # Any other malformed request head: auto-respond like hyper's
-            # `Server::on_error` (role.rs L466-484), then close.
-            await self._send_error(codec, _error_status(str(exc)))
+            # `Server::on_error` (role.rs L481-499), then close. The app never sees
+            # the `H1ParseError` — hyper's service is never invoked for it either.
+            await self._send_error(codec, _error_status(exc.args[0]))
             return None
         except self.backend.broken_transport_errors:
             # The transport died at the request boundary — an RST, or a TLS
@@ -770,9 +784,9 @@ class ServerConnection(H1ConnectionBase):
             # Cap the still-incomplete head at hyper's max_buf_size (io.rs L202-205):
             # once the buffered bytes reach the limit it's `Parse::TooLarge` -> auto 431
             # + close. Without this a slow/never-terminating head stream is unbounded
-            # memory per connection (F14). `_error_status` maps "TooLarge" -> 431.
+            # memory per connection (F14). `_error_status` maps `too_large` -> 431.
             if buffered >= self._max_buf_size:
-                raise ValueError("message head is too large (Parse::TooLarge)")
+                raise H1ParseError("too_large", "message head is too large")
 
     def _read_or_shutdown(self, n):
         """The next idle-read awaitable, or `_SHUTDOWN` if a graceful shutdown was already
@@ -879,11 +893,26 @@ class ServerConnection(H1ConnectionBase):
         return stream
 
     def _fail_response(self, exc):
-        # A failed response write poisons the connection (hyper `Writing::Closed` -> close).
+        """A failed response poisons the connection (hyper `Writing::Closed` + the error
+        stored on the connection -> close) and `exc` surfaces as hyper's kind for it:
+
+        - an httpunk error is hyper's own verdict, raised as it is: the client closed
+          mid-request (`H1IncompleteMessageError`), a `User` error from the encoder
+          (`H1UserError`: a 1xx status, `content-length` + `transfer-encoding`, a body
+          short of its Content-Length), or a write into an already-torn-down transport;
+        - a transport failure is hyper `Io` -> `ConnectionClosedError` (cancellation
+          reaching a write is folded in the same way — the write did not complete);
+        - the app's own body-iterable exception (hyper `User::Body`) propagates as
+          itself — hyper wraps it because Rust must; Python carries the instance."""
         self._reusable = False
         self._closed = True
         self._close_transport()
-        raise ConnectionClosedError("failed to send response") from exc
+        if isinstance(exc, HTTPunkError):
+            raise exc
+        transport_errors = (OSError, *self.backend.broken_transport_errors)
+        if isinstance(exc, transport_errors) or not isinstance(exc, Exception):
+            raise ConnectionClosedError("failed to send response") from exc
+        raise exc
 
     def _finish_response(self, req):
         """Completion, shared by both paths: the response is fully on the wire — apply

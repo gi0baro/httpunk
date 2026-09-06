@@ -1,22 +1,42 @@
-"""httpunk's error taxonomy.
+"""httpunk's error taxonomy — one class per public error kind of the upstream
+crates, so a caller can match on what hyper / h2 would have reported.
 
 Everything derives from `HTTPunkError`, the neutral root. `ConnectionClosedError`
-is protocol-neutral (raised on both HTTP/1 and HTTP/2); every other subtype is
-HTTP/2-specific and shares the `H2Error` sub-base (defined in Rust, so the
-state-machine / flow-control / API-misuse errors raised by the extension share it):
+is protocol-neutral: hyper's `Kind::Io` and h2's `Error::Io`, a transport
+failure with work in flight, on either protocol. The HTTP/1 errors mirror
+hyper's `Error` kinds (`H1Error` sub-base) and the HTTP/2 errors the h2
+crate's (`H2Error` sub-base); both families are defined in Rust, where the
+codecs / state machines raise them (`src/h1/errors.rs`, `src/h2/errors.rs`):
 
     HTTPunkError
-    ├── ConnectionClosedError     transport closed/IO error with work in flight (HTTP/1 + HTTP/2; Rust)
-    └── H2Error                   base for HTTP/2 protocol errors (Rust)
-        ├── H2ProtocolError       connection-level protocol violation (-> GOAWAY; Rust)
-        ├── H2StreamError         stream-level protocol violation (-> RST_STREAM; Rust)
-        ├── H2UserError           local API misuse (from the Rust state machine)
-        ├── H2FlowControlError    flow-control window over/underflow (Rust)
-        ├── GoAwayError           peer sent GOAWAY
-        └── StreamResetError      peer sent RST_STREAM for a stream
+    ├── ConnectionClosedError       transport closed / IO error with work in flight (hyper `Io`, h2 `Io`; Rust)
+    ├── H1Error                     base for HTTP/1 errors (hyper `Error` kinds; Rust)
+    │   ├── H1ParseError            malformed message head (hyper `Parse`; `kind` = the variant)
+    │   ├── H1BodyError             malformed or truncated body (hyper `Body`; `io_kind` = the io cause)
+    │   ├── H1IncompleteMessageError  EOF while a message was still expected (hyper `IncompleteMessage`)
+    │   ├── H1UnexpectedMessageError  bytes on an idle client connection (hyper `UnexpectedMessage`)
+    │   └── H1UserError             local misuse hyper reports on the wire path (hyper `User`; `kind`)
+    └── H2Error                     base for HTTP/2 protocol errors (Rust)
+        ├── H2ProtocolError         connection-level protocol violation (-> GOAWAY; Rust)
+        ├── H2StreamError           stream-level protocol violation (-> RST_STREAM; Rust)
+        ├── H2UserError             local API misuse (from the Rust state machine)
+        ├── H2FlowControlError      flow-control window over/underflow (Rust)
+        ├── GoAwayError             peer sent GOAWAY
+        └── StreamResetError        peer sent RST_STREAM for a stream
 
 `error_code` attributes are `H2Reason` members for known codes (an `IntEnum`, so
-they compare equal to ints), or a plain int for codes outside the RFC set.
+they compare equal to ints), or a plain int for codes outside the RFC set. The
+Rust-defined classes carry their fields positionally in `args`, e.g.
+`H1ParseError.args == (kind, message)`, `H1BodyError.args == (io_kind, message)`,
+`H2UserError.args == (kind, message)`.
+
+What stays a plain Python exception: caller-argument validation (an invalid
+method / URL / status / header name, an out-of-range option — the `http` crate's
+constructor errors, which hyper never sees) is a `ValueError`; misuse of
+httpunk's own API (responding twice, reading the next request before answering
+the current one) is a `RuntimeError`. Neither is a hyper error kind. An
+exception raised by the caller's own body iterable propagates as itself: hyper
+wraps it as `User::Body` because Rust must; Python carries the instance.
 
 An HTTP/1 `send_request` failure raised before the request was handed to the
 writer carries `request_unsent = True` on the exception instance (whatever its
@@ -34,6 +54,12 @@ import copy as _copy
 
 from ._httpunk import (
     ConnectionClosedError as ConnectionClosedError,
+    H1BodyError as H1BodyError,
+    H1Error as H1Error,
+    H1IncompleteMessageError as H1IncompleteMessageError,
+    H1ParseError as H1ParseError,
+    H1UnexpectedMessageError as H1UnexpectedMessageError,
+    H1UserError as H1UserError,
     H2Error as H2Error,
     H2FlowControlError as H2FlowControlError,
     H2ProtocolError as H2ProtocolError,

@@ -56,6 +56,7 @@ pub mod proto;
 // crate — the rest is hyper-internal machinery). See
 // `proto/h1/httpunk.rs`.
 pub use crate::proto::h1::httpunk::{
-    date_header_value, encode_request, encode_response, parse_request, parse_response, BodyDecode,
-    BodyDecoder, BodyEncoder, ParsedHead, ParsedRequest,
+    date_header_value, encode_request, encode_response, error_kind, error_parse_kind,
+    error_user_kind, parse_request, parse_response, BodyDecode, BodyDecoder, BodyEncoder,
+    ParsedHead, ParsedRequest,
 };
