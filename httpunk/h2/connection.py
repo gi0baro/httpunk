@@ -211,9 +211,12 @@ class H2ConnectionBase(H2Streams):
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never cancel it
         # (a cancellation landing between its take and its flush would lose control
         # frames). Then cancel + join the body writers, drain what their teardown
-        # enqueued (h2 `codec.shutdown` = flush THEN shutdown, F23), close the
-        # transport — which is what ends the read pump's parked read — join it, and
-        # wake every straggler.
+        # enqueued (h2 `codec.shutdown` = flush THEN shutdown, F23), shut the
+        # transport down — `FramedWrite::shutdown` ends in the IO's `poll_shutdown`
+        # (`close_notify` over TLS), which is also what ends the read pump's parked
+        # read — join it, and wake every straggler. On a transport that already died
+        # the alert cannot go out and the shutdown is the plain close hyper's drop
+        # would be: wire-identical.
         self.stop_pump()
         self._write_evt.set()
         handle = self.take_pump_handle()
@@ -223,7 +226,7 @@ class H2ConnectionBase(H2Streams):
         await self._write_scope.__aexit__(None, None, None)
         with contextlib.suppress(Exception):  # best-effort: the connection is closing regardless
             await self._flush()
-        self.backend.close_transport(self._transport)
+        await self.backend.shutdown_transport(self._transport)
         handle = self.take_read_handle()
         if handle is not None:
             await handle

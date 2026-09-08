@@ -158,6 +158,9 @@ class _DummyTransport:
     def close(self):
         pass
 
+    def abort(self):  # the asyncio seam's abortive close (`_AsyncioStream.abort`)
+        pass
+
 
 @pytest.mark.asyncio
 async def test_h1_fail_stores_a_stripped_copy():

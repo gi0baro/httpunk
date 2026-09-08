@@ -4,6 +4,8 @@ request + response bodies, keep-alive reuse, chunked responses, headers, and the
 auto-`Date` header.
 """
 
+import asyncio
+
 import pytest
 from _client import open_h1
 from tonio.colored import Event, scope, sleep
@@ -85,6 +87,9 @@ class _StubTransport:
 
     def close(self):
         self.closed = True
+
+    def abort(self):  # the asyncio seam's abortive close (`_AsyncioStream.abort`)
+        self.close()
 
 
 class _PeekableStub(_StubTransport):
@@ -404,6 +409,101 @@ async def test_server_shutdown_wins_over_buffered_pipelined_request():
     await conn.graceful_shutdown()
     assert await conn.next_request() is None  # /b is readable but must NOT be parsed...
     assert transport._buffered  # ...nor read: the bytes are still in the transport
+
+
+class _AsyncioSilentStub(_StubTransport):
+    """`_SilentStub` on asyncio primitives: a read parks once the bytes are consumed,
+    until `close()` ends it with EOF (what closing a real transport does)."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self._closed_evt = asyncio.Event()
+        self.parked = asyncio.Event()
+
+    async def receive_some(self, max_bytes=65536):
+        if self._data:
+            return await super().receive_some(max_bytes)
+        self.parked.set()
+        await self._closed_evt.wait()
+        return b""
+
+    def close(self):
+        super().close()
+        self._closed_evt.set()
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_closes_idle_connection_under_parked_read_asyncio():
+    """hyper `disable_keep_alive` while `KA::Idle`: `state.close()` at once. The parked
+    idle read ends by that close (the one way a parked read ends, on every backend),
+    and the reader maps it to a clean end: `next_request` -> None, nothing written."""
+    transport = _AsyncioSilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport, backend=AsyncioBackend())
+    req = await conn.next_request()
+    await req.respond(200)
+    sent = len(transport.sent)
+    reader = asyncio.ensure_future(conn.next_request())
+    await transport.parked.wait()
+    await conn.graceful_shutdown()
+    assert transport.closed  # closed under the parked read, in the shutdown itself
+    assert await reader is None
+    assert len(transport.sent) == sent  # no response, no error on the wire
+    assert conn.closed and not conn.reusable
+
+
+@pytest.mark.tonio
+async def test_server_shutdown_closes_idle_connection_under_parked_read_tonio():
+    transport = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport)
+    req = await conn.next_request()
+    await req.respond(200)
+    results = []
+
+    async def reader():
+        results.append(await conn.next_request())
+
+    async with scope() as s:
+        s.spawn(reader())
+        await transport.parked.wait()
+        await conn.graceful_shutdown()
+        assert transport.closed
+    assert results == [None]
+    assert conn.closed and not conn.reusable
+
+
+@pytest.mark.tonio
+async def test_server_shutdown_drops_bytes_that_land_on_a_closed_idle_read():
+    """The keep-alive race, hyper's way: `disable_keep_alive` on an idle connection
+    closes it whatever the kernel (or `read_buf`) holds — a request landing in that
+    instant is dropped (the client sees the close and retries). A read that returns
+    bytes after the state closed under it must not serve them: `next_request` -> None."""
+
+    class _LateBytes(_SilentStub):
+        async def receive_some(self, max_bytes=65536):
+            data = await super().receive_some(max_bytes)
+            if not data and self._data:  # woken by the close: bytes landed in that instant
+                chunk, self._data = self._data, b""
+                return chunk
+            return data
+
+    transport = _LateBytes(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport)
+    req = await conn.next_request()
+    await req.respond(200)
+    sent = len(transport.sent)
+    results = []
+
+    async def reader():
+        results.append(await conn.next_request())
+
+    async with scope() as s:
+        s.spawn(reader())
+        await transport.parked.wait()
+        transport._data = b"GET /late HTTP/1.1\r\nhost: x\r\n\r\n"  # bytes "arrive" as the close lands
+        await conn.graceful_shutdown()  # closes under the read; its wake now returns the bytes
+    assert results == [None]  # not served: the connection was closed first
+    assert len(transport.sent) == sent  # nothing written for the dropped request
+    assert transport.closed and conn.closed
 
 
 @pytest.mark.tonio

@@ -590,9 +590,16 @@ impl H1ServerState {
 
     /// The idle read (`READ_WATCHER` / `READ_TRANSPORT`) returned: a read that
     /// completes is no longer interruptible. Right after the read, before the parse —
-    /// a head that keeps arriving over further reads must not be woken by a shutdown.
-    fn unpark_idle_read(&self) {
-        self.lock().idle_read_parked = false;
+    /// a head that keeps arriving over further reads must not be closed under by a
+    /// shutdown. Reports whether a `request_shutdown` closed the connection while the
+    /// read was parked: then whatever the read returned (an error from the closed
+    /// transport, or bytes that landed in the same instant) belongs to a request hyper
+    /// drops too (`disable_keep_alive` on an idle connection: `state.close()`, whatever
+    /// the kernel or `read_buf` holds).
+    fn unpark_idle_read(&self) -> bool {
+        let mut me = self.lock();
+        me.idle_read_parked = false;
+        me.closed
     }
 
     /// Feed `data` to the head parser (hyper `Conn::read_head`: parse, remember the
@@ -648,12 +655,17 @@ impl H1ServerState {
     }
 
     /// `close()`: closed + non-reusable; returns the transport to close (`None` if
-    /// handed off) and the watcher's done event to wait on before joining it.
-    fn mark_closed(&self, py: Python<'_>) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
+    /// handed off), the watcher's done event to wait on before joining it, and
+    /// whether the connection had already ended (`stop_serving`: a clean EOF between
+    /// requests) — hyper's `Connection` future completing, which shuts the IO down
+    /// (`poll_shutdown`) — as opposed to the caller leaving the serve loop with the
+    /// connection still open, which is the future being dropped.
+    fn mark_closed(&self, py: Python<'_>) -> (Option<Py<PyAny>>, Option<Py<PyAny>>, bool) {
         let mut me = self.lock();
+        let ended = me.closed;
         let transport = me.close_now();
         let done = me.watcher.as_ref().map(|w| w.done.clone_ref(py));
-        (transport, done)
+        (transport, done, ended)
     }
 
     /// The body read broke: no further request may be served (hyper `Reading::Closed`).
@@ -661,16 +673,20 @@ impl H1ServerState {
         self.lock().reusable = false;
     }
 
-    /// `graceful_shutdown()` (hyper `disable_keep_alive`): stop reusing the
-    /// connection. Returns the transport to `interrupt_read` on when a read is parked
-    /// idly between requests and the backend can wake it (asyncio); the caller also
-    /// sets the shutdown event for the select-based race (tonio).
-    fn request_shutdown(&self, py: Python<'_>, native_read_interrupt: bool) -> Option<Py<PyAny>> {
+    /// `graceful_shutdown()` (hyper `Conn::disable_keep_alive`): stop reusing the
+    /// connection. Idle — a read parked between requests (hyper `KA::Idle`) — the
+    /// connection is closed NOW (`state.close()`), in this same step, and the
+    /// transport is returned for the caller to shut down: that close is what ends
+    /// the parked read (neither backend wakes a parked read any other way), and the
+    /// reader sees the close through `unpark_idle_read`. In flight (or between the
+    /// response and the next `begin_read`): nothing to wake — `next_request` serves
+    /// no more once non-reusable, and the serve loop ends after the current response.
+    fn request_shutdown(&self) -> Option<Py<PyAny>> {
         let mut me = self.lock();
         me.reusable = false;
         me.shutdown_requested = true;
-        if native_read_interrupt && me.idle_read_parked {
-            return me.transport.as_ref().map(|t| t.clone_ref(py));
+        if me.idle_read_parked {
+            return me.close_now();
         }
         None
     }
@@ -1246,18 +1262,26 @@ impl H1ClientState {
         self.lock().close_now()
     }
 
-    /// `close()`: `(transport, watcher done event, writer scope)` — close the
+    /// `close()`: `(transport, watcher done event, writer scope, idle)` — close the
     /// transport (what ends the parked watcher read), await the watcher, tear the
-    /// writer down.
+    /// writer down. `idle` = no exchange held the slot: hyper's dispatcher, told its
+    /// `SendRequest` is gone while idle, closes and shuts the IO down (`poll_shutdown`);
+    /// mid-exchange the caller is dropping the `Connection` future.
     fn mark_closed(
         &self,
         py: Python<'_>,
-    ) -> (Option<Py<PyAny>>, Option<Py<PyAny>>, Option<Py<PyAny>>) {
+    ) -> (
+        Option<Py<PyAny>>,
+        Option<Py<PyAny>>,
+        Option<Py<PyAny>>,
+        bool,
+    ) {
         let mut me = self.lock();
+        let idle = !me.busy;
         let transport = me.close_now();
         let done = me.watcher.as_ref().map(|w| w.done.clone_ref(py));
         let writer = me.writer.take();
-        (transport, done, writer)
+        (transport, done, writer, idle)
     }
 
     /// A 101 / 2xx-to-CONNECT: the connection stops being HTTP. Marks the transport

@@ -123,10 +123,11 @@ class BaseServer(Generic[_RequestT]):
         return self._conn.next_request()
 
     def graceful_shutdown(self) -> Awaitable[None]:
-        """Signal a graceful shutdown (non-blocking, like hyper's
-        `Connection::graceful_shutdown`): h2 sends GOAWAY and refuses new streams;
-        h1 stops reusing the connection and releases an idle read. In-flight work
-        finishes as the caller keeps driving the accept loop, which then ends and
-        closes. `httpunk.util.GracefulShutdown` coordinates this over many
-        connections (§11.3)."""
+        """Signal a graceful shutdown (hyper's `Connection::graceful_shutdown`): h2
+        sends GOAWAY and refuses new streams; h1 stops reusing the connection, and
+        closes it at once when it is idle between requests (hyper `disable_keep_alive`
+        on an idle connection) — the orderly transport shutdown is awaited here, since
+        it is what ends the parked idle read. In-flight work finishes as the caller
+        keeps driving the accept loop, which then ends and closes.
+        `httpunk.util.GracefulShutdown` coordinates this over many connections (§11.3)."""
         return self._conn.graceful_shutdown()

@@ -55,7 +55,7 @@ from .._httpunk import (
     H1Codec,
     H1ServerState,
 )
-from ..exceptions import ConnectionClosedError, H1IncompleteMessageError, H1ParseError, HTTPunkError
+from ..exceptions import ConnectionClosedError, H1IncompleteMessageError, H1ParseError, H1UserError, HTTPunkError
 from ..http import HeaderMap
 from ..types import Version
 from .connection import H1Framing
@@ -68,7 +68,6 @@ if TYPE_CHECKING:
 
 
 _READ_SIZE = 65536
-_SHUTDOWN = object()  # sentinel: a graceful shutdown released an idle head-read
 # The interim response hyper's server auto-sends for `Expect: 100-continue` (conn.rs L409).
 _CONTINUE = H1Codec.continue_response()
 _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L249)
@@ -303,7 +302,7 @@ class SendStream:
         Fails with `ConnectionClosedError` once the client closed its side mid-request
         (hyper: the connection errored with `IncompleteMessage`, nothing more is written)."""
         self._check_open()
-        self._conn._check_peer_open(self._req)
+        await self._conn._check_peer_open(self._req)
         codec = self._codec
         try:
             if codec.body_is_eof():
@@ -316,28 +315,28 @@ class SendStream:
             # `serialize_end` on a body short of its Content-Length: hyper `end_body` ->
             # `User::BodyWriteAborted` + `Writing::Closed`. Same poison as a failed write.
             self._done = True
-            self._conn._fail_response(self._req, exc)
+            await self._conn._fail_response(self._req, exc)
         if end_stream:
             self._done = True
         if buf:
             await self._write(buf)
         if end_stream:
-            self._conn._finish_response(self._req)
+            await self._conn._finish_response(self._req)
 
     async def send_trailers(self, trailers: HeadersInput) -> None:
         """Finish a chunked body with a trailer block (hyper `Server::encode` allow-lists
         the fields named in the response's `Trailer` header; others are dropped, and a
         non-chunked body gets a bare terminator — `Encoder::encode_trailers`)."""
         self._check_open()
-        self._conn._check_peer_open(self._req)
+        await self._conn._check_peer_open(self._req)
         hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
         self._done = True
         try:
             buf = self._codec.serialize_trailers(hdrs)  # bare terminator unless the request said `TE: trailers`
         except BaseException as exc:
-            self._conn._fail_response(self._req, exc)
+            await self._conn._fail_response(self._req, exc)
         await self._write(buf)
-        self._conn._finish_response(self._req)
+        await self._conn._finish_response(self._req)
 
     async def send_reset(self, reason: int | None = None) -> None:
         """Abort the response. HTTP/1 has no per-stream reset frame, so this is what
@@ -358,7 +357,7 @@ class SendStream:
             await self._conn.write(data)
         except BaseException as exc:
             self._done = True
-            self._conn._fail_response(self._req, exc)
+            await self._conn._fail_response(self._req, exc)
 
 
 class ServerConnection(H1Framing, H1ServerState):
@@ -419,14 +418,9 @@ class ServerConnection(H1Framing, H1ServerState):
             max_buf_size=max_buf_size,
         )
         self._codec = self.codec  # the one codec the state holds (hyper's `Conn`)
-        self._shutdown_evt = self.backend.event()  # set by graceful_shutdown() (the select-based race)
         # Max time to read a complete request head before closing (slowloris defence),
         # hyper's `header_read_timeout` (default 30s, http1.rs L249). `None` disables it.
         self._header_read_timeout = header_read_timeout
-        # The head-read deadline always uses `backend.timeout` (every backend implements it).
-        # This capability is extra: a backend that can wake a parked read from another task
-        # (asyncio) lets us skip the per-read shutdown `select`; absent (tonio) → use `select`.
-        self._native_read_interrupt = getattr(self.backend, "native_read_interrupt", False)
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
@@ -434,10 +428,16 @@ class ServerConnection(H1Framing, H1ServerState):
     async def close(self):
         # Close the transport FIRST (what ends a parked watcher read), then JOIN the
         # watcher (never cancel it — see `_watch_mid_message`). The state hands out
-        # the transport and the watcher's done event in one step.
-        transport, done = self.mark_closed()
+        # the transport, the watcher's done event and the end's kind in one step: a
+        # connection that already ended (a clean EOF between requests) is hyper's
+        # `Connection` future completing — the orderly shutdown; a transport still
+        # serving when the caller leaves the loop is that future being dropped.
+        transport, done, ended = self.mark_closed()
         if transport is not None:
-            self.backend.close_transport(transport)
+            if ended:
+                await self._shutdown(transport)
+            else:
+                self._close(transport)
         if done is not None:
             await done.wait()
             handle = self.take_watcher_handle()
@@ -460,8 +460,21 @@ class ServerConnection(H1Framing, H1ServerState):
         return transport.receive_some(_READ_SIZE)
 
     def _close(self, transport):
+        """The ABORTIVE end: hyper dropping the IO without `poll_shutdown` — an error out
+        of the dispatcher (`poll_loop`'s `?`: a transport failure, the header-read
+        deadline, a body that errored mid-write, the peer gone mid-message). Sync."""
         if transport is not None:
             self.backend.close_transport(transport)
+
+    async def _shutdown(self, transport):
+        """The ORDERLY end: hyper's `Connection` future completing — `is_done()` then
+        `poll_shutdown` on the IO (dispatch.rs `poll_inner`), which over TLS sends
+        `close_notify`. Every end that reaches `is_done` is this one: a clean EOF between
+        requests, a `Connection: close` response, a graceful shutdown, the automatic
+        response to a parse error, a head-time `User` error (stored, surfaced by
+        `take_error` AFTER the shutdown)."""
+        if transport is not None:
+            await self.backend.shutdown_transport(transport)
 
     # ===== mid-message watcher (hyper conn.rs `mid_message_detect_eof`) =====
 
@@ -552,11 +565,11 @@ class ServerConnection(H1Framing, H1ServerState):
             return self._eof()  # a concurrent close: the connection is over
         return transport.receive_some(n)
 
-    def _check_peer_open(self, req):
+    async def _check_peer_open(self, req):
         # hyper: once `mid_message_detect_eof` saw EOF the connection is errored and nothing
         # more is written for this exchange. Poison + close, surface `IncompleteMessage`.
         if self.peer_closed_flag(req._seq):
-            self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
+            await self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
 
     async def _send_async_body(self, req, body, trailers):
         """Stream an ASYNC response body and fail fast on a client FIN. hyper polls the
@@ -590,9 +603,9 @@ class ServerConnection(H1Framing, H1ServerState):
         # the producer unwound and the generator was closed.
         await done.wait()
         if abandoned:
-            self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
+            await self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
         if box:
-            self._fail_response(req, box[0])
+            await self._fail_response(req, box[0])
 
     async def _pump_async_body(self, body, trailers, done, box):
         # A bare task: never lets an exception escape (it is reported through `box`).
@@ -605,18 +618,23 @@ class ServerConnection(H1Framing, H1ServerState):
             done.set()
 
     async def graceful_shutdown(self):
-        # h1 `Connection::graceful_shutdown` (hyper Dispatcher `disable_keep_alive`):
-        # a non-blocking signal — stop reusing the connection so the accept loop
-        # ends after the current request (`next_request` returns None once
-        # non-reusable), and wake a read parked idly between requests: asyncio can
-        # wake it from another task (`interrupt_read`, decided under the state's
-        # lock with the park flag); tonio races the read against `_shutdown_evt`.
-        # The caller drives the serve loop to completion and closes; nothing is
-        # awaited/closed here.
-        transport = self.request_shutdown(self._native_read_interrupt)
-        self._shutdown_evt.set()
+        """h1 `Connection::graceful_shutdown` -> `Conn::disable_keep_alive`. In flight:
+        stop reusing the connection, so the serve loop ends after the current response
+        (`next_request` returns None once non-reusable). Idle — a read parked between
+        requests (hyper `KA::Idle`): hyper closes the connection at once
+        (`state.close()`), and the parked read is not woken but simply never polled
+        again. httpunk's parked `receive_some` can only end by the transport closing
+        (no backend wakes a parked read from another task), so the state closes the
+        connection in the same step it checks the park, and the transport is shut down
+        here — the orderly end hyper's `Connection` future then performs
+        (`poll_shutdown`: `close_notify` over TLS), awaited here rather than in the
+        serve loop because the shutdown is what ends the loop's read. The reader maps
+        the close to a clean end (`_read_head_frames`). A request landing in that same
+        instant gets a reset, exactly as with hyper: the keep-alive race clients retry.
+        The caller keeps driving the serve loop to its end and closes."""
+        transport = self.request_shutdown()
         if transport is not None:
-            transport.interrupt_read()
+            await self._shutdown(transport)
 
     async def next_request(self):
         """Read the next request head and return a `ServerRequest`, or None once
@@ -637,7 +655,9 @@ class ServerConnection(H1Framing, H1ServerState):
         if code == H1_NEXT_DRAIN:
             code, obj = self.drain_done(self._drain_unread_body())
         if code == H1_NEXT_CLOSE:
-            self._close(obj)  # body not cheaply drainable — connection closed
+            # Body not cheaply drainable: hyper `close_read()`, then `try_keep_alive`
+            # closes and the connection completes — the orderly end.
+            await self._shutdown(obj)
             return None
         if code == H1_NEXT_NONE:
             return None
@@ -646,9 +666,11 @@ class ServerConnection(H1Framing, H1ServerState):
             accepted = await self._read_request_head(code, obj)
         except H1ParseError:
             # hyper conn.rs `on_parse_error`: an HTTP/2 preface is `Parse::VersionH2` and
-            # the connection just closes; any other malformed head gets `Server::on_error`'s
-            # automatic response (400 / 414 / 431), then closes. The app never sees the
-            # `H1ParseError` — hyper's service is never invoked for it either.
+            # the connection errors (dropped: the abortive end); any other malformed head
+            # gets `Server::on_error`'s automatic response (400 / 414 / 431), then the
+            # connection completes with the error stored — the orderly end, then
+            # `take_error`. The app never sees the `H1ParseError` — hyper's service is
+            # never invoked for it either.
             transport = self.fail_read()
             status = codec.parse_error_status
             if status is None or transport is None:
@@ -659,7 +681,7 @@ class ServerConnection(H1Framing, H1ServerState):
         except self.backend.broken_transport_errors:
             # The transport died at the request boundary — an RST, or a TLS
             # close without close_notify (which httpunk's own abortive
-            # `close_transport` produces, F33a). The wire outcome is identical to
+            # `close_transport` produces). The wire outcome is identical to
             # the clean EOF below, so it surfaces as a clean end-of-iteration (F47).
             self._close(self.fail_read())
             return None
@@ -730,17 +752,25 @@ class ServerConnection(H1Framing, H1ServerState):
             elif code in (H1_READ_SHUTDOWN, H1_READ_EOF):
                 return None
             else:
-                # Between requests: a graceful shutdown may end the wait. The park was
-                # flagged in the state by the same step that chose this read (`begin_read`),
-                # so `graceful_shutdown()` may wake THIS read only — never a mid-head read.
+                # Between requests: a graceful shutdown may end the wait by closing the
+                # connection (hyper `disable_keep_alive` while `KA::Idle`: `state.close()`).
+                # The park was flagged in the state by the same step that chose this read
+                # (`begin_read`), so `request_shutdown` closes under THIS read only — never
+                # a mid-head read. The close is what ends the parked read (an error from the
+                # closed transport, or EOF), and `unpark_idle_read` reports it in the same
+                # step that clears the park: whatever the read returned — even bytes that
+                # landed in that instant — belongs to a request hyper drops too.
                 try:
                     data = await self._idle_read(code, obj)
-                finally:
+                except Exception:
+                    if self.unpark_idle_read():
+                        return None
+                    raise
+                except BaseException:
                     self.unpark_idle_read()
-                if data is _SHUTDOWN:  # tonio select: the shutdown signal won the race
+                    raise
+                if self.unpark_idle_read():
                     return None
-                # An interrupt_read shutdown wake surfaces as b"" and falls into the EOF
-                # return below — same outcome either way (loop ends; close, no response).
             if not data:
                 # EOF. A clean EOF between requests (nothing buffered) is a normal
                 # client close. hyper additionally distinguishes a MID-head EOF
@@ -760,29 +790,16 @@ class ServerConnection(H1Framing, H1ServerState):
         """The idle-read awaitable for a `READ_WATCHER` (`obj` = the parked watcher's done
         event: the hand-off — never a second reader on the transport) or `READ_TRANSPORT`
         (`obj` = the transport) verdict. A plain (sync) function so the fast path adds no
-        wrapper coroutine.
-
-        asyncio (`native_read_interrupt`): the read itself; if it parks, graceful_shutdown()
-        wakes it via `interrupt_read` and the read returns b"" (a parked watcher's
-        underlying read is that same transport read). Backends without a native read
-        interrupt (tonio can't wake a parked recv from another task): race the read against
-        the shutdown signal via `select`, which cancels the losing branch — hyper's poll
-        instead re-checks `should_read` and completes without reading."""
-        read = self._take_watcher(obj) if code == H1_READ_WATCHER else obj.receive_some(_READ_SIZE)
-        if self._native_read_interrupt:
-            return read
-
-        async def _await_shutdown():
-            await self._shutdown_evt.wait()
-            return _SHUTDOWN
-
-        # With a watcher armed the racer is its completion-event wait, so the losing
-        # cancel never lands on the parked read itself (which ends by the close that follows).
-        return self.backend.select(read, _await_shutdown())
+        wrapper coroutine. Never raced, woken or cancelled: a graceful shutdown ends it by
+        closing the connection (`graceful_shutdown`), the one sanctioned way to end a
+        parked read on either backend."""
+        return self._take_watcher(obj) if code == H1_READ_WATCHER else obj.receive_some(_READ_SIZE)
 
     async def _send_error(self, transport, codec, status):
         """Best-effort automatic error response (bodyless, `Connection: close`),
-        then close — hyper `Server::on_error` + `write_head`."""
+        then the orderly end — hyper `Server::on_error` + `write_head`, the parse error
+        stored on the connection, which then completes (`poll_shutdown`) before
+        `take_error` surfaces it."""
         try:
             # `keep_alive=False`: hyper `close_read()`s before `on_error`, so `enforce_version`
             # inserts `connection: close` on the automatic response (F29).
@@ -790,7 +807,7 @@ class ServerConnection(H1Framing, H1ServerState):
             await transport.send_all(codec.serialize_head_and_body(head))  # one write (coalesced)
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
             pass
-        self._close(transport)
+        await self._shutdown(transport)
 
     # ===== sending responses (hyper conn.rs encode_head / role.rs Server::encode) =====
 
@@ -816,14 +833,14 @@ class ServerConnection(H1Framing, H1ServerState):
             try:
                 await self.write(head)  # the head must never wait on the app's generator
             except BaseException as exc:
-                self._fail_response(req, exc)
+                await self._fail_response(req, exc)
             await self._send_async_body(req, body, trailers)
         else:
             try:
                 await self._send_head_and_body(self._codec, head, body, trailers)
             except BaseException as exc:
-                self._fail_response(req, exc)
-        self._finish_response(req)
+                await self._fail_response(req, exc)
+        await self._finish_response(req)
 
     async def _send_response_head(self, req, status, headers, *, end_stream):
         """The push path (`ServerRequest.send_response`): write the head now, return
@@ -842,9 +859,9 @@ class ServerConnection(H1Framing, H1ServerState):
         try:
             await self.write(head)
         except BaseException as exc:
-            self._fail_response(req, exc)
+            await self._fail_response(req, exc)
         if end_stream:
-            self._finish_response(req)
+            await self._finish_response(req)
         return stream
 
     async def _respond_head(self, req, status, headers, content_length, chunked, *, want):
@@ -869,14 +886,14 @@ class ServerConnection(H1Framing, H1ServerState):
                     req._seq, status, hdrs, done, content_length=content_length, chunked=chunked, want=want
                 )
             except BaseException as exc:
-                self._fail_response(req, exc)
+                await self._fail_response(req, exc)
             if code == H1_REQ_OK:
                 break
             if code == H1_REQ_CONTINUE:
                 await req._continue_evt.wait()
                 continue
             if code == H1_REQ_PEER_CLOSED:
-                self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
+                await self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
             raise RuntimeError("response already sent for this request")
         if armed:
             handle = self.backend.spawn_without_results(self._watch_mid_message(req, done))
@@ -885,7 +902,7 @@ class ServerConnection(H1Framing, H1ServerState):
                 await refused
         return head
 
-    def _fail_response(self, req, exc):
+    async def _fail_response(self, req, exc):
         """A failed response poisons the connection (hyper `Writing::Closed` + the error
         stored on the connection -> close) and `exc` surfaces as hyper's kind for it:
 
@@ -896,9 +913,21 @@ class ServerConnection(H1Framing, H1ServerState):
         - a transport failure is hyper `Io` -> `ConnectionClosedError` (cancellation
           reaching a write is folded in the same way — the write did not complete);
         - the app's own body-iterable exception (hyper `User::Body`) propagates as
-          itself — hyper wraps it because Rust must; Python carries the instance."""
-        self._close(self.fail_response(req._seq))  # the window closed in the same step
+          itself — hyper wraps it because Rust must; Python carries the instance.
+
+        The end is hyper's for the kind: a head-time `User` error is STORED
+        (`encode_head`: `state.error = Some(err); writing = Closed`), the connection
+        completes and `poll_shutdown`s the IO, and only then `take_error` surfaces it —
+        the orderly end; everything else is an `Err` out of `poll_loop` (`?` on the io
+        write, `new_user_body`, `end_body`'s `BodyWriteAborted`, `new_incomplete`) —
+        the dispatcher errors and the IO is dropped, the abortive end. The state is
+        poisoned synchronously either way; only the orderly transport shutdown awaits."""
+        transport = self.fail_response(req._seq)  # the window closed in the same step
         req._peer_closed_evt.set()
+        if isinstance(exc, H1UserError) and exc.args[0] != "body_write_aborted":
+            await self._shutdown(transport)
+        else:
+            self._close(transport)
         if isinstance(exc, HTTPunkError):
             raise exc
         transport_errors = (OSError, *self.backend.broken_transport_errors)
@@ -908,15 +937,17 @@ class ServerConnection(H1Framing, H1ServerState):
 
     def _abort_response(self, req):
         """`SendStream.send_reset`: hyper closes the connection when a response `Body`
-        errors mid-stream (`Writing::Closed`); the client sees a truncated body."""
+        errors mid-stream (`Writing::Closed`, the dispatcher's `?` on `new_user_body`:
+        the abortive end); the client sees a truncated body."""
         self._close(self.fail_response(req._seq))
         req._peer_closed_evt.set()
 
-    def _finish_response(self, req):
+    async def _finish_response(self, req):
         """Completion, shared by both paths: the response is fully on the wire — apply
         the head-time reuse decision (hyper `try_keep_alive` after `Writing::KeepAlive`),
         or hand off the tunnel for a protocol switch. One step in the state; the
-        `peer_closed()` waiters wake after it."""
+        `peer_closed()` waiters wake after it. A non-reusable connection completes:
+        `try_keep_alive` closes it and the future `poll_shutdown`s — the orderly end."""
         switch, close, transport, leftover = self.finish_response(req._seq)
         req._peer_closed_evt.set()
         if switch:
@@ -924,7 +955,7 @@ class ServerConnection(H1Framing, H1ServerState):
             # the start of the tunnel) is the caller's; the state detached.
             req.upgraded = H1Upgraded(transport, leftover)
         elif close:
-            self._close(transport)
+            await self._shutdown(transport)
 
 
 class H1Server(BaseServer[ServerRequest]):

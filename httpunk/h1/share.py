@@ -46,10 +46,10 @@ class H1Upgraded:
 
     async def aclose(self):
         if self._close_latch.try_acquire():
-            # The caller owns this raw tunnel and closes it from an async context, so
-            # — unlike the driver's sync close paths — we can await a `TLSStream`'s
-            # `close()` coroutine (the full `close_notify` dance); a plain socket's
-            # `close()` returns None and needs no await.
+            # The caller owns this raw tunnel: the orderly end (hyper's `poll_shutdown`
+            # on the `Upgraded` IO — `close_notify` over TLS). A tonio `TLSStream`'s
+            # `close()` is a coroutine (the alert is written, then the socket closes);
+            # a plain socket's, and asyncio's stream `close()`, return None.
             result = self._transport.close()
             if result is not None:
                 await result

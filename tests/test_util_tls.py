@@ -13,6 +13,7 @@ from tonio.colored.net import open_tcp_listeners
 from tonio.colored.net.tls import open_tls_over_tcp_listeners
 
 from httpunk import H1Connection, H2Connection
+from httpunk._backend.tonio import TonioBackend
 from httpunk.util import auto, connect
 
 
@@ -75,11 +76,11 @@ async def test_https_falls_back_to_h1_when_alpn_is_http11(ca):
     server_errors = []
 
     async def server_side():
-        # Recorded, not spawned-and-forgotten: the client's context exit closes
-        # its TLS transport ABORTIVELY (no close_notify — F33a), and the server
-        # must treat that as the connection ending (clean `async for` exit, F47)
-        # rather than die on the backend's broken-transport error. A swallowed
-        # crash here once let this test pass for the wrong reason.
+        # Recorded, not spawned-and-forgotten: the client's context exit closes its
+        # idle TLS connection the orderly way (close_notify, hyper's `poll_shutdown`),
+        # and the server must treat that as the connection ending (clean `async for`
+        # exit) rather than die. A swallowed crash here once let this test pass for
+        # the wrong reason.
         try:
             await _echo(await auto.serve(await listener.accept()))
         except Exception as exc:
@@ -92,7 +93,50 @@ async def test_https_falls_back_to_h1_when_alpn_is_http11(ca):
         async with conn:
             resp = await conn.request("POST", "/", headers={"host": f"127.0.0.1:{port}"}, body=b"hey")
             assert await resp.read() == b"tls:hey"
-    assert not server_errors  # the abortive client close ended the server loop cleanly
+    assert not server_errors  # the client's close ended the server loop cleanly
+
+
+_H1_OK = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+
+
+@pytest.mark.tonio
+async def test_h1_client_orderly_close_sends_close_notify(ca):
+    """hyper's two ends, on the wire. An idle h1 connection closed by the caller is the
+    `Connection` future completing -> `poll_shutdown` -> tokio-rustls writes
+    close_notify: tonio's server-side TLS read then ends with a CLEAN EOF (`b""`).
+    The abortive close (`close_transport`, hyper dropping the IO) sends no alert:
+    that read raises the backend's broken-transport error instead."""
+    listener = (await open_tls_over_tcp_listeners(0, _server_ctx(ca, ("http/1.1",)), host="127.0.0.1"))[0]
+    host, port = listener.transport.socket.getsockname()[:2]
+    ends = []
+
+    async def raw_server(n):
+        for _ in range(n):
+            stream = await listener.accept()
+            await stream.receive_some()  # the request head
+            await stream.send_all(_H1_OK)
+            try:
+                ends.append(await stream.receive_some())  # b"" = EOF with close_notify
+            except Exception as exc:
+                ends.append(exc)
+            finally:
+                stream.transport.close()
+
+    async with scope() as s:
+        s.spawn(raw_server(2))
+        backend = TonioBackend()
+        # 1. the orderly end: `H1Connection.__aexit__` on an idle connection
+        stream, _ = await backend.connect_tls(host, port, ssl_context=_client_ctx(ca, ("http/1.1",)))
+        async with H1Connection(stream) as conn:
+            resp = await conn.request("GET", "/", headers={"host": host})
+            assert await resp.read() == b"ok"
+        # 2. the abortive end: the backend's sync close (hyper dropping the IO)
+        stream, _ = await backend.connect_tls(host, port, ssl_context=_client_ctx(ca, ("http/1.1",)))
+        await stream.send_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        await stream.receive_some()
+        backend.close_transport(stream)
+    assert ends[0] == b""  # close_notify: a clean TLS EOF
+    assert isinstance(ends[1], backend.broken_transport_errors)  # no alert: a torn-down transport
 
 
 @pytest.mark.tonio

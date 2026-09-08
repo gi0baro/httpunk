@@ -122,8 +122,21 @@ class Connection(H1Framing, H1ClientState):
         return transport.receive_some(_READ_SIZE)
 
     def _close(self, transport):
+        """The ABORTIVE end: hyper's dispatcher erroring and its IO dropped without
+        `poll_shutdown` (an io failure, a request body that errored, an unexpected
+        message, a failed exchange torn down). Sync, so a failure commits it without
+        a suspension."""
         if transport is not None:
             self.backend.close_transport(transport)
+
+    async def _shutdown(self, transport):
+        """The ORDERLY end: hyper's client `Connection` future completing — `is_done()`
+        then `poll_shutdown` on the IO (`close_notify` over TLS): a non-keep-alive
+        exchange completed (`try_keep_alive` -> close), the server's EOF on an idle
+        connection (`close_read` -> close), or the `SendRequest` gone while idle
+        (`poll_read_head`: "dispatch no longer receiving messages" -> close)."""
+        if transport is not None:
+            await self.backend.shutdown_transport(transport)
 
     # ----- the single in-flight slot -----
 
@@ -216,7 +229,7 @@ class Connection(H1Framing, H1ClientState):
             error = exc.with_traceback(None)  # strip frames: don't pin the connection in a cycle
         code, transport = self.watcher_completed(data, error)
         if code == H1_WATCH_IDLE_EOF:
-            self._close(transport)
+            await self._shutdown(transport)  # hyper: `close_read()`, the future completes
         elif code == H1_WATCH_IDLE_BYTES:
             self.poison_unexpected(len(data))
         elif code == H1_WATCH_IDLE_ERROR:
@@ -478,11 +491,18 @@ class Connection(H1Framing, H1ClientState):
         abandoned body generator) must not leave an open connection whose `closed`
         lies to a pool above. On reuse the idle watcher is armed BEFORE the writer
         join (also a suspension), so an interrupted join never leaves a reusable
-        connection without read interest (H1C-9); the slot is released in `finally`."""
+        connection without read interest (H1C-9); the slot is released in `finally`.
+
+        The end is hyper's for the case: a completed exchange the response made
+        non-reusable is the connection completing (`try_keep_alive` -> close, then
+        `poll_shutdown`) — the orderly end, awaited after the verdict (the TLS
+        `close_notify`; an interruption there still closes the socket); an upload
+        still in flight is cancelled and the connection dropped — abortive, sync."""
         fully_sent = self.writer_finished
         reuse = resp_keep_alive and fully_sent
-        if not reuse:
-            self._close(self.close_now())  # sync by design (backend.close_transport)
+        transport = None if reuse else self.close_now()  # the verdict, committed synchronously
+        if not fully_sent:
+            self._close(transport)
         try:
             if reuse:
                 # The connection is reusable-idle again: restore hyper's idle read
@@ -491,6 +511,8 @@ class Connection(H1Framing, H1ClientState):
                 # the happens-before edge that makes it observe the watcher and take
                 # its read as the response's first read, F55).
                 await self._start_watcher()
+            elif fully_sent:
+                await self._shutdown(transport)  # the writer is done: nothing holds the send side
             await self._teardown_writer(cancel=not fully_sent)
         finally:
             self._release()
@@ -501,8 +523,14 @@ class Connection(H1Framing, H1ClientState):
         # closed flags and exits quietly) — then join it and abort + join a
         # still-running background writer. The joins can be interrupted (they
         # suspend); a force-close never comes away with `closed` still False.
-        transport, done, writer = self.mark_closed()
-        self._close(transport)
+        # Idle: hyper's dispatcher, its `SendRequest` gone, closes and the future
+        # completes (`poll_shutdown`) — orderly; mid-exchange the caller is dropping
+        # the future — abortive.
+        transport, done, writer, idle = self.mark_closed()
+        if idle:
+            await self._shutdown(transport)
+        else:
+            self._close(transport)
         if done is not None:
             await done.wait()
             handle = self.take_watcher_handle()

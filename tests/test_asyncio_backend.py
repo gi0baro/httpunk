@@ -141,18 +141,39 @@ class _FakeCloseTransport:
 
 
 @pytest.mark.asyncio
-async def test_close_aborts_tls_transport_but_closes_plain():
-    # TLS closes abortively (no close_notify) to match tonio's raw-socket close (F33a);
-    # plain TCP still gets a graceful FIN via close().
+async def test_close_is_orderly_and_abort_is_abortive():
+    # hyper's two ends. `close()` = the `Connection` future completing -> `poll_shutdown`
+    # on the IO: asyncio's `transport.close()` runs the TLS close_notify exchange (and is
+    # a plain FIN over TCP). `abort()` = the IO dropped without `poll_shutdown`: over TLS
+    # `transport.abort()` (no close_notify); plain TCP has nothing to skip -> `close()`.
     tls = _AsyncioStream()
     tls.connection_made(_FakeCloseTransport(ssl=True))
     tls.close()
+    assert tls._transport.closed and not tls._transport.aborted
+
+    tls = _AsyncioStream()
+    tls.connection_made(_FakeCloseTransport(ssl=True))
+    tls.abort()
     assert tls._transport.aborted and not tls._transport.closed
 
     plain = _AsyncioStream()
     plain.connection_made(_FakeCloseTransport(ssl=False))
-    plain.close()
+    plain.abort()
     assert plain._transport.closed and not plain._transport.aborted
+
+
+@pytest.mark.asyncio
+async def test_backend_close_transport_aborts_and_shutdown_transport_closes():
+    backend = AsyncioBackend()
+    tls = _AsyncioStream()
+    tls.connection_made(_FakeCloseTransport(ssl=True))
+    backend.close_transport(tls)  # the abortive end
+    assert tls._transport.aborted and not tls._transport.closed
+
+    tls = _AsyncioStream()
+    tls.connection_made(_FakeCloseTransport(ssl=True))
+    await backend.shutdown_transport(tls)  # the orderly end
+    assert tls._transport.closed and not tls._transport.aborted
 
 
 @pytest.mark.asyncio

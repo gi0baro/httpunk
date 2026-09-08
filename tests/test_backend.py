@@ -5,6 +5,8 @@ has no `.socket`, so the plain-socket path would be wrong (and would AttributeEr
 
 import threading
 
+import pytest
+
 from httpunk._backend.tonio import TonioBackend
 
 
@@ -121,10 +123,41 @@ def test_close_transport_plain_socket_calls_close():
 
 
 def test_close_transport_tls_closes_underlying_socket_synchronously():
-    # Regression: a TLSStream's own close() is a coroutine (close_notify) the sync
-    # close paths can't await; close the underlying socket instead so the peer's
-    # read ends, and never invoke the (un-awaitable here) TLS close() coroutine.
+    # The ABORTIVE end (hyper dropping the IO): a TLSStream's own close() is the
+    # close_notify coroutine, which this end must NOT run; the underlying socket is
+    # closed directly so the peer's read ends, with no alert on the wire.
     stream = _FakeTLSStream(b"")
     TonioBackend().close_transport(stream)
     assert stream.transport.closed  # underlying socket really closed
     assert not stream.close_coro_called  # the async close_notify coroutine untouched
+
+
+@pytest.mark.tonio
+async def test_shutdown_transport_plain_socket_calls_close():
+    stream = _FakePlainStream(b"")
+    await TonioBackend().shutdown_transport(stream)
+    assert stream.closed
+
+
+@pytest.mark.tonio
+async def test_shutdown_transport_tls_awaits_close_notify():
+    # The ORDERLY end (hyper `poll_shutdown` on the IO): the TLSStream's own close()
+    # coroutine — close_notify, then the socket — is what runs.
+    stream = _FakeTLSStream(b"")
+    await TonioBackend().shutdown_transport(stream)
+    assert stream.close_coro_called
+
+
+@pytest.mark.tonio
+async def test_shutdown_transport_tls_swallows_a_failed_alert_write():
+    # A peer already gone: the alert cannot be written. hyper surfaces that as
+    # `Kind::Shutdown` from a connection future the serve loop has already left;
+    # the socket is closed regardless (the TLSStream's `finally`), so nothing to raise.
+    class _Broken(_FakeTLSStream):
+        async def close(self):
+            self.close_coro_called = True
+            raise BrokenPipeError
+
+    stream = _Broken(b"")
+    await TonioBackend().shutdown_transport(stream)
+    assert stream.close_coro_called

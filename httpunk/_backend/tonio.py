@@ -98,32 +98,50 @@ class TonioBackend:
             return None
 
     def close_transport(self, transport):
-        """Synchronously close a transport, unblocking the peer's read. The driver
-        closes from both sync (body-release, failure) and async paths, so this must
-        be sync.
+        """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —
+        an error out of the connection (a transport failure, the header-read deadline,
+        a body that errored mid-write, the peer gone mid-message), or its future
+        dropped. Sync, so the failure paths can commit it without a suspension.
 
-        - **Plain socket**: its `close()` is synchronous.
-        - **TLS (`TLSStream`)**: its own `close()` is a coroutine (it writes a TLS
-          `close_notify`), which a sync caller can't await — so close the underlying
-          socket (`.transport`) directly. The `close_notify` is skipped (a
-          best-effort/abortive close, like hyper's hard close on a dropped
-          connection), but the socket is really closed so the peer's read ends.
-          (`H1Upgraded.aclose`, which is async and caller-owned, awaits the full
-          `close_notify` dance instead.)"""
+        - **Plain socket**: `close()` — a FIN, or a RST if unread bytes are pending,
+          exactly what dropping a `TcpStream` does.
+        - **TLS (`TLSStream`)**: the underlying socket is closed directly, so no
+          `close_notify` goes out — what dropping a tokio-rustls stream does. The peer
+          sees a TLS EOF without close_notify (`ResourceBroken` on tonio).
+        Either way a parked `receive_some` on the transport ends (tonio deregisters
+        the fd before closing it, which wakes the reader; its retry fails on the closed
+        socket)."""
         ssl_obj = getattr(transport, "_ssl", None)
-        if ssl_obj is not None:  # a TLSStream — close the underlying socket synchronously
+        if ssl_obj is not None:  # a TLSStream — close the underlying socket
             transport.transport.close()
         else:
             transport.close()
+
+    async def shutdown_transport(self, transport):
+        """The ORDERLY close: hyper's `Connection` future completing calls `poll_shutdown`
+        on the IO (proto/h1/dispatch.rs `poll_inner`; h2's `codec.shutdown` = flush then
+        shutdown), which over TLS is tokio-rustls' `send_close_notify` + flush + socket
+        shutdown. tonio's `TLSStream.close()` is that exchange (`unwrap` -> the alert is
+        written -> the socket is closed, in a `finally`, so an interruption still closes
+        it); a plain socket just closes. A write failure while sending the alert is
+        swallowed: hyper surfaces it as `Kind::Shutdown` from the connection future,
+        which httpunk's serve loop has already left — the socket is closed regardless."""
+        ssl_obj = getattr(transport, "_ssl", None)
+        if ssl_obj is None:
+            transport.close()
+            return
+        try:
+            await transport.close()
+        except OSError:  # the alert did not go out; the socket closed regardless
+            pass
 
     # Exceptions `receive_some`/`send_all` raise when the peer tears the
     # transport down ABRUPTLY instead of a clean EOF: an RST on plain TCP
     # (`ConnectionError`: ConnectionResetError/BrokenPipeError), or a TLS close
     # without close_notify (tonio wraps the SSLEOFError in `ResourceBroken`) —
-    # which httpunk's own sync `close_transport` produces by design (abortive
-    # close, F33a), so any httpunk client hanging up makes the peer see one.
-    # The h1 server maps these at the request-head boundary to a clean
-    # end-of-iteration (F47).
+    # which httpunk's own abortive `close_transport` produces, so an httpunk
+    # peer that drops a connection makes the other side see one. The h1 server
+    # maps these at the request-head boundary to a clean end-of-iteration (F47).
     broken_transport_errors = (ConnectionError, ResourceBroken)
 
     # Spawn task(s) NOW, discarding their results; returns the join handle.
@@ -147,6 +165,5 @@ class TonioBackend:
     sleep = staticmethod(_colored.sleep)  # async sleep(seconds)
     # `timeout(coro, seconds) -> (result, completed)` — tonio's native deadline; the h1 server
     # uses it to bound the request-head read (measured ~12-16% faster than racing sleep() via
-    # select). Same contract as AsyncioBackend.timeout. tonio still can't wake a parked recv from
-    # another task, so it does NOT advertise `native_read_interrupt` (idle shutdown stays select).
+    # select). Same contract as AsyncioBackend.timeout.
     timeout = staticmethod(_timeout)

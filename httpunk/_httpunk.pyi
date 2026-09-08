@@ -700,7 +700,9 @@ class H1ServerState:
     def drain_done(self, complete: bool) -> tuple[int, object | None]:
         """The one-poll drain's outcome: `H1_NEXT_CLOSE` + transport, or the read verdict."""
 
-    def unpark_idle_read(self) -> None: ...
+    def unpark_idle_read(self) -> bool:
+        """The idle read returned; True = a shutdown closed the connection while it was parked."""
+
     def accept_head(self, data: bytes) -> tuple[H1RequestHead, int, H1BodyDecoder] | None:
         """Feed the head parser; once a head is complete it is the current request:
         `(head, seq, its body decoder — fed the bytes read alongside the head)`; None =
@@ -710,12 +712,13 @@ class H1ServerState:
         """A head parse failure / deadline / broken transport: closed; the transport to close."""
 
     def stop_serving(self) -> None: ...
-    def mark_closed(self) -> tuple[object | None, object | None]:
-        """`close()`: `(transport to close, the watcher's done event to await)`."""
+    def mark_closed(self) -> tuple[object | None, object | None, bool]:
+        """`close()`: `(transport to close, the watcher's done event to await, ended)`;
+        `ended` = the connection had already ended cleanly (hyper's orderly shutdown)."""
 
     def mark_unusable(self) -> None: ...
-    def request_shutdown(self, native_read_interrupt: bool) -> object | None:
-        """`graceful_shutdown()`: the transport to `interrupt_read` on, if a read is parked idly."""
+    def request_shutdown(self) -> object | None:
+        """`graceful_shutdown()`: closed if a read is parked idly — the transport to shut down."""
 
     # ----- the current request -----
     def try_send_continue(self, seq: int) -> bool: ...
@@ -807,8 +810,8 @@ class H1ClientState:
         """Store `exc` (a traceback-free copy) if none is stored, close; the transport to close."""
 
     def close_now(self) -> object | None: ...
-    def mark_closed(self) -> tuple[object | None, object | None, object | None]:
-        """`(transport, watcher done event, writer scope)`."""
+    def mark_closed(self) -> tuple[object | None, object | None, object | None, bool]:
+        """`(transport, watcher done event, writer scope, idle)`; `idle` = no exchange held the slot."""
 
     def upgrade(self) -> object | None:
         """Hand the transport off (101 / CONNECT), in one step."""

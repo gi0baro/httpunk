@@ -183,18 +183,67 @@ async def test_h2_graceful_shutdown_emits_two_phase_goaways():
     assert conn.shutdown_final is True
 
 
-# ----- h1 primitive: non-blocking signal (stop reuse + arm the idle-read release) -----
+# ----- h1 primitive: stop reuse; an idle connection (a read parked between requests) closes -----
 
 
 @pytest.mark.tonio
 async def test_h1_graceful_is_a_nonblocking_signal():
+    # No read parked (hyper: not `KA::Idle` — nothing to close now): the signal only
+    # stops reuse, and the serve loop ends on its own.
     transport = _IdleTransport()
     conn = H1ServerConnection(transport)
     await conn.graceful_shutdown()
     assert not conn.reusable
-    assert conn._shutdown_evt.is_set()
-    assert not transport.closed  # the primitive does NOT close — the serve loop does
+    assert not transport.closed  # nothing was parked: the serve loop closes, not the primitive
     assert await conn.next_request() is None  # not reusable -> serves no more
+
+
+class _ParkedTransport(_IdleTransport):
+    """A quiet keep-alive peer: after its bytes, a read PARKS (until `close()` ends it
+    with EOF, as a real socket's close ends a parked recv) instead of returning EOF."""
+
+    def __init__(self, data):
+        super().__init__()
+        self._data = data
+        self._closed_evt = Event()
+        self.parked = Event()
+
+    async def receive_some(self, max_bytes=65536):
+        if self._data:
+            chunk, self._data = self._data[:max_bytes], self._data[max_bytes:]
+            return chunk
+        self.parked.set()
+        await self._closed_evt.wait()
+        return b""
+
+    def close(self):
+        super().close()
+        self._closed_evt.set()
+
+
+@pytest.mark.tonio
+async def test_h1_graceful_closes_idle_connection_under_its_parked_read():
+    """hyper `disable_keep_alive` on an idle connection (`KA::Idle`): `state.close()`,
+    at once — the parked idle read is not woken, the connection is simply over. The
+    only way to end httpunk's parked `receive_some` IS the transport close, so the
+    primitive closes (in the state step that sees the park) and the reader maps the
+    close to a clean end: `next_request` returns None, no error, no response."""
+    transport = _ParkedTransport(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = H1ServerConnection(transport)
+    req = await conn.next_request()
+    await req.respond(200)
+    results = []
+
+    async def reader():
+        results.append(await conn.next_request())
+
+    async with scope() as s:
+        s.spawn(reader())
+        await transport.parked.wait()  # the idle read is parked on the transport
+        await conn.graceful_shutdown()
+        assert transport.closed  # closed NOW, under the parked read
+    assert results == [None]
+    assert conn.closed and not conn.reusable
 
 
 # ----- h2 end-to-end: an in-flight request finishes before close -----
@@ -276,8 +325,9 @@ async def test_h1_graceful_releases_idle_connection_and_closes():
         assert graceful.count() == 1
 
         # The server is now idle, parked reading the next request head on a
-        # keep-alive connection. Graceful shutdown must release that read (via the
-        # shutdown-event race) so the connection completes and closes.
+        # keep-alive connection. Graceful shutdown must end that read (by closing the
+        # connection under it, hyper's `state.close()` on an idle connection) so the
+        # serve loop completes and the watch releases.
         await graceful.shutdown()
         assert graceful.count() == 0
         await conn.__aexit__(None, None, None)

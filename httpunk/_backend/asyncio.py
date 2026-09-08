@@ -138,12 +138,20 @@ class _AsyncioStream(asyncio.Protocol):
             await self._drain_waiter
 
     def close(self):
+        """The ORDERLY end — hyper's `poll_shutdown` on the IO when its `Connection`
+        future completes: over TLS asyncio's `close()` runs the `close_notify`
+        exchange before closing the socket (tokio-rustls' `poll_shutdown`); over plain
+        TCP it is a FIN. Pending writes are flushed first."""
         if self._transport is None:
             return
-        # Over TLS, abort() (no close_notify) rather than close() — an abortive close
-        # matching tonio's raw-socket close and hyper's hard close on a dropped
-        # connection (F33a); the async, caller-owned H1Upgraded.aclose path does the
-        # full close_notify dance instead. Plain TCP close() already sends a FIN.
+        self._transport.close()
+
+    def abort(self):
+        """The ABORTIVE end — hyper dropping the IO without `poll_shutdown` (an error
+        out of the connection, or its future dropped): no `close_notify`, no flush of
+        pending writes over TLS; plain TCP has nothing to skip, so it is a `close()`."""
+        if self._transport is None:
+            return
         if self._transport.get_extra_info("ssl_object") is not None:
             self._transport.abort()
         else:
@@ -175,12 +183,6 @@ class _AsyncioStream(asyncio.Protocol):
         waiter = self._read_waiter
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
-
-    def interrupt_read(self):
-        """Wake a parked `receive_some` so it returns b"" — lets a graceful shutdown release
-        an idle keep-alive read WITHOUT racing a coroutine (asyncio can wake a parked read from
-        another task; tonio can't, which is why it uses a select-based race instead)."""
-        self._wake_reader()
 
 
 class _AsyncioScope:
@@ -267,8 +269,17 @@ class AsyncioBackend:
         return transport.read_nowait(max_bytes)
 
     def close_transport(self, transport):
-        """Close the transport (sync). `transport.close()` covers TLS too (asyncio
-        drives the `close_notify`), so no plain/TLS split like tonio."""
+        """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —
+        an error out of the connection (a transport failure, the header-read deadline,
+        a body that errored mid-write, the peer gone mid-message), or its future
+        dropped. Over TLS no `close_notify` is sent. See `shutdown_transport`."""
+        transport.abort()
+
+    async def shutdown_transport(self, transport):
+        """The ORDERLY close: hyper's `Connection` future completing calls `poll_shutdown`
+        on the IO (proto/h1/dispatch.rs `poll_inner`; h2's `codec.shutdown`), which over
+        TLS sends `close_notify` before the socket closes. asyncio's `transport.close()`
+        does exactly that (the SSL protocol runs the shutdown exchange, then closes)."""
         transport.close()
 
     def spawn_without_results(self, *coros):
@@ -335,12 +346,6 @@ class AsyncioBackend:
     scope = _AsyncioScope
     monotonic = staticmethod(_time.monotonic)
     sleep = staticmethod(asyncio.sleep)  # async sleep(seconds), for deadline races (`select`)
-
-    # Every backend implements `timeout` (above), so the h1 server always uses it for the
-    # head-read deadline. This extra capability is asyncio-only: `_AsyncioStream.interrupt_read`
-    # can wake a parked idle read from another task, so the h1 server can skip the per-read
-    # shutdown `select`. tonio can't (no such method) → it keeps the select there.
-    native_read_interrupt = True
 
     async def timeout(self, coro, seconds):
         """Run `coro` bounded by `seconds`; return `(result, True)` on completion, or
