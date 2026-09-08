@@ -8,6 +8,7 @@ import asyncio
 
 import pytest
 from _client import open_h1
+from _transport import StubSocket
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
@@ -77,10 +78,21 @@ class _StubTransport:
         self._data = data
         self.sent = b""
         self.closed = False
+        self.socket = StubSocket(self)  # the tonio seam's socket surface (the bounded reader)
 
     async def receive_some(self, max_bytes=65536):
+        return self._recv_now(max_bytes)
+
+    # The socket surface: always readable (bytes, then EOF).
+    def _readable(self):
+        return True
+
+    def _recv_now(self, max_bytes):
         chunk, self._data = self._data[:max_bytes], self._data[max_bytes:]
         return chunk
+
+    async def receive_bounded(self, max_bytes, deadline):  # the asyncio seam's bounded read
+        return await self.receive_some(max_bytes)
 
     async def send_all(self, data):
         self.sent += bytes(data)
@@ -101,9 +113,9 @@ class _PeekableStub(_StubTransport):
         super().__init__(first)
         self._buffered = buffered
 
-    async def receive_some(self, max_bytes=65536):
+    def _recv_now(self, max_bytes):
         if self._data:
-            return await super().receive_some(max_bytes)
+            return super()._recv_now(max_bytes)
         chunk, self._buffered = self._buffered[:max_bytes], self._buffered[max_bytes:]
         return chunk
 
@@ -124,6 +136,21 @@ class _SilentStub(_StubTransport):
         self.parked.set()
         await self._closed_evt.wait()
         return b""
+
+    # The socket surface: readable while bytes remain or once closed (EOF); parked otherwise.
+    def _readable(self):
+        return bool(self._data) or self.closed
+
+    def _park(self, timeout):
+        self.parked.set()
+        return self._closed_evt.wait(None if timeout is None else timeout / 1_000_000)
+
+    def _recv_now(self, max_bytes):
+        if self._data:
+            return super()._recv_now(max_bytes)
+        if self.closed:
+            return b""
+        raise BlockingIOError
 
     def close(self):
         super().close()
@@ -425,6 +452,16 @@ class _AsyncioSilentStub(_StubTransport):
             return await super().receive_some(max_bytes)
         self.parked.set()
         await self._closed_evt.wait()
+        return b""
+
+    async def receive_bounded(self, max_bytes, deadline):
+        if self._data:
+            return await super().receive_some(max_bytes)
+        self.parked.set()
+        try:
+            await asyncio.wait_for(self._closed_evt.wait(), deadline - asyncio.get_running_loop().time())
+        except (TimeoutError, asyncio.TimeoutError):
+            return None
         return b""
 
     def close(self):
@@ -1902,3 +1939,52 @@ async def test_server_close_with_watcher_parked_on_silent_client(arm):
 
 async def _watch(req, seen):
     seen.append(await req.peer_closed())
+
+
+@pytest.mark.tonio
+async def test_bounded_reader_on_a_real_socket_times_out_then_keeps_reading():
+    """The bounded read on tonio's own socket: a silent peer -> None once the timer fires;
+    the socket is untouched by that (the stale reader slot is harmless): the peer's next
+    bytes arrive through a plain read, and bytes already there come back at once."""
+    listener, host, port = await _listener()
+    backend = TonioBackend()
+    accepted, got = [], Event()
+
+    async def accept():
+        accepted.append(await listener.accept())
+        got.set()
+
+    async with scope() as s:
+        s.spawn(accept())
+        client = await _raw_client(host, port)
+        await got.wait()
+        server = accepted[0]
+        try:
+            read = backend.bounded_reader(server)
+            assert await read(100, backend.monotonic() + 0.05) is None  # the timer: nothing to read
+            await client.send_all(b"late")
+            assert await server.receive_some(100) == b"late"  # still a working socket
+            await client.send_all(b"early")
+            assert await read(100, backend.monotonic() + 5.0) == b"early"  # bytes: the readiness wake
+        finally:
+            client.close()
+            server.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_server_header_read_timeout_bounds_the_watcher_hand_off():
+    """With the mid-message watcher armed (a push response), the next head read IS the
+    watcher's parked read, awaited through its done event: the deadline bounds that
+    wait the same way (hyper: one timer per head, whichever poll is pending). Expiry
+    closes with no response; the close ends the watcher's read; `close()` joins it."""
+    transport = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport, header_read_timeout=0.05)
+    req = await conn.next_request()
+    stream = await req.send_response(200, headers={"content-length": "2"})  # push: arms the watcher
+    await stream.send_data(b"ok", end_stream=True)
+    sent = len(transport.sent)
+    await transport.parked.wait()  # the watcher's read is parked on the silent client
+    assert await conn.next_request() is None  # the deadline hit
+    assert transport.closed and len(transport.sent) == sent  # closed, nothing written
+    await conn.close()  # joins the watcher (its read ended by the close)

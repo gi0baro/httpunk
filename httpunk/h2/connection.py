@@ -374,7 +374,7 @@ class H2ConnectionBase(H2Streams):
         """Stream a body, marking END_STREAM on the final DATA frame (or on the
         trailing HEADERS), then close the send half. A bodyless message never reaches
         here — its END_STREAM rode the HEADERS frame."""
-        if body is not None and hasattr(body, "__aiter__"):
+        if body is not None and not isinstance(body, (bytes, bytearray)) and hasattr(body, "__aiter__"):
             await self._send_async_body(st, body, trailers)
             return
         pending = _UNSET

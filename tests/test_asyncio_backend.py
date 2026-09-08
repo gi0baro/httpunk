@@ -277,3 +277,62 @@ async def test_queue_send_and_receive_fifo():
     sender.send(2)
     assert await receiver.receive() == 1
     assert await receiver.receive() == 2
+
+
+# ----- receive_bounded / bounded_reader: the head-read deadline on the read future (no task, nothing cancelled) -----
+
+
+def _stream():
+    s = _AsyncioStream()
+    s.connection_made(_FakeCloseTransport(ssl=False))
+    return s
+
+
+def _at(seconds):
+    return asyncio.get_running_loop().time() + seconds
+
+
+@pytest.mark.asyncio
+async def test_receive_bounded_buffered_bytes_return_at_once():
+    s = _stream()
+    s.data_received(b"hi")
+    assert await s.receive_bounded(100, _at(5.0)) == b"hi"
+
+
+@pytest.mark.asyncio
+async def test_receive_bounded_data_wins_and_the_timer_is_cancelled():
+    s = _stream()
+    asyncio.get_running_loop().call_soon(s.data_received, b"soon")
+    assert await s.receive_bounded(100, _at(5.0)) == b"soon"
+    assert s._read_waiter is None
+
+
+@pytest.mark.asyncio
+async def test_receive_bounded_expires_to_none_and_the_stream_keeps_working():
+    s = _stream()
+    assert await s.receive_bounded(100, _at(0.01)) is None
+    s.data_received(b"later")
+    assert await s.receive_some(100) == b"later"
+
+
+@pytest.mark.asyncio
+async def test_receive_bounded_eof_is_empty_bytes():
+    s = _stream()
+    asyncio.get_running_loop().call_soon(s.eof_received)
+    assert await s.receive_bounded(100, _at(5.0)) == b""
+
+
+@pytest.mark.asyncio
+async def test_backend_bounded_reader_and_timed_event_wait():
+    backend = AsyncioBackend()
+    s = _stream()
+    s.data_received(b"own")
+    assert await backend.bounded_reader(s)(100, _at(5.0)) == b"own"  # the seam's stream bounds itself
+    # The backend's Event carries tonio's `wait(timeout)`: no verdict, `is_set()` is the answer.
+    assert backend.event is asyncio.Event  # plain events carry no wrapper
+    evt = backend.timed_event()
+    await evt.wait(0.01)
+    assert not evt.is_set()
+    evt.set()
+    await evt.wait(0.01)
+    assert evt.is_set()

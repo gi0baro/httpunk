@@ -8,8 +8,9 @@ across coroutines — so a future asyncio/trio backend is a drop-in replacement.
 import ssl as _ssl
 
 from tonio import colored as _colored
+from tonio._net._tls import _is_eof  # private: the TLS clean-EOF test `TLSStream.receive_some` applies
 from tonio.colored.net import open_tcp_stream as _open_tcp_stream
-from tonio.colored.net.tls import open_tls_over_tcp_stream as _open_tls_over_tcp_stream
+from tonio.colored.net.tls import TLSStream as _TLSStream, open_tls_over_tcp_stream as _open_tls_over_tcp_stream
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
 from tonio.colored.sync.channel import unbounded as _unbounded
 from tonio.colored.time import time as _now, timeout as _timeout
@@ -87,8 +88,8 @@ class TonioBackend:
         - A peek beside a parked plain-socket reader is safe: both are one `recv`
           syscall on the same non-blocking socket, the bytes go to exactly one of
           them, and the loser's `EAGAIN` sends it back to waiting (tonio `recv`)."""
-        ssl_obj = getattr(transport, "_ssl", None)
-        if ssl_obj is not None:  # a TLSStream — peek only already-decrypted plaintext
+        if isinstance(transport, _TLSStream):  # peek only already-decrypted plaintext
+            ssl_obj = transport._ssl
             with ssl_obj._lock:  # tonio `_SSLProxy._lock`: the SSLObject's one lock
                 pending = ssl_obj._inner.pending()
                 return ssl_obj._inner.read(min(max_bytes, pending)) if pending else None
@@ -96,6 +97,98 @@ class TonioBackend:
             return transport.socket._sock.recv(max_bytes)  # b"" only at EOF
         except (BlockingIOError, InterruptedError):
             return None
+
+    def bounded_reader(self, transport):
+        """Chosen ONCE per connection: how `transport`'s reads are bounded by a deadline —
+        the h1 server's head-read deadline (hyper `header_read_timeout`) riding the read
+        itself, so no task is spawned per head and no parked read is ever cancelled.
+        Returns `async read(max_bytes, deadline) -> bytes | b"" (EOF) | None (expired)`;
+        `deadline` is an instant on this backend's `monotonic` clock. The transport's kind
+        is fixed for the connection's life, so the dispatch happens here, never per read,
+        and the plain-socket reader is one coroutine over bound methods resolved here —
+        the cost of tonio's own `receive_some`, plus one arm on the (cold) timer path.
+
+        Bytes first, hyper's order (`poll_read_head` polls the timer only after `parse`
+        returned Pending): a wake that finds bytes returns them, whatever the timer did.
+
+        - **Plain socket**: the socket's own arm (`_io_arm_r(timeout)`) puts the readiness
+          wait and the timer on ONE suspension (a `Waiter` with a timer). Both wakes resume
+          with `None`; the readiness word tells them apart: a readiness wake set bits
+          before waking (`set_readiness` precedes `wake`), a timer wake set none — so a
+          bare `_io_arm_r()` after the wake asks "readable?": `None` = bits set (read now),
+          a waiter = the timer fired. That waiter is never awaited: a stale reader slot,
+          overwritten by the next arm, harmless by tonio's contract. One reader per socket,
+          and `clear_r` runs only on this reader's failed syscall, so nothing consumes the
+          bits in between. Every arm is computed from the absolute deadline, so a spurious
+          readiness wake (`EAGAIN` after a wake) re-arms for the remaining time.
+        - **TLS (`TLSStream`)**: `TLSStream.receive_some` is `_ssl_dance(_read)` with
+          `_recv` feeding the ingress BIO from the raw socket; this is that dance with the
+          raw read bounded (private API — tonio and httpunk share an author; keep in step
+          with `tonio/_colored/_net/_tls.py`).
+        A transport is one of tonio's two streams — a `TLSStream` or a `SocketStream` —
+        and nothing else; anything else fails here, at setup, not on a read."""
+        if isinstance(transport, _TLSStream):
+            return self._tls_bounded_reader(transport)
+        return self._socket_bounded_reader(transport.socket)
+
+    @staticmethod
+    def _socket_bounded_reader(sock):
+        arm, clear, recv = sock._io_arm_r, sock._io_clear_r, sock._sock.recv
+
+        async def read(max_bytes, deadline):
+            while True:
+                micros = round((deadline - _now()) * 1_000_000)
+                waiter = arm(0 if micros < 0 else micros)
+                if waiter is not None:
+                    await waiter
+                    if arm() is not None:  # no readiness bits: the timer woke us
+                        return None
+                try:
+                    return recv(max_bytes)  # bytes first, whatever the timer did
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    clear()  # a spurious readiness wake: re-arm for the remaining time
+
+        return read
+
+    @staticmethod
+    def _tls_bounded_reader(stream):
+        ssl_obj = stream._ssl
+        raw_read = TonioBackend._socket_bounded_reader(stream.transport.socket)
+
+        async def read(max_bytes, deadline):
+            stream._check_ready()
+            try:
+                while True:
+                    try:
+                        ret, want_read, to_send = ssl_obj._read(max_bytes)
+                    except (_ssl.SSLError, _ssl.CertificateError) as exc:
+                        stream._set_broken()
+                        raise ResourceBroken from exc
+                    if to_send:
+                        await stream._send(to_send)
+                    elif want_read:
+                        recv_count = stream._recv_count
+                        async with stream._lock_recv:
+                            if recv_count == stream._recv_count:  # nobody fed the BIO meanwhile
+                                data = await raw_read(65536, deadline)
+                                if data is None:
+                                    return None
+                                if not data:
+                                    ssl_obj._ingress_write_eof()
+                                else:
+                                    stream._recv_est_size = max(stream._recv_est_size, len(data))
+                                    ssl_obj._ingress_write(data)
+                                stream._recv_count += 1
+                    if not want_read:
+                        return ret
+            except ResourceBroken as exc:
+                if stream._compat_https and _is_eof(exc.__cause__):
+                    return b""
+                raise
+
+        return read
 
     def close_transport(self, transport):
         """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —
@@ -111,8 +204,7 @@ class TonioBackend:
         Either way a parked `receive_some` on the transport ends (tonio deregisters
         the fd before closing it, which wakes the reader; its retry fails on the closed
         socket)."""
-        ssl_obj = getattr(transport, "_ssl", None)
-        if ssl_obj is not None:  # a TLSStream — close the underlying socket
+        if isinstance(transport, _TLSStream):  # close the underlying socket
             transport.transport.close()
         else:
             transport.close()
@@ -126,8 +218,7 @@ class TonioBackend:
         it); a plain socket just closes. A write failure while sending the alert is
         swallowed: hyper surfaces it as `Kind::Shutdown` from the connection future,
         which httpunk's serve loop has already left — the socket is closed regardless."""
-        ssl_obj = getattr(transport, "_ssl", None)
-        if ssl_obj is None:
+        if not isinstance(transport, _TLSStream):
             transport.close()
             return
         try:
@@ -159,6 +250,7 @@ class TonioBackend:
     scope = staticmethod(_colored.scope)
     lock = _Lock
     event = _colored.Event
+    timed_event = _colored.Event  # tonio's `Event.wait` already takes a timeout: the same class
     semaphore = _TonioSemaphore
     queue = staticmethod(_unbounded)
     monotonic = staticmethod(_now)

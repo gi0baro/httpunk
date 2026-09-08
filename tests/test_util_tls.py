@@ -8,7 +8,7 @@ import ssl
 
 import pytest
 import trustme
-from tonio.colored import scope
+from tonio.colored import Event, scope
 from tonio.colored.net import open_tcp_listeners
 from tonio.colored.net.tls import open_tls_over_tcp_listeners
 
@@ -155,3 +155,34 @@ async def test_http_cleartext_is_h1(ca):
         async with conn:
             resp = await conn.request("POST", "/", headers={"host": f"127.0.0.1:{port}"}, body=b"plain")
             assert await resp.read() == b"tls:plain"
+
+
+@pytest.mark.tonio
+async def test_bounded_reader_over_tls(ca):
+    """The bounded read over a `TLSStream`: the raw read beneath the SSL dance carries
+    the deadline — a silent peer -> None; the stream keeps working afterwards."""
+    listener = (await open_tls_over_tcp_listeners(0, _server_ctx(ca, ("http/1.1",)), host="127.0.0.1"))[0]
+    host, port = listener.transport.socket.getsockname()[:2]
+    backend = TonioBackend()
+    accepted, got = [], Event()
+
+    async def accept():
+        accepted.append(await listener.accept())
+        got.set()
+
+    async with scope() as s:
+        s.spawn(accept())
+        client, _ = await backend.connect_tls(host, port, ssl_context=_client_ctx(ca, ("http/1.1",)))
+        await got.wait()
+        server = accepted[0]
+        try:
+            read = backend.bounded_reader(server)
+            assert await read(100, backend.monotonic() + 0.05) is None
+            await client.send_all(b"late")
+            assert await server.receive_some(100) == b"late"
+            await client.send_all(b"early")
+            assert await read(100, backend.monotonic() + 5.0) == b"early"
+        finally:
+            backend.close_transport(client)
+            backend.close_transport(server)
+            s.cancel()

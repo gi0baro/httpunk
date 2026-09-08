@@ -233,6 +233,13 @@ class H2Connection(BaseClientConnection):
         shared connection (util.Singleton self-heal)."""
         return self._conn.is_closed()
 
+    @property
+    def busy(self) -> bool:
+        """h2 multiplexes: there is no single in-flight slot an interrupted release
+        could leave held, so an h2 connection is never `busy` in the h1 sense (the pool
+        checks `closed or busy` before parking a connection, `util.pool`)."""
+        return False
+
     async def send_request(self, request: Request) -> Response:
         """Send `request` and return its `Response` once the head arrives.
 

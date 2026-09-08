@@ -6,6 +6,8 @@ has no `.socket`, so the plain-socket path would be wrong (and would AttributeEr
 import threading
 
 import pytest
+from tonio.colored.net.tls import TLSStream
+from tonio.colored.time import time as _now
 
 from httpunk._backend.tonio import TonioBackend
 
@@ -45,13 +47,13 @@ class _FakeUnderlyingSocket:
         self.closed = True
 
 
-class _FakeTLSStream:
-    """A stand-in for tonio's `TLSStream`: exposes `._ssl`, the underlying
-    `.transport` socket, and — deliberately — NO `.socket`, so a raw-socket peek
-    would AttributeError. Its own `close()` is a coroutine (the TLS `close_notify`
-    dance), which a sync caller must NOT invoke."""
+class _FakeTLSStream(TLSStream):
+    """A stand-in for tonio's `TLSStream` — a subclass, since the backend dispatches on
+    the type: exposes `._ssl`, the underlying `.transport` socket, and — deliberately —
+    NO `.socket`, so a raw-socket peek would AttributeError. Its own `close()` is a
+    coroutine (the TLS `close_notify` dance), which a sync caller must NOT invoke."""
 
-    def __init__(self, plaintext):
+    def __init__(self, plaintext):  # noqa: PLW0231 - the real __init__ needs a socket + context
         self._ssl = _FakeSSLObject(plaintext)
         self.transport = _FakeUnderlyingSocket()
         self.close_coro_called = False
@@ -161,3 +163,86 @@ async def test_shutdown_transport_tls_swallows_a_failed_alert_write():
     stream = _Broken(b"")
     await TonioBackend().shutdown_transport(stream)
     assert stream.close_coro_called
+
+
+# ----- bounded_reader: the head-read deadline riding the read (no task, nothing cancelled) -----
+
+
+class _Wake:
+    """A `Waiter` stand-in: the runtime resuming a parked waiter — readiness or timer,
+    both hand back None. A plain awaitable (not a coroutine), like tonio's `Waiter`:
+    the readiness question hands one out that is never awaited."""
+
+    def __await__(self):
+        return iter(())
+
+
+class _FakeArmSocket:
+    """The `_Socket` surface the bounded reader drives: `_io_arm_r(timeout)` hands out a
+    waiter (park) or None (readable now), `_io_clear_r()`, and the raw `_sock.recv`.
+    `arms` scripts the arm answers in order (True = a waiter); `recvs` the syscall's
+    (`BlockingIOError` = EAGAIN); `calls` records every timeout asked for."""
+
+    def __init__(self, arms, recvs):
+        self._arms = list(arms)
+        self._recvs = list(recvs)
+        self.calls = []
+        self.cleared = 0
+        self._sock = self
+
+    def _io_arm_r(self, timeout=None):
+        self.calls.append(timeout)
+        return _Wake() if self._arms.pop(0) else None
+
+    def _io_clear_r(self):
+        self.cleared += 1
+
+    def recv(self, n):
+        ret = self._recvs.pop(0)
+        if ret is BlockingIOError:
+            raise BlockingIOError
+        return ret
+
+
+class _ArmStream:
+    def __init__(self, sock):
+        self.socket = sock
+
+
+async def _bounded(sock, timeout=1.0):
+    read = TonioBackend().bounded_reader(_ArmStream(sock))  # chosen once per connection
+    return await read(100, _now() + timeout)
+
+
+@pytest.mark.tonio
+async def test_receive_bounded_readable_at_once_never_parks():
+    sock = _FakeArmSocket(arms=[False], recvs=[b"head"])
+    assert await _bounded(sock) == b"head"
+    assert len(sock.calls) == 1  # bits were set: no wait
+
+
+@pytest.mark.tonio
+async def test_receive_bounded_timer_wake_is_told_by_the_readiness_word():
+    # park -> wake -> the readiness question hands out a waiter: no bits, so the timer fired.
+    sock = _FakeArmSocket(arms=[True, True], recvs=[])
+    assert await _bounded(sock, 0.5) is None
+    assert 499_000 < sock.calls[0] <= 500_000  # the arm carried the timer (micros; the clock ran a little)
+    assert sock.calls[1] is None  # the question carries none
+    assert sock.cleared == 0  # no syscall on the timer path
+
+
+@pytest.mark.tonio
+async def test_receive_bounded_readiness_wake_reads_bytes_first():
+    sock = _FakeArmSocket(arms=[True, False], recvs=[b"head"])
+    assert await _bounded(sock) == b"head"
+
+
+@pytest.mark.tonio
+async def test_receive_bounded_spurious_wake_rearms_with_the_remaining_time():
+    # park -> wake -> readable? yes -> EAGAIN (a spurious wake) -> clear -> re-arm, then bytes.
+    sock = _FakeArmSocket(arms=[True, False, True, False], recvs=[BlockingIOError, b"head"])
+    assert await _bounded(sock, 0.5) == b"head"
+    assert sock.cleared == 1
+    first, again = sock.calls[0], sock.calls[2]
+    assert 499_000 < first <= 500_000
+    assert 0 < again <= first  # the deadline is absolute: never reset to the full timeout

@@ -262,7 +262,7 @@ class _Lease:
         # Drop it instead: never park open-and-lying. (Liveness stays a use-time
         # check, as in hyper-util: a peer close landing right after this park is
         # caught by the next checkout's request, not here.)
-        if exc_type is None and not (conn.closed or getattr(conn, "busy", False)) and self._cache._checkin(conn):
+        if exc_type is None and not (conn.closed or conn.busy) and self._cache._checkin(conn):
             pass  # clean exit + completed exchange -> idle set
         else:
             # Deliberate simplification vs hyper-util (F51, documented WON'T-FIX): on ANY

@@ -68,6 +68,7 @@ if TYPE_CHECKING:
 
 
 _READ_SIZE = 65536
+_DEADLINE = object()  # sentinel: the head-read deadline hit (hyper `Error::new_header_timeout`)
 # The interim response hyper's server auto-sends for `Expect: 100-continue` (conn.rs L409).
 _CONTINUE = H1Codec.continue_response()
 _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L249)
@@ -421,6 +422,11 @@ class ServerConnection(H1Framing, H1ServerState):
         # Max time to read a complete request head before closing (slowloris defence),
         # hyper's `header_read_timeout` (default 30s, http1.rs L249). `None` disables it.
         self._header_read_timeout = header_read_timeout
+        # The head read's clock and bounded reader, bound ONCE: the transport's kind is
+        # fixed for the connection's life, so the backend picks the reader here and each
+        # read is one coroutine (`backend.bounded_reader`).
+        self._now = self.backend.monotonic
+        self._read_bounded = None if header_read_timeout is None else self.backend.bounded_reader(transport)
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
@@ -501,7 +507,7 @@ class ServerConnection(H1Framing, H1ServerState):
         here, after it, and the handle is stored — or, if the connection closed in
         between, handed back and joined right here (the watcher exits at once: the
         transport is gone). Never a second reader beside the next head read."""
-        done = self.backend.event()
+        done = self.backend.timed_event()  # awaited under the head-read deadline (`_take_watcher`)
         if not self.arm_watcher(req._seq, done, want=want, head_negotiated=head_negotiated):
             return
         handle = self.backend.spawn_without_results(self._watch_mid_message(req, done))
@@ -536,13 +542,18 @@ class ServerConnection(H1Framing, H1ServerState):
             req._peer_closed_evt.set()
         done.set()
 
-    async def _take_watcher(self, done):
-        """The watcher's read result — awaited through its completion EVENT (cancellable:
-        the head-read deadline and the shutdown race may abandon this wait, with the
-        handle still in its slot), then its handle joined exactly once (already done:
-        no suspension, so no cancellation can strand it). Raises the transport error
-        the read hit, if any."""
-        await done.wait()
+    async def _take_watcher(self, done, deadline):
+        """The watcher's read result — awaited through its completion EVENT, bounded by
+        the head-read `deadline` (the wait is abandoned on expiry — `None` — with the
+        handle still in its slot; the close that follows ends the watcher's read and
+        `close()` joins it), then its handle joined exactly once (already done: no
+        suspension). Raises the transport error the read hit, if any."""
+        if deadline is None:
+            await done.wait()
+        else:
+            await done.wait(deadline - self._now())  # a timed wait resumes without a verdict...
+            if not done.is_set():  # ...the flag is the answer (a set landing with the timer counts)
+                return None
         handle = self.take_watcher_handle()
         if handle is not None:
             await handle
@@ -554,16 +565,22 @@ class ServerConnection(H1Framing, H1ServerState):
     async def _eof(self):
         return b""
 
-    def _recv_head_bytes(self, n):
+    def _recv_head_bytes(self, n, deadline):
         """The next head-read awaitable: the parked watcher's read when one is armed (the
-        hand-off — never a second reader on the transport), else a fresh read."""
+        hand-off — never a second reader on the transport), else a fresh read — bounded
+        by the head-read `deadline` (None = unbounded): `None` on expiry. hyper's
+        `header_read_timeout` timer is polled AFTER `parse` returned Pending — bytes
+        first — and the bounded read keeps that order. The bound is on the read itself:
+        no wrapper task, and nothing cancels a parked read."""
         done = self.watcher_done()
         if done is not None:
-            return self._take_watcher(done)
+            return self._take_watcher(done, deadline)
         transport = self.transport_ref()
         if transport is None:
             return self._eof()  # a concurrent close: the connection is over
-        return transport.receive_some(n)
+        if deadline is None:
+            return transport.receive_some(n)
+        return self._read_bounded(n, deadline)
 
     async def _check_peer_open(self, req):
         # hyper: once `mid_message_detect_eof` saw EOF the connection is errored and nothing
@@ -720,27 +737,31 @@ class ServerConnection(H1Framing, H1ServerState):
         return dec.is_complete
 
     async def _read_request_head(self, code, obj):
-        # Bound the head read by `header_read_timeout` (slowloris defence, hyper http1.rs L249):
-        # if the deadline wins, close with no response (hyper closes on a header-read timeout).
-        # `backend.timeout(coro, seconds) -> (result, completed)` cancels the read cleanly on
-        # expiry — cheap on every backend (asyncio: one task + one timer; tonio: its native
-        # timeout). `None` disables the deadline.
-        if self._header_read_timeout is None:
-            return await self._read_head_frames(code, obj)
-        result, completed = await self.backend.timeout(self._read_head_frames(code, obj), self._header_read_timeout)
-        if not completed:
+        # hyper's `header_read_timeout` (slowloris defence, http1.rs L249; default 30s, `None`
+        # disables it): ONE deadline per head, armed at the first poll for it — i.e. from the
+        # moment the connection is idle between requests, so it covers the keep-alive wait
+        # plus the head's bytes — never reset by partial bytes (conn.rs `poll_read_head`:
+        # `h1_header_read_timeout_running` stays set until a head parses). Expiry is
+        # `Error::new_header_timeout` out of the dispatcher: closed, no response, the
+        # abortive end. The bound rides each read (`_read_bounded`), so no task is spawned
+        # per head and no parked read is ever cancelled.
+        deadline = None if self._header_read_timeout is None else self._now() + self._header_read_timeout
+        accepted = await self._read_head_frames(code, obj, deadline)
+        if accepted is _DEADLINE:
             self._close(self.fail_read())
             return None
-        return result
+        return accepted
 
-    async def _read_head_frames(self, code, obj):
+    async def _read_head_frames(self, code, obj, deadline):
         """Read + parse the next head from `begin_read`'s verdict: `READ_PARSE` = bytes of
         it are already buffered (pipelined), parse before touching the transport;
         `READ_WATCHER` / `READ_TRANSPORT` = the idle between-requests read (`obj` = the
         parked watcher's done event, or the transport); `READ_SHUTDOWN` / `READ_EOF` =
         nothing to read. Each read's bytes go to `accept_head`, which parses and — once
         the head is complete — makes it the current request in the same step. Returns
-        `(head, seq, decoder)`, or None on EOF / a shutdown wake."""
+        `(head, seq, decoder)`, None on EOF / a shutdown close, or `_DEADLINE` once the
+        head-read `deadline` (a monotonic instant, None = unbounded) passed with the
+        head still incomplete."""
         if code == H1_READ_PARSE:
             accepted = self.accept_head(b"")
             if accepted is not None:
@@ -748,7 +769,7 @@ class ServerConnection(H1Framing, H1ServerState):
             code = None  # a partial head: keep reading — a request in flight must complete
         while True:
             if code is None:
-                data = await self._recv_head_bytes(_READ_SIZE)
+                data = await self._recv_head_bytes(_READ_SIZE, deadline)
             elif code in (H1_READ_SHUTDOWN, H1_READ_EOF):
                 return None
             else:
@@ -761,7 +782,7 @@ class ServerConnection(H1Framing, H1ServerState):
                 # step that clears the park: whatever the read returned — even bytes that
                 # landed in that instant — belongs to a request hyper drops too.
                 try:
-                    data = await self._idle_read(code, obj)
+                    data = await self._idle_read(code, obj, deadline)
                 except Exception:
                     if self.unpark_idle_read():
                         return None
@@ -771,6 +792,8 @@ class ServerConnection(H1Framing, H1ServerState):
                     raise
                 if self.unpark_idle_read():
                     return None
+            if data is None:
+                return _DEADLINE  # the deadline hit before the head completed
             if not data:
                 # EOF. A clean EOF between requests (nothing buffered) is a normal
                 # client close. hyper additionally distinguishes a MID-head EOF
@@ -786,14 +809,19 @@ class ServerConnection(H1Framing, H1ServerState):
             if accepted is not None:
                 return accepted
 
-    def _idle_read(self, code, obj):
+    def _idle_read(self, code, obj, deadline):
         """The idle-read awaitable for a `READ_WATCHER` (`obj` = the parked watcher's done
         event: the hand-off — never a second reader on the transport) or `READ_TRANSPORT`
-        (`obj` = the transport) verdict. A plain (sync) function so the fast path adds no
-        wrapper coroutine. Never raced, woken or cancelled: a graceful shutdown ends it by
-        closing the connection (`graceful_shutdown`), the one sanctioned way to end a
-        parked read on either backend."""
-        return self._take_watcher(obj) if code == H1_READ_WATCHER else obj.receive_some(_READ_SIZE)
+        (`obj` = the transport) verdict, bounded by the head-read `deadline`. A plain
+        (sync) function so the fast path adds no wrapper coroutine. Never raced, woken or
+        cancelled: a graceful shutdown ends it by closing the connection
+        (`graceful_shutdown`), the one sanctioned way to end a parked read on either
+        backend, and the deadline is the read's own."""
+        if code == H1_READ_WATCHER:
+            return self._take_watcher(obj, deadline)
+        if deadline is None:
+            return obj.receive_some(_READ_SIZE)
+        return self._read_bounded(_READ_SIZE, deadline)
 
     async def _send_error(self, transport, codec, status):
         """Best-effort automatic error response (bodyless, `Connection: close`),
@@ -818,7 +846,7 @@ class ServerConnection(H1Framing, H1ServerState):
         path, so the two cannot drift; only the write batching differs. The peer-closed
         check is the claim's (`_claim_response`), which precedes this."""
         content_length, chunked = self._body_framing(body)
-        streaming = body is not None and hasattr(body, "__aiter__")
+        streaming = chunked and hasattr(body, "__aiter__")  # chunked = an iterable: async or sync?
         if trailers is not None and not isinstance(trailers, HeaderMap):
             # As hyper: the framing is the body's (a known-length body cannot carry
             # them) and only fields the response's own `Trailer` header declared are
@@ -879,7 +907,7 @@ class ServerConnection(H1Framing, H1ServerState):
         (`mid_message_detect_eof` -> `IncompleteMessage`); an encoder `User` error (a 1xx
         status, content-length + transfer-encoding) fails it after the claim, as hyper's."""
         hdrs = headers if headers is None or isinstance(headers, HeaderMap) else HeaderMap(headers)
-        done = self.backend.event()
+        done = self.backend.timed_event()  # awaited under the head-read deadline (`_take_watcher`)
         while True:
             try:
                 code, head, armed = self.respond_head(

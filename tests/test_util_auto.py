@@ -7,6 +7,7 @@ server (the replayed preface / request line parses correctly).
 
 import pytest
 from _client import open_h1, open_h2
+from _transport import StubSocket
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
@@ -25,8 +26,15 @@ class _ScriptedTransport:
         self._chunk = chunk_size
         self.sent = bytearray()
         self.closed = False
+        self.socket = StubSocket(self)  # the tonio seam's socket surface (the bounded reader)
 
     async def receive_some(self, max_bytes=65536):
+        return self._recv_now(max_bytes)
+
+    def _readable(self):
+        return True
+
+    def _recv_now(self, max_bytes):
         n = min(max_bytes, len(self._data))
         if self._chunk is not None:
             n = min(n, self._chunk)
@@ -262,6 +270,17 @@ class _SilentTransport(_ScriptedTransport):
     async def receive_some(self, max_bytes=65536):
         await self._closed_evt.wait()
         return b""
+
+    def _readable(self):
+        return self.closed
+
+    def _park(self, timeout):
+        return self._closed_evt.wait(None if timeout is None else timeout / 1_000_000)
+
+    def _recv_now(self, max_bytes):
+        if self.closed:
+            return b""
+        raise BlockingIOError
 
     def close(self):
         super().close()

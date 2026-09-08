@@ -122,6 +122,41 @@ class _AsyncioStream(asyncio.Protocol):
             raise _fresh_exc(self._error) from self._error
         return b""
 
+    async def receive_bounded(self, max_bytes, deadline):
+        """`receive_some` bounded by `deadline` (an instant on the loop's clock): `None`
+        once it passed with nothing buffered and no EOF. One `call_at` on the loop
+        resolves the read future with a marker; data or EOF arriving first resolves it
+        with None and the timer handle is cancelled — no task, no `wait_for`, nothing
+        cancelled. Bytes first (hyper polls its timer after `parse`): a timer wake that
+        finds bytes buffered returns them."""
+        if self._buffer:
+            return self._take(max_bytes)
+        if self._eof:
+            if self._error is not None:
+                raise _fresh_exc(self._error) from self._error
+            return b""
+        if self._read_waiter is not None:
+            raise RuntimeError("concurrent receive_some on one stream (single-reader contract)")
+        waiter = self._read_waiter = self._loop.create_future()
+        handle = self._loop.call_at(deadline, self._expire_reader, waiter)
+        try:
+            expired = await waiter
+        finally:
+            self._read_waiter = None
+            handle.cancel()
+        if self._buffer:
+            return self._take(max_bytes)
+        if self._error is not None:
+            raise _fresh_exc(self._error) from self._error
+        if self._eof:
+            return b""
+        return None if expired else b""
+
+    @staticmethod
+    def _expire_reader(waiter):
+        if not waiter.done():
+            waiter.set_result(True)
+
     async def send_all(self, data):
         # A write to a dead socket must fail (F32): asyncio's transport silently
         # DISCARDS writes after connection_lost, but tonio (like a raw socket) raises
@@ -222,6 +257,22 @@ class _AsyncioScope:
         return False
 
 
+class _Event(asyncio.Event):
+    """`asyncio.Event` with tonio's `wait(timeout)`: returns after the set OR the
+    timeout, either way without a verdict — `is_set()` afterwards is the answer. Only
+    for the one event a driver waits on under a deadline (`backend.timed_event()`: the
+    h1 watcher hand-off, `await done.wait(remaining)` then `done.is_set()`); every
+    other event is a plain `asyncio.Event`, with no wrapper on its `wait`."""
+
+    async def wait(self, timeout=None):
+        if timeout is None:
+            return await super().wait()
+        try:
+            return await asyncio.wait_for(super().wait(), timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
+
+
 class _QueueSender:
     __slots__ = ["_q"]
 
@@ -267,6 +318,11 @@ class AsyncioBackend:
     def receive_nowait(self, transport, max_bytes=65536):  # bytes | b"" (EOF) | None (nothing ready)
         """Synchronous non-blocking peek of the userspace buffer (approach B)."""
         return transport.read_nowait(max_bytes)
+
+    def bounded_reader(self, transport):
+        """Chosen once per connection (see the tonio twin): the seam's stream bounds its
+        own read (`_AsyncioStream.receive_bounded`: one timer handle on the read future)."""
+        return transport.receive_bounded
 
     def close_transport(self, transport):
         """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —
@@ -342,6 +398,7 @@ class AsyncioBackend:
     # shape step 1 normalized the h1 slot to).
     lock = asyncio.Lock
     event = asyncio.Event
+    timed_event = _Event  # the one event waited on under a deadline (the h1 watcher hand-off)
     semaphore = asyncio.Semaphore
     scope = _AsyncioScope
     monotonic = staticmethod(_time.monotonic)

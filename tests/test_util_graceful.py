@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from _client import open_h1  # noqa: F401  (kept for symmetry; loopback uses raw connections)
+from _transport import StubSocket
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
@@ -31,8 +32,15 @@ class _IdleTransport:
 
     def __init__(self):
         self.closed = False
+        self.socket = StubSocket(self)  # the tonio seam's socket surface (the bounded reader)
 
     async def receive_some(self, max_bytes=65536):
+        return b""
+
+    def _readable(self):
+        return True
+
+    def _recv_now(self, max_bytes):
         return b""
 
     async def send_all(self, data):
@@ -210,11 +218,25 @@ class _ParkedTransport(_IdleTransport):
 
     async def receive_some(self, max_bytes=65536):
         if self._data:
-            chunk, self._data = self._data[:max_bytes], self._data[max_bytes:]
-            return chunk
+            return self._recv_now(max_bytes)
         self.parked.set()
         await self._closed_evt.wait()
         return b""
+
+    def _readable(self):
+        return bool(self._data) or self.closed
+
+    def _park(self, timeout):
+        self.parked.set()
+        return self._closed_evt.wait(None if timeout is None else timeout / 1_000_000)
+
+    def _recv_now(self, max_bytes):
+        if self._data:
+            chunk, self._data = self._data[:max_bytes], self._data[max_bytes:]
+            return chunk
+        if self.closed:
+            return b""
+        raise BlockingIOError
 
     def close(self):
         super().close()
