@@ -67,6 +67,8 @@ class ServerRequest:
     headers: HeaderMap
     version: Version  # always HTTP_2 (h2 stamps it on every request, server.rs L1676)
 
+    __slots__ = ("method", "scheme", "authority", "path", "target", "headers", "version", "_stream", "_conn")
+
     def __init__(self, stream, conn, frame):
         self.method = frame.method  # str, e.g. "GET"
         self.scheme = frame.scheme  # str | None
@@ -153,6 +155,8 @@ class SendStream:
     END_STREAM rides the final frame the caller marks. Single-owner by contract (one
     producer per response), like h2's `SendStream`."""
 
+    __slots__ = ("_conn", "_stream", "_done")
+
     def __init__(self, conn, stream):
         self._conn = conn
         self._stream = stream
@@ -167,9 +171,6 @@ class SendStream:
         if end_stream:
             self._done = True
         await self._conn._send_data(self._stream, bytes(chunk), end_stream)
-        if end_stream:
-            self._conn._finish_send(self._stream)
-            self._conn._after_response(self._stream)
 
     async def send_trailers(self, trailers: HeadersInput) -> None:
         """End the stream with a trailing HEADERS frame (h2 `SendStream::send_trailers`);
@@ -180,8 +181,6 @@ class SendStream:
         self._conn.check_send_headers(hdrs)
         self._done = True
         self._conn._send_trailers(self._stream, hdrs)
-        self._conn._finish_send(self._stream)
-        self._conn._after_response(self._stream)
 
     async def send_reset(self, reason: int | None = None) -> None:
         """Abort the stream with RST_STREAM (h2 `SendStream::send_reset`); defaults to
@@ -322,30 +321,27 @@ class ServerConnection(H2ConnectionBase):
         await self._send_response_head(st, status, headers, end_stream=end_stream)
         if not end_stream:
             await self._send_body(st, body, trailers)
-            self._after_response(st)
 
     async def _send_response_head(self, st, status, headers, *, end_stream):
         # One locked step (h2 `SendResponse::send_response`, state.rs `send_open`):
         # the RFC 9113 §8.2.2 check, the transition, the HPACK encode and the queue
-        # append. A stream the peer reset while the handler was computing surfaces as
-        # the stop (hyper's first `poll_reset` window, proto/h2/server.rs L458).
-        stop, flags = self.send_response_head(st.id, status, self._headermap(headers), end_stream)
+        # append — and for a bodyless response the completion: HEADERS closed the send
+        # half, and the request's recv half goes with it (h2 drops the request's
+        # RecvStream once the response is sent: an unread request body is
+        # RST_STREAM(NO_ERROR)ed, the nginx-compat rule, and its in-flight window
+        # returned, `release_closed_capacity`; `handle` = the reader to notify). A stream
+        # the peer reset while the handler was computing surfaces as the stop (hyper's
+        # first `poll_reset` window, proto/h2/server.rs L458).
+        v = self.send_response_head(st.id, status, self._headermap(headers), end_stream)
+        stop = v.stopped
         if stop is not None:
             if stop.reason is None and not stop.conn and st.stop is None:
                 raise ConnectionClosedError("stream already closed")  # completed / cancelled locally
             raise self._stopped_error(st, stop)
-        self._after(flags)
-        if end_stream:
-            self._after_response(st)  # bodyless response — HEADERS closed the send half
-
-    def _after_response(self, st):
-        # h2 drops the request's RecvStream once the response is sent: an unread
-        # request body is RST_STREAM(NO_ERROR)ed (the nginx-compat rule) and its
-        # in-flight window returned (`release_closed_capacity`) — in Rust.
-        v = self.after_response(st.id)
+        if v.flags:
+            self._after(v.flags)
         if v.handle is not None:
-            self._notify_reset(v.handle, v.stop)
-        self._after(v.flags)
+            self._notify_reset(v.handle, v.reader_stop)
 
 
 class H2Server(BaseServer[ServerRequest]):

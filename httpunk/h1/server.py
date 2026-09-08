@@ -110,6 +110,24 @@ class ServerRequest:
     content_length: int | None  # declared request Content-Length (None if chunked)
     upgraded: H1Upgraded | None  # the raw tunnel once a CONNECT/Upgrade is answered
 
+    __slots__ = (
+        "method",
+        "target",
+        "path",
+        "headers",
+        "version",
+        "trailers",
+        "keep_alive",
+        "is_upgrade",
+        "content_length",
+        "upgraded",
+        "_conn",
+        "_seq",
+        "_decoder",
+        "_peer_closed_evt",
+        "_continue_evt",
+    )
+
     def __init__(self, conn, seq, head, decoder):
         self.method = head.method  # str
         self.target = head.target  # str — the request-target (origin/absolute/authority form)
@@ -288,6 +306,8 @@ class SendStream:
     body-framing calls (`serialize_data` / `serialize_end` / `serialize_trailers`).
     Every write is awaited for backpressure (`send_all`). One response at a time per
     connection, so a `SendStream` is single-owner and not thread-safe."""
+
+    __slots__ = ("_conn", "_req", "_codec", "_done")
 
     def __init__(self, conn, req, codec):
         self._conn = conn

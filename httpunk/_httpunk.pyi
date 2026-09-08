@@ -892,9 +892,11 @@ class H2RecvDataVerdict:
 
 class H2SendVerdict:
     sent: int  # bytes of `data[offset:]` framed and queued (0 with done=False: wait for window)
-    done: bool  # the last byte (and END_STREAM, if requested) is queued
+    done: bool  # the last byte (and END_STREAM, if requested) is queued; with END_STREAM the send half closed
     stopped: H2Stopped | None
     flags: int
+    handle: object | None  # server, the response complete: the request reader to notify (its body was reset)
+    reader_stop: H2Stopped | None  # the stop those readers must see
 
 class H2ResetVerdict:
     handle: object | None  # the stream's handle to notify (None: no live stream)
@@ -997,12 +999,10 @@ class H2Streams:
 
     # ----- sending -----
     def send_data(self, sid: int, data: bytes, offset: int, end_stream: bool) -> H2SendVerdict: ...
-    def send_trailers(self, sid: int, trailers: HeaderMap) -> tuple[H2Stopped | None, int]: ...
-    def finish_send(self, sid: int) -> tuple[H2Stopped | None, int]: ...
+    def send_trailers(self, sid: int, trailers: HeaderMap) -> H2SendVerdict: ...
     def send_response_head(
         self, sid: int, status: int, headers: HeaderMap | None, end_stream: bool
-    ) -> tuple[H2Stopped | None, int]: ...
-    def after_response(self, sid: int) -> H2ResetVerdict: ...
+    ) -> H2SendVerdict: ...
     def reset_stream(self, sid: int, reason: int, initiator: str = ...) -> H2ResetVerdict: ...
     def reset_on_error(self, sid: int, reason: int) -> H2ResetVerdict:
         """Library reset after a peer violation; counts toward the ENHANCE_YOUR_CALM cap."""

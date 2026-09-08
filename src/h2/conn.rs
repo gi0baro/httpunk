@@ -132,13 +132,21 @@ pub struct SendVerdict {
     /// Bytes of `data[offset:]` framed and queued (0 with `done=False`: wait for window).
     #[pyo3(get)]
     pub sent: usize,
-    /// The last byte (and END_STREAM, if requested) is queued.
+    /// The last byte (and END_STREAM, if requested) is queued — and with END_STREAM the
+    /// send half is closed in this same step (h2 `send_data` / `send_trailers`).
     #[pyo3(get)]
     pub done: bool,
     #[pyo3(get)]
     pub stopped: Option<Py<Stopped>>,
     #[pyo3(get)]
     pub flags: u8,
+    /// Server, the response complete: the request's recv half went with it (hyper drops
+    /// the `RecvStream`) — the handle to notify when an unread body was RST_STREAMed,
+    /// with the stop its readers must see (`None`: nothing to notify).
+    #[pyo3(get)]
+    pub handle: Option<Py<PyAny>>,
+    #[pyo3(get)]
+    pub reader_stop: Option<Py<Stopped>>,
 }
 
 #[pyclass(module = "httpunk._httpunk", name = "H2ResetVerdict", frozen)]
@@ -467,6 +475,30 @@ impl Inner {
             self.streams.remove(&sid);
         }
         flags | self.on_stream_gone()
+    }
+
+    /// The send half just closed (the END_STREAM frame is queued and `send_close`
+    /// ran, in the caller's step): the stream leaves the active set, and on the
+    /// SERVER the request's recv half goes with it — hyper drops the request's
+    /// `RecvStream` once the response is sent: an unread body is RST_STREAM(NO_ERROR)ed
+    /// while the client is still sending (`maybe_cancel`, streams.rs L1601 — the
+    /// nginx-compat rule) and the in-flight body's connection window is returned
+    /// (`release_closed_capacity`). Returns the handle to notify when a reset was
+    /// sent, the stop its readers must see, and the flags.
+    fn finish_stream(&mut self, sid: u32) -> (Option<Py<PyAny>>, Option<Stopped>, u8) {
+        let flags = self.close_stream(sid);
+        if self.role == Role::Server {
+            match self.streams.get(&sid) {
+                Some(e) if !e.state.is_closed() => {
+                    let (handle, stop, more) =
+                        self.reset_stream(sid, u32::from(Reason::NO_ERROR), Initiator::User);
+                    return (handle, stop, flags | more);
+                }
+                Some(_) => self.reclaim_stream_accounting(sid),
+                None => {}
+            }
+        }
+        (None, None, flags)
     }
 
     /// A stream left the active set: the server's phase-2 drain check, and the
@@ -1664,12 +1696,15 @@ impl H2Streams {
             let r = me.encoder.encode_data(sid, &[], end_stream, &mut pending);
             me.pending = pending;
             r?;
-            return Ok(SendVerdict {
-                sent: 0,
-                done: true,
-                stopped: None,
-                flags: me.wake_flag(before),
-            });
+            let tail = if end_stream {
+                // h2 `send_data`: the END_STREAM frame closes the send half in the same step.
+                me.streams.get_mut(&sid).expect("live").state.send_close();
+                me.finish_stream(sid)
+            } else {
+                (None, None, 0)
+            };
+            let flags = me.wake_flag(before);
+            return Ok(completed_send(0, flags, tail));
         }
         let budget = me.send_budget(e);
         if budget == 0 {
@@ -1678,6 +1713,8 @@ impl H2Streams {
                 done: false,
                 stopped: None,
                 flags: 0,
+                handle: None,
+                reader_stop: None,
             });
         }
         let want = data.len() - offset;
@@ -1697,58 +1734,46 @@ impl H2Streams {
             Some((last, m)) if *last == sid => *m += n,
             _ => me.credit.push((sid, n)),
         }
+        if last {
+            // h2 `send_data`: the END_STREAM frame closes the send half in the same step
+            // (`is_send_streaming` held above, under this same lock: no reset in between).
+            me.streams.get_mut(&sid).expect("live").state.send_close();
+            let tail = me.finish_stream(sid);
+            let flags = me.wake_flag(before);
+            return Ok(completed_send(n, flags, tail));
+        }
         Ok(SendVerdict {
             sent: n,
             done: n == want,
             stopped: None,
             flags: me.wake_flag(before),
+            handle: None,
+            reader_stop: None,
         })
     }
 
-    /// A trailing HEADERS frame (END_STREAM) after the body (h2 `send_trailers`).
-    fn send_trailers(&self, sid: u32, trailers: &HeaderMap) -> (Option<Stopped>, u8) {
+    /// A trailing HEADERS frame (END_STREAM) after the body (h2 `send_trailers`): the
+    /// send half closes in this same step, as h2's does.
+    fn send_trailers(&self, sid: u32, trailers: &HeaderMap) -> SendVerdict {
         let hframe = codec::build_trailers(sid, trailers.snapshot());
         let mut me = self.lock();
         let before = me.pending.len();
-        let Some(e) = me.streams.get(&sid) else {
-            return (
-                Some(Stopped {
-                    reason: None,
-                    conn: false,
-                }),
-                0,
-            );
+        let Some(e) = me.streams.get_mut(&sid) else {
+            return stopped_send(Stopped {
+                reason: None,
+                conn: false,
+            });
         };
         if !e.state.is_send_streaming() {
-            return (Some(e.stopped()), 0);
+            return stopped_send(e.stopped());
         }
+        e.state.send_close();
         let mut pending = std::mem::take(&mut me.pending);
         me.encoder.encode_headers(hframe, &mut pending);
         me.pending = pending;
-        (None, me.wake_flag(before))
-    }
-
-    /// Close the send half after the END_STREAM frame went out (h2 send.rs closes the
-    /// send half only while still streaming): a peer reset landing between our final
-    /// frame and here has moved the state to Closed — surface the reset instead.
-    fn finish_send(&self, sid: u32) -> (Option<Stopped>, u8) {
-        let mut me = self.lock();
-        let Some(e) = me.streams.get_mut(&sid) else {
-            return (
-                Some(Stopped {
-                    reason: None,
-                    conn: false,
-                }),
-                0,
-            );
-        };
-        if e.state.is_send_streaming() {
-            e.state.send_close();
-            (None, me.close_stream(sid))
-        } else {
-            let stop = e.stopped();
-            (Some(stop), me.close_stream(sid))
-        }
+        let tail = me.finish_stream(sid);
+        let flags = me.wake_flag(before);
+        completed_send(0, flags, tail)
     }
 
     /// Server: send the response HEADERS (h2 server.rs `SendResponse::send_response`;
@@ -1763,7 +1788,7 @@ impl H2Streams {
         status: u16,
         headers: Option<&HeaderMap>,
         end_stream: bool,
-    ) -> PyResult<(Option<Stopped>, u8)> {
+    ) -> PyResult<SendVerdict> {
         let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
         // RFC 9113 §8.2.2 rejection BEFORE the state transition: a rejected call
         // leaves the stream untouched and still able to send a valid response.
@@ -1775,62 +1800,28 @@ impl H2Streams {
         // the stop the pump published on the handle decides (a post-END_STREAM reset,
         // hyper's `poll_reset` window) — else the caller reports "already closed".
         let Some(e) = me.streams.get_mut(&sid) else {
-            return Ok((
-                Some(Stopped {
-                    reason: None,
-                    conn: false,
-                }),
-                0,
-            ));
+            return Ok(stopped_send(Stopped {
+                reason: None,
+                conn: false,
+            }));
         };
         if e.state.is_closed() {
-            return Ok((Some(e.stopped()), 0));
+            return Ok(stopped_send(e.stopped()));
         }
         let hframe = codec::build_response_headers(sid, status, fields, end_stream, auto_date)?;
         e.state.send_open(end_stream).map_err(map_user_err)?;
         let mut pending = std::mem::take(&mut me.pending);
         me.encoder.encode_headers(hframe, &mut pending);
         me.pending = pending;
-        let mut flags = 0;
-        if end_stream {
-            flags |= me.close_stream(sid); // bodyless response — HEADERS closed the send half
-        }
-        Ok((None, flags | me.wake_flag(before)))
-    }
-
-    /// Server, after the response is sent: h2 drops the request's RecvStream. If the
-    /// app never consumed the request body, that (a) RST_STREAM(NO_ERROR)s while the
-    /// client is still sending (`maybe_cancel`, streams.rs L1601 — the nginx-compat
-    /// rule) and (b) returns the in-flight body's connection window
-    /// (`release_closed_capacity`). Returns the handle to notify when a reset was sent.
-    fn after_response(&self, sid: u32) -> ResetVerdict {
-        let mut me = self.lock();
-        let before = me.pending.len();
-        let Some(e) = me.streams.get(&sid) else {
-            return ResetVerdict {
-                handle: None,
-                stop: None,
-                flags: 0,
-            };
+        // A bodiless response: HEADERS closed the send half — the response is complete
+        // in this step (the request's recv half goes with it, `finish_stream`).
+        let tail = if end_stream {
+            me.finish_stream(sid)
+        } else {
+            (None, None, 0)
         };
-        if !e.state.is_closed() {
-            let (handle, stop, flags) =
-                me.reset_stream(sid, u32::from(Reason::NO_ERROR), Initiator::User);
-            let flags = flags | me.wake_flag(before);
-            return ResetVerdict {
-                handle,
-                stop: None,
-                flags,
-            }
-            .with_stop_py(stop);
-        }
-        me.reclaim_stream_accounting(sid);
         let flags = me.wake_flag(before);
-        ResetVerdict {
-            handle: None,
-            stop: None,
-            flags,
-        }
+        Ok(completed_send(0, flags, tail))
     }
 
     /// Abort a stream: RST_STREAM(reason) + full teardown (h2 `send_reset`).
@@ -2234,6 +2225,26 @@ fn stopped_send(stop: Stopped) -> SendVerdict {
         done: false,
         stopped: Some(stop.into_py_unchecked()),
         flags: 0,
+        handle: None,
+        reader_stop: None,
+    }
+}
+
+/// The verdict of a completed send step: `flags`, plus the server's end-of-response
+/// notification when the request's recv half was reset (`finish_stream`).
+fn completed_send(
+    sent: usize,
+    flags: u8,
+    tail: (Option<Py<PyAny>>, Option<Stopped>, u8),
+) -> SendVerdict {
+    let (handle, stop, tail_flags) = tail;
+    SendVerdict {
+        sent,
+        done: true,
+        stopped: None,
+        flags: flags | tail_flags,
+        handle,
+        reader_stop: stop.map(Stopped::into_py_unchecked),
     }
 }
 

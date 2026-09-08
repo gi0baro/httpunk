@@ -291,9 +291,10 @@ class H2ConnectionBase(H2Streams):
                 # After a peer GOAWAY, once every in-flight stream has finished, queue our
                 # acknowledging GOAWAY(NO_ERROR) and stop serving (F23; h2 `go_away_now`).
                 flags = self.maybe_goaway_reply()
-                self._after(flags)
-                if flags & H2_FLAG_CONN_DONE:
-                    break
+                if flags:
+                    self._after(flags)
+                    if flags & H2_FLAG_CONN_DONE:
+                        break
         except H2Error as exc:
             # A protocol/flow violation we detected: notify the peer with GOAWAY, then
             # tear down (h2 `go_away_now`). Best-effort: the connection is going down.
@@ -328,7 +329,8 @@ class H2ConnectionBase(H2Streams):
                 handle = v.handle
                 handle.trailers = frame.headers
                 handle.body_send.send(None)  # EOF (trailers available via `.trailers`)
-            self._after(v.flags)
+            if v.flags:
+                self._after(v.flags)
         elif isinstance(frame, Data):
             v = self.recv_data(frame)
             handle = v.handle
@@ -337,7 +339,8 @@ class H2ConnectionBase(H2Streams):
                     handle.body_send.send((v.payload, v.budgeted))
                 if v.eof:
                     handle.body_send.send(None)
-            self._after(v.flags)
+            if v.flags:
+                self._after(v.flags)
         elif isinstance(frame, WindowUpdate):
             for handle in self.recv_window_update(frame):
                 handle.window_evt.set()
@@ -345,7 +348,8 @@ class H2ConnectionBase(H2Streams):
             initial, wake, flags = self.recv_settings(frame)
             for handle in wake:
                 handle.window_evt.set()
-            self._after(flags)
+            if flags:
+                self._after(flags)
             if initial:
                 self._signal_ready()  # connection fully established (client unblocks connect())
         elif isinstance(frame, Ping):
@@ -374,13 +378,23 @@ class H2ConnectionBase(H2Streams):
         """Stream a body, marking END_STREAM on the final DATA frame (or on the
         trailing HEADERS), then close the send half. A bodyless message never reaches
         here — its END_STREAM rode the HEADERS frame."""
-        if body is not None and not isinstance(body, (bytes, bytearray)) and hasattr(body, "__aiter__"):
+        if isinstance(body, bytes):
+            # hyper's `Full` body: one poll yields the whole chunk with `is_end_stream()`
+            # set — one DATA carrying END_STREAM (or the trailers carry it, F45).
+            if trailers is None:
+                await self._send_data(st, body, end_stream=True)
+                return
+            if body:
+                await self._send_data(st, body, end_stream=False)
+            self._send_trailers(st, trailers)
+            return
+        if body is not None and not isinstance(body, bytearray) and hasattr(body, "__aiter__"):
             await self._send_async_body(st, body, trailers)
             return
         pending = _UNSET
         if body is not None:
-            # `bytes` / a sync iterable can't park: hold one chunk back so END_STREAM rides
-            # the final DATA frame.
+            # A sync iterable can't park: hold one chunk back so END_STREAM rides the
+            # final DATA frame.
             async for chunk in aiter_body(body):  # yields without suspending for these shapes
                 if pending is not _UNSET:
                     await self._send_data(st, pending, end_stream=False)
@@ -394,7 +408,6 @@ class H2ConnectionBase(H2Streams):
             await self._send_data(st, b"", end_stream=True)  # nothing yielded: one empty END_STREAM DATA
         else:
             await self._send_data(st, pending, end_stream=True)
-        self._finish_send(st)
 
     async def _send_async_body(self, st, body, trailers):
         """Stream an ASYNC body and fail fast on a peer reset — hyper's `PipeToSendStream`
@@ -422,7 +435,6 @@ class H2ConnectionBase(H2Streams):
             raise self._stopped_error(st, st.stop)
         if box:
             raise box[0]
-        self._finish_send(st)
 
     async def _pump_async_body(self, st, body, trailers, done, box):
         # A bare task: never lets an exception escape (it is reported through `box`).
@@ -443,8 +455,11 @@ class H2ConnectionBase(H2Streams):
         """Queue `data` as DATA frame(s), each reserved against min(connection window,
         stream window, send-buffer room, peer max_frame_size) — h2 send.rs `send_data`
         behind `poll_capacity`. `send_data` is one locked step (reserve + encode +
-        append); "no window now" is awaited on `window_evt` with the fixed waiter
-        idiom: try, clear, try again, wait (design §4)."""
+        append — and, with END_STREAM on the last frame, the send half's close, as h2's;
+        on the server the request's recv half goes with it, hyper dropping the
+        `RecvStream`: `handle` is the reader to notify when its unread body was reset);
+        "no window now" is awaited on `window_evt` with the fixed waiter idiom: try,
+        clear, try again, wait (design §4)."""
         offset = 0
         while True:
             v = self.send_data(st.id, data, offset, end_stream)
@@ -452,9 +467,11 @@ class H2ConnectionBase(H2Streams):
                 raise self._stopped_error(st, v.stopped)
             if v.flags:
                 self._after(v.flags)
-            offset += v.sent
             if v.done:
+                if v.handle is not None:
+                    self._notify_reset(v.handle, v.reader_stop)
                 return
+            offset += v.sent
             if v.sent:
                 continue
             st.window_evt.clear()
@@ -463,25 +480,24 @@ class H2ConnectionBase(H2Streams):
                 raise self._stopped_error(st, v.stopped)
             if v.flags:
                 self._after(v.flags)
-            offset += v.sent
             if v.done:
+                if v.handle is not None:
+                    self._notify_reset(v.handle, v.reader_stop)
                 return
+            offset += v.sent
             if not v.sent:
                 await st.window_evt.wait()
 
     def _send_trailers(self, st, trailers):
-        stop, flags = self.send_trailers(st.id, trailers)
-        if stop is not None:
-            raise self._stopped_error(st, stop)
-        self._after(flags)
-
-    def _finish_send(self, st):
-        """Close the send half after the END_STREAM frame went out (h2 send.rs closes it
-        only while still streaming): a peer reset that landed in between surfaces here."""
-        stop, flags = self.finish_send(st.id)
-        self._after(flags)
-        if stop is not None:
-            raise self._stopped_error(st, stop)
+        """The trailing HEADERS (END_STREAM) closes the send half in the same step
+        (h2 `send_trailers`); see `_send_data` for the server's `handle`."""
+        v = self.send_trailers(st.id, trailers)
+        if v.stopped is not None:
+            raise self._stopped_error(st, v.stopped)
+        if v.flags:
+            self._after(v.flags)
+        if v.handle is not None:
+            self._notify_reset(v.handle, v.reader_stop)
 
     def _reset(self, st, reason, initiator="user"):
         """Abort a stream: RST_STREAM + full teardown in one locked step (h2
