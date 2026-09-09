@@ -9,7 +9,7 @@ import ssl as _ssl
 
 from tonio import colored as _colored
 from tonio._net._tls import _is_eof  # private: the TLS clean-EOF test `TLSStream.receive_some` applies
-from tonio.colored.net import open_tcp_stream as _open_tcp_stream
+from tonio.colored.net import SocketStream as _SocketStream, open_tcp_stream as _open_tcp_stream
 from tonio.colored.net.tls import TLSStream as _TLSStream, open_tls_over_tcp_stream as _open_tls_over_tcp_stream
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
 from tonio.colored.sync.channel import unbounded as _unbounded
@@ -61,6 +61,43 @@ class TonioBackend:
             ssl_context.set_alpn_protocols(list(alpn))
         stream = await _open_tls_over_tcp_stream(host, port, ssl_context=ssl_context)
         return stream, stream._ssl.selected_alpn_protocol()
+
+    async def wrap_tls(self, stream, *, server_hostname, alpn=None, ssl_context=None, prefix=b""):
+        """TLS over a stream this backend already produced — `connect_tcp`'s, or the IO
+        `H1Upgraded.downcast()` hands back (a CONNECT tunnel through a proxy to an
+        `https` origin). Returns `(stream, selected_alpn)` exactly like `connect_tls`,
+        and the result is accepted everywhere a `connect_tls` stream is. `prefix` is the
+        tunnel's `read_buf`: bytes read past the CONNECT response that are the start of
+        the TLS conversation (hyper wraps the `Rewind`ed `Upgraded`, so they are the
+        first ciphertext) — written into the ingress BIO before the handshake (private
+        `_SSLProxy` API, tonio and httpunk share an author).
+
+        The TLS layer sits DIRECTLY on the `SocketStream` (the same stack `connect_tls`
+        builds), so every dispatch in this backend holds — the plaintext peek, the
+        bounded reader's raw read, the abortive close of the socket beneath. tonio's
+        `TLSStream` is designed over a socket stream only: TLS over TLS (a tunnel
+        through an `https://` proxy) is not supported here and is refused at setup.
+        On a handshake failure the socket is closed before the error propagates
+        (hyper: the failed connect drops the IO) — the caller has nothing to clean up.
+        Failure exceptions are `connect_tls`'s (`ResourceBroken` from the ssl error)."""
+        if not isinstance(stream, _SocketStream):
+            raise TypeError(
+                f"wrap_tls needs a tonio SocketStream, got {type(stream).__name__}: TLS over TLS "
+                "(an https:// proxy tunnel) is outside tonio's TLSStream design"
+            )
+        if ssl_context is None:
+            ssl_context = _ssl.create_default_context()
+        if alpn:
+            ssl_context.set_alpn_protocols(list(alpn))
+        tls = _TLSStream(stream, ssl_context, server_hostname=server_hostname)
+        if prefix:
+            tls._ssl._ingress_write(prefix)
+        try:
+            await tls.handshake()
+        except BaseException:
+            stream.close()
+            raise
+        return tls, tls._ssl.selected_alpn_protocol()
 
     def receive_nowait(self, transport, max_bytes=65536):
         """A synchronous, non-blocking read: whatever bytes are immediately

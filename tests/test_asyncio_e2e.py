@@ -279,6 +279,249 @@ async def test_tls_alpn_negotiates_h2(ca):
             assert await resp.read() == b"tls:/x"
 
 
+# ----- TLS over an existing stream: `wrap_tls` on a CONNECT tunnel -----
+
+_CONNECT_OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+
+
+def _h1_ctx(ca):
+    ctx = ssl.create_default_context()
+    ca.configure_trust(ctx)
+    ctx.set_alpn_protocols(["http/1.1"])
+    return ctx
+
+
+async def _read_head(stream):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = await stream.receive_some(65536)
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+async def _answer_connect(stream):
+    head = await _read_head(stream)
+    assert head is not None and head.startswith(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n")
+    await stream.send_all(_CONNECT_OK)
+
+
+async def _server_tls(stream, server_ctx):
+    """The origin's side of the tunnel: server TLS on the SAME connection the CONNECT
+    came on — `start_tls` over the accepted stream's transport, the stream re-pointed at
+    the TLS transport (the mirror of what `wrap_tls` does on the client side)."""
+    loop = asyncio.get_running_loop()
+    tls_transport = await loop.start_tls(stream._transport, stream, server_ctx, server_side=True)
+    stream.connection_made(tls_transport)
+    return stream
+
+
+async def _tunnel_origin(accept, listener, server_ctx, backend, errors):
+    """A CONNECT proxy and the `https` origin behind it, in one (see the tonio twin in
+    test_util_tls.py). Errors are recorded, never swallowed."""
+    try:
+        stream = await accept()
+        await _answer_connect(stream)
+        server = await auto.serve(await _server_tls(stream, server_ctx), backend=backend)
+        async with server:
+            async for req in server:
+                body = await req.read()
+                await req.respond(200, body=b"tls:" + body)
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        listener.close()
+
+
+async def _connect_tunnel(backend, host, port, *, ssl_context=None):
+    """Dial the proxy (over TLS if `ssl_context`), CONNECT, take the tunnel's IO back out."""
+    if ssl_context is not None:
+        transport, _ = await backend.connect_tls(host, port, ssl_context=ssl_context)
+    else:
+        transport = await backend.connect_tcp(host, port)
+    async with H1Connection(transport, authority=f"{host}:{port}", backend=backend) as proxy:
+        resp = await proxy.request("CONNECT", "127.0.0.1:443", headers={"host": "127.0.0.1:443"})
+        assert resp.status == 200 and resp.is_upgrade
+        return resp.upgraded.downcast()
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_tunnel_alpn_h2(ca):
+    backend = AsyncioBackend()
+    errors = []
+    host, port, accept, listener = await _listen()
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(_tunnel_origin(accept, listener, _server_ctx(ca), backend, errors))
+        io, read_buf = await _connect_tunnel(backend, host, port)
+        assert read_buf == b""
+        stream, selected = await backend.wrap_tls(
+            io, server_hostname="127.0.0.1", ssl_context=_client_ctx(ca), prefix=read_buf
+        )
+        assert stream is io  # the same stream object, re-pointed at the TLS transport
+        assert selected == "h2"
+        async with H2Connection(stream, authority="127.0.0.1:443", scheme="https", backend=backend) as conn:
+            resp = await conn.request("POST", "/", body=b"hi")
+            assert await resp.read() == b"tls:hi"
+    assert not errors
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_tunnel_h1_keep_alive_and_abort(ca):
+    """h1 over the tunnel: keep-alive reuse (the send-time peek before the second request
+    runs on the wrapped stream), then the abortive `close_transport` — `abort()` on the
+    TLS transport, the path punkreq's own wrapper lacked — ends the origin's loop."""
+    backend = AsyncioBackend()
+    errors = []
+    host, port, accept, listener = await _listen()
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(_tunnel_origin(accept, listener, _server_ctx(ca), backend, errors))
+        io, read_buf = await _connect_tunnel(backend, host, port)
+        stream, selected = await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=_h1_ctx(ca))
+        assert selected == "http/1.1"
+        conn = H1Connection(stream, authority="127.0.0.1:443", backend=backend)
+        await conn.__aenter__()
+        for body in (b"one", b"two"):
+            resp = await conn.request("POST", "/", headers={"host": "127.0.0.1:443"}, body=body)
+            assert await resp.read() == b"tls:" + body
+        backend.close_transport(stream)  # no close_notify: the origin's read breaks or ends
+    assert not errors  # the h1 server maps the broken transport at the head boundary to a clean end (F47)
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_tunnel_orderly_close_sends_close_notify(ca):
+    backend = AsyncioBackend()
+    errors = []
+    host, port, accept, listener = await _listen()
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(_tunnel_origin(accept, listener, _server_ctx(ca), backend, errors))
+        io, _ = await _connect_tunnel(backend, host, port)
+        stream, _ = await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=_h1_ctx(ca))
+        async with H1Connection(stream, authority="127.0.0.1:443", backend=backend) as conn:
+            resp = await conn.request("GET", "/", headers={"host": "127.0.0.1:443"})
+            assert await resp.read() == b"tls:"
+    assert not errors
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_over_tls_https_proxy(ca):
+    """A tunnel through an `https://` proxy: TLS to the proxy, CONNECT inside it, then the
+    origin's TLS inside the tunnel — TLS over TLS. sslproto stacks and cascades both
+    ends, so on asyncio this simply works (tonio refuses it at setup)."""
+    backend = AsyncioBackend()
+    errors = []
+    host, port, accept, listener = await _listen(ssl_ctx=_server_ctx(ca))  # the proxy speaks TLS
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(_tunnel_origin(accept, listener, _server_ctx(ca), backend, errors))
+        io, read_buf = await _connect_tunnel(backend, host, port, ssl_context=_h1_ctx(ca))
+        stream, selected = await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=_client_ctx(ca))
+        assert selected == "h2"
+        async with H2Connection(stream, authority="127.0.0.1:443", scheme="https", backend=backend) as conn:
+            resp = await conn.request("POST", "/", body=b"nested")
+            assert await resp.read() == b"tls:nested"
+    assert not errors  # the orderly close cascaded through both TLS layers
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_rejects_bytes_before_the_handshake(ca):
+    """asyncio's runtime limitation: bytes the peer sent before the ClientHello — a
+    non-empty `prefix`, or bytes the eager drain already buffered on the stream — cannot
+    be fed to the SSL layer, and mean the peer is no TLS server anyway: `ssl.SSLError`
+    up front, the stream aborted (the proxy's read ends)."""
+    backend = AsyncioBackend()
+    ended = []
+    host, port, accept, listener = await _listen()
+
+    async def proxy():
+        try:
+            stream = await accept()
+            await _answer_connect(stream)
+            try:
+                ended.append(await stream.receive_some())
+            except ConnectionError as exc:
+                ended.append(exc)
+        finally:
+            listener.close()
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(proxy())
+        io, read_buf = await _connect_tunnel(backend, host, port)
+        assert read_buf == b""
+        with pytest.raises(ssl.SSLError, match="before the TLS handshake"):
+            await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=_client_ctx(ca), prefix=b"junk")
+    assert ended and (ended[0] == b"" or isinstance(ended[0], ConnectionError))
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_rejects_buffered_bytes(ca):
+    """The other way the peer can speak first on asyncio: bytes sitting in the stream's
+    own buffer (the eager drain) at wrap time — the same up-front `ssl.SSLError`."""
+    backend = AsyncioBackend()
+    io = _AsyncioStream()
+    io.connection_made(None)
+    io.data_received(b"junk")
+    with pytest.raises(ssl.SSLError, match="before the TLS handshake"):
+        await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=_client_ctx(ca))
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_dead_stream_fails_fast(ca):
+    """A stream whose peer already closed: no handshake can complete, and `start_tls`
+    would silently drop the ClientHello and sit until its own timeout — fail up front
+    with a `ConnectionError` instead (the F32 rule `send_all` follows)."""
+    backend = AsyncioBackend()
+    host, port, accept, listener = await _listen()
+
+    async def proxy():
+        try:
+            stream = await accept()
+            await _answer_connect(stream)
+            stream.close()  # a FIN right after the 200
+        finally:
+            listener.close()
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(proxy())
+        io, _ = await _connect_tunnel(backend, host, port)
+        assert await io.receive_some() == b""  # the EOF has arrived: deterministic, no timing
+        with pytest.raises(ConnectionError):
+            await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=_client_ctx(ca))
+
+
+@pytest.mark.asyncio
+async def test_wrap_tls_handshake_failure_closes_the_socket(ca):
+    """A refused certificate: `ssl.SSLCertVerificationError` out of `wrap_tls`, and the
+    socket is already closed by then (sslproto force-closes it): the origin's own
+    handshake fails, then its raw read ends — nothing for the caller to tear down."""
+    backend = AsyncioBackend()
+    ends = []
+    host, port, accept, listener = await _listen()
+
+    async def origin():
+        try:
+            stream = await accept()
+            await _answer_connect(stream)
+            try:
+                await _server_tls(stream, _server_ctx(ca))
+            except Exception as exc:
+                ends.append(exc)
+            try:
+                ends.append(await stream.receive_some())
+            except Exception as exc:
+                ends.append(exc)
+        finally:
+            listener.close()
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(origin())
+        io, _ = await _connect_tunnel(backend, host, port)
+        untrusting = ssl.create_default_context()  # no `ca.configure_trust`: verification fails
+        with pytest.raises(ssl.SSLCertVerificationError):
+            await backend.wrap_tls(io, server_hostname="127.0.0.1", ssl_context=untrusting)
+        assert io._transport.is_closing()  # sslproto force-closed the socket: nothing to clean up
+    assert len(ends) == 2 and not isinstance(ends[0], bytes)  # the origin's handshake failed, then its read ended
+
+
 # ----- graceful shutdown (teardown + the h1 read-race via backend.select) -----
 
 

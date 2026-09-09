@@ -20,6 +20,23 @@ handed off to the caller — mirroring hyper's `Upgraded` (`on_upgrade` /
 from .._httpunk import OnceLatch
 
 
+class _Spent:
+    """What a downcast `H1Upgraded` reads from / writes to: nothing. hyper's `downcast`
+    consumes the `Upgraded`; here the handle stays reachable, so using it is a loud
+    error rather than a read on a transport someone else now owns."""
+
+    __slots__ = []
+
+    def receive_some(self, max_bytes=65536):
+        raise RuntimeError("H1Upgraded spent: downcast() took its transport")
+
+    def send_all(self, data):
+        raise RuntimeError("H1Upgraded spent: downcast() took its transport")
+
+
+_SPENT = _Spent()
+
+
 class H1Upgraded:
     """The raw connection after an HTTP/1 upgrade (101) or CONNECT tunnel — a
     byte stream the caller now owns and drives directly. Reads first drain any
@@ -43,6 +60,20 @@ class H1Upgraded:
 
     def send_all(self, data):
         return self._transport.send_all(data)
+
+    def downcast(self):
+        """Take the IO back out of the handle: `(transport, read_buf)` — the backend's
+        stream this tunnel rides, and the `bytes` read past the response head that
+        no read consumed yet. hyper: `Upgraded::downcast` -> `Parts { io, read_buf }`.
+        It consumes the handle: this `H1Upgraded` is spent afterwards (`aclose` is a
+        no-op — the caller owns the transport now — and reads/writes raise). The
+        seam's `wrap_tls(transport, prefix=read_buf, ...)` takes exactly these two to
+        run an origin's TLS handshake inside a CONNECT tunnel."""
+        if not self._close_latch.try_acquire():
+            raise RuntimeError("H1Upgraded already closed or downcast")
+        transport, self._transport = self._transport, _SPENT
+        read_buf, self._leftover = self._leftover, b""
+        return transport, read_buf
 
     async def aclose(self):
         if self._close_latch.try_acquire():

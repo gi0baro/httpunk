@@ -336,6 +336,50 @@ class AsyncioBackend:
         selected = ssl_obj.selected_alpn_protocol() if ssl_obj is not None else None
         return stream, selected
 
+    async def wrap_tls(self, stream, *, server_hostname, alpn=None, ssl_context=None, prefix=b""):
+        """TLS over a stream this backend already produced — `connect_tcp`'s, or the IO
+        `H1Upgraded.downcast()` hands back (a CONNECT tunnel through a proxy to an
+        `https` origin). Returns `(stream, selected_alpn)` like `connect_tls` (see the
+        tonio twin). `loop.start_tls` swaps the socket's protocol for asyncio's
+        `SSLProtocol`, runs the handshake, and hands back the TLS transport this SAME
+        `_AsyncioStream` is now fed from and writes to — so the returned stream IS
+        `stream`, re-pointed at it. `close`/`abort` already dispatch on the SSL object
+        being there, and TLS over TLS (an `https://` proxy) works: sslproto cascades
+        both ends through stacked transports.
+
+        Handshake failure: sslproto force-closes the socket itself and the error
+        (`ssl.SSLError`/`CertificateError`, or `ConnectionResetError` on an EOF mid-
+        handshake) comes out of `start_tls` — nothing for the caller to clean up. A
+        stream whose socket is already gone fails up front the way `send_all` does
+        (F32): `start_tls` on a dead transport would otherwise sit in the handshake
+        until its timeout, the ClientHello silently discarded.
+
+        Runtime limitation (like F33b): `start_tls` has no seam between the protocol
+        swap and the ClientHello, so bytes the peer sent BEFORE the handshake — `prefix`
+        (the tunnel's `read_buf`), or bytes asyncio's eager drain already buffered on
+        `stream` — cannot be fed to the SSL layer the way the tonio twin (hyper's
+        `Rewind`) does. A TLS server never speaks before the ClientHello, so such bytes
+        mean the peer is not one and the handshake would fail on them anyway: that
+        failure is raised up front, as `ssl.SSLError`, with the stream aborted."""
+        if ssl_context is None:
+            ssl_context = _ssl.create_default_context()
+        if alpn:
+            ssl_context.set_alpn_protocols(list(alpn))
+        if stream._eof:
+            stream.abort()
+            if stream._error is not None:
+                raise _fresh_exc(stream._error) from stream._error
+            raise ConnectionResetError(_errno.ECONNRESET, "connection closed before the TLS handshake")
+        if prefix or stream._buffered:
+            stream.abort()
+            raise _ssl.SSLError("bytes received before the TLS handshake: the peer is not a TLS server")
+        loop = asyncio.get_running_loop()
+        tls_transport = await loop.start_tls(stream._transport, stream, ssl_context, server_hostname=server_hostname)
+        stream.connection_made(tls_transport)
+        ssl_obj = tls_transport.get_extra_info("ssl_object")
+        selected = ssl_obj.selected_alpn_protocol() if ssl_obj is not None else None
+        return stream, selected
+
     def receive_nowait(self, transport, max_bytes=65536):  # bytes | b"" (EOF) | None (nothing ready)
         """Synchronous non-blocking peek of the userspace buffer (approach B)."""
         return transport.read_nowait(max_bytes)

@@ -420,6 +420,54 @@ async def test_connect_tunnel():
 
 
 @pytest.mark.tonio
+async def test_upgraded_downcast_takes_io_and_read_buf():
+    """`H1Upgraded.downcast()` is hyper's `Upgraded::downcast` -> `Parts { io, read_buf }`:
+    the backend's stream plus the bytes read past the head, and the handle is spent —
+    reads/writes on it raise, a second downcast raises, `aclose` no longer touches the
+    transport (the caller owns it now)."""
+    listener, host, port = await _listener()
+    done = Event()
+
+    async def server():
+        try:
+            stream = await listener.accept()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = await stream.receive_some(65536)
+                if not chunk:
+                    return
+                buf += chunk
+            await stream.send_all(b"HTTP/1.1 200 Connection Established\r\n\r\nHELLO")  # 200 + tunnel bytes
+            while True:
+                data = await stream.receive_some(65536)
+                if not data:
+                    break
+                await stream.send_all(data[::-1])
+        finally:
+            done.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h1(host, port) as conn:
+            resp = await conn.request("CONNECT", "example.com:443", headers={"host": "example.com:443"})
+            up = resp.upgraded
+        io, read_buf = up.downcast()
+        assert read_buf == b"HELLO"
+        with pytest.raises(RuntimeError, match="spent"):
+            await up.receive_some()
+        with pytest.raises(RuntimeError, match="spent"):
+            await up.send_all(b"x")
+        with pytest.raises(RuntimeError):
+            up.downcast()
+        await up.aclose()  # a no-op: the IO is the caller's now...
+        await io.send_all(b"abc")  # ...and still live
+        assert await io.receive_some() == b"cba"
+        io.close()
+        await done.wait()
+        s.cancel()
+
+
+@pytest.mark.tonio
 async def test_post_request_body():
     listener, host, port = await _listener()
     requests, done = [], Event()
