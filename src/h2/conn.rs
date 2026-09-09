@@ -192,8 +192,11 @@ struct StreamEntry {
 
 impl StreamEntry {
     fn new(handle: Py<PyAny>, send_window: u32, recv_window: u32, is_head: bool) -> Self {
+        // Send side: `available` is kept equal to the window (see `send_budget`), so
+        // it is assigned here and on every later increment, never left at zero.
         let mut send_flow = FlowControl::new();
         let _ = send_flow.inc_window(send_window);
+        let _ = send_flow.assign_capacity(send_window);
         let mut recv_flow = FlowControl::new();
         let _ = recv_flow.inc_window(recv_window);
         let _ = recv_flow.assign_capacity(recv_window);
@@ -651,9 +654,11 @@ impl Inner {
                 }
                 if new >= old {
                     e.send_flow.inc_window(new - old).map_err(map_reason)?;
+                    e.send_flow.assign_capacity(new - old).map_err(map_reason)?;
                     wake.push(e.handle.clone_ref_unchecked());
                 } else {
                     e.send_flow.dec_send_window(old - new).map_err(map_reason)?;
+                    e.send_flow.claim_capacity(old - new).map_err(map_reason)?;
                 }
             }
         }
@@ -701,6 +706,15 @@ impl Inner {
 
     /// Bytes a stream may queue now: within the flow-control windows AND the
     /// per-stream send buffer cap (hyper `max_send_buf_size` -> h2 `poll_capacity`).
+    ///
+    /// Runtime-forced divergence from h2: h2 hands a stream send capacity from the
+    /// connection's pool on demand (prioritize.rs `try_assign_capacity`, claimed back
+    /// on a SETTINGS decrease), and its senders wait on that `available`. httpunk has
+    /// no prioritize queue — a sender reserves against the windows right here — so
+    /// each send window's `available` is simply kept EQUAL to its `window_size`:
+    /// assigned wherever the window is opened or incremented, claimed where it is
+    /// decremented. Without that, `FlowControl::send_data` (which decrements both)
+    /// drives `available` negative by every byte sent and underflows after 2 GiB.
     fn send_budget(&self, e: &StreamEntry) -> usize {
         let window = self.conn_send.window_size().min(e.send_flow.window_size()) as usize;
         window.min(self.max_send_buf_size.saturating_sub(e.send_buffered))
@@ -908,8 +922,13 @@ impl H2Streams {
                 codec::MAX_WINDOW_SIZE
             )));
         }
+        // h2 prioritize.rs `Prioritize::new`: the connection send window is opened AND
+        // its capacity assigned; `FlowControl::send_data` decrements both counters, so an
+        // unassigned `available` would drift negative by every byte sent and underflow
+        // (FLOW_CONTROL_ERROR) after 2 GiB on one connection.
         let mut conn_send = FlowControl::new();
         let _ = conn_send.inc_window(DEFAULT_INITIAL_WINDOW_SIZE);
+        let _ = conn_send.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE);
         let mut conn_recv = FlowControl::new();
         let _ = conn_recv.inc_window(DEFAULT_INITIAL_WINDOW_SIZE);
         let _ = conn_recv.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE);
@@ -1319,8 +1338,11 @@ impl H2Streams {
     fn recv_window_update(&self, frame: &WindowUpdate) -> PyResult<Vec<Py<PyAny>>> {
         let mut me = self.lock();
         if frame.stream_id == 0 {
+            // h2 prioritize.rs `recv_connection_window_update`: `inc_window` then
+            // `assign_connection_capacity` — the window and its capacity move together.
             me.conn_send
                 .inc_window(frame.increment)
+                .and_then(|()| me.conn_send.assign_capacity(frame.increment))
                 .map_err(map_reason)?;
             return Ok(me
                 .streams
@@ -1339,7 +1361,11 @@ impl H2Streams {
         };
         // A stream send-window overflow is a *stream* error (h2 send.rs
         // `recv_stream_window_update`), not a connection teardown.
-        if e.send_flow.inc_window(frame.increment).is_err() {
+        if e.send_flow
+            .inc_window(frame.increment)
+            .and_then(|()| e.send_flow.assign_capacity(frame.increment))
+            .is_err()
+        {
             return Err(stream_err(sid, Reason::FLOW_CONTROL_ERROR));
         }
         Ok(vec![e.handle.clone_ref_unchecked()])
