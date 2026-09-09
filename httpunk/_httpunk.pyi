@@ -268,6 +268,11 @@ class H1Codec:
         `Server::on_error` picks (400 / 414 / 431), or None when it answers nothing
         and just closes (an HTTP/2 preface: `Parse::VersionH2`)."""
 
+    @property
+    def max_buf_size(self) -> int:
+        """hyper's `max_buf_size`: the incomplete-head cap, and the driver's coalescing
+        cap for an immediate body written together with the head."""
+
     def take_body(self) -> bytes:
         """Drain the bytes buffered after the head (the body bytes already read)."""
 

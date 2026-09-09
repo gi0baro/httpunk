@@ -19,17 +19,19 @@ from .._common import aiter_body
 
 _READ_SIZE = 65536
 
-# Coalescing cutoff for `_send_head_and_body`: an immediate bytes body at or
-# under this size is copied into the head's buffer and written in ONE syscall.
-# Small enough that the memcpy is far cheaper than the syscall it saves; large
-# bodies don't need it (bulk writes of full segments don't Nagle-stall) and
-# copying them would just churn memory. The VALUE is ours, not hyper's: hyper
-# needs no cutoff — its WriteBuf either flattens bodies of any size (bounded by
-# max_buf_size, ~417KB default) or queues chunks copy-free for a vectored
-# writev. A copy cap stands in for that writev path, which the transport seam's
-# single-buffer `send_all` can't express; a future `send_vectored` on the seam
-# would retire the cutoff and match hyper's Queue strategy outright.
-_COALESCE_MAX = 8192
+# Coalescing: an immediate bytes body is written together with the head, in ONE
+# buffer and one syscall, up to the codec's `max_buf_size` (hyper's, 417 KB by
+# default). hyper's `WriteBuf` has two strategies: `Queue` over a vectored IO (head
+# and body go out in one writev, nothing copied) and `Flatten` otherwise (the body
+# is memcpy'd after the head, whatever its size). The transport seam is a
+# single-buffer `send_all`, so only Flatten is reachable here; the copy is one
+# exact-size write (`serialize_head_and_body`). The cap is where the divergence
+# lives: hyper's Flatten has none, and `max_buf_size` is hyper's own bound on how
+# much it buffers before flushing — past it the memcpy is worth about the syscall
+# it saves and a huge body would be doubled in memory, so the head goes first and
+# the body follows as its own write. Measured (BENCH_FINDINGS §3): the one-write
+# path wins at every size up to 100 KB. Streamed bodies are never coalesced: the
+# head must never wait on the app's generator (hyper polls the body after the head).
 
 
 class H1Framing:
@@ -51,16 +53,12 @@ class H1Framing:
 
     async def _send_head_and_body(self, codec, head, body, trailers=None):
         """Write the message head + framed body. A bodyless message or an
-        immediate small `bytes` body (≤ `_COALESCE_MAX`) is COALESCED with the
-        head into a single transport write — hyper's `WriteBuf` "flatten"
-        strategy (proto/h1/io.rs): one syscall instead of two, and never two
-        small back-to-back segments, so the Nagle × delayed-ACK stall (~40ms
-        per message on sockets without TCP_NODELAY) is structurally impossible
-        for small messages. Streamed/large bodies keep the head-first write —
-        the head must never wait on a body generator, and copying bulk data
-        would cost more than the saved syscall. The coalesced branch mirrors
+        immediate `bytes` body up to the codec's `max_buf_size` is COALESCED with
+        the head into a single transport write — hyper's `WriteBuf` Flatten strategy
+        (proto/h1/io.rs), see the module comment. Streamed bodies, and immediate ones
+        past the cap, keep the head-first write. The coalesced branch mirrors
         `_send_body` exactly (aiter_body yields a bytes body as one chunk)."""
-        if body is None or (isinstance(body, (bytes, bytearray)) and len(body) <= _COALESCE_MAX):
+        if body is None or (isinstance(body, (bytes, bytearray)) and len(body) <= codec.max_buf_size):
             await self.write(codec.serialize_head_and_body(head, body, trailers))
             return
         await self.write(head)
@@ -78,13 +76,19 @@ class H1Framing:
         # All writes go through `write`, which raises a clean ConnectionClosedError once the
         # state gave the transport away (F59) — a body pump orphaned by an abandoned
         # exchange wakes into that, not into an AttributeError on `None.send_all`.
+        # `serialize_end` is always CALLED (it is what raises on a body short of its
+        # Content-Length) but only WRITTEN when it has bytes: the chunked terminator.
+        # A content-length body ends with nothing on the wire (hyper `end_body`).
         if codec.body_is_eof():
-            await self.write(codec.serialize_end())
+            end = codec.serialize_end()
+            if end:
+                await self.write(end)
             return
         if body is not None:
             async for chunk in aiter_body(body):
-                await self.write(codec.serialize_data(bytes(chunk)))
-        if trailers is not None:
-            await self.write(codec.serialize_trailers(trailers))
-        else:
-            await self.write(codec.serialize_end())
+                chunk = codec.serialize_data(bytes(chunk))
+                if chunk:
+                    await self.write(chunk)
+        end = codec.serialize_trailers(trailers) if trailers is not None else codec.serialize_end()
+        if end:
+            await self.write(end)

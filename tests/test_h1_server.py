@@ -1988,3 +1988,35 @@ async def test_server_header_read_timeout_bounds_the_watcher_hand_off():
     assert await conn.next_request() is None  # the deadline hit
     assert transport.closed and len(transport.sent) == sent  # closed, nothing written
     await conn.close()  # joins the watcher (its read ended by the close)
+
+
+@pytest.mark.asyncio
+async def test_immediate_body_coalesces_with_the_head_up_to_the_codecs_buffer_cap():
+    """hyper `WriteBuf` Flatten up to `max_buf_size`: an immediate body no larger than the
+    codec's cap rides the head's write; a larger one follows the head as its own write."""
+
+    class _WriteLog(_AsyncioSilentStub):
+        def __init__(self, data):
+            super().__init__(data)
+            self.writes = []  # one entry per `send_all`, the object as handed over
+
+        async def send_all(self, data):
+            self.writes.append(data)
+            await super().send_all(data)
+
+    body = bytes(100_000)
+    transport = _WriteLog(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport, backend=AsyncioBackend())
+    assert H1Codec().max_buf_size == 417_792  # hyper's default, the cap in force here
+    req = await conn.next_request()
+    await req.respond(200, body=body)
+    assert len(transport.writes) == 1
+    assert transport.writes[0].startswith(b"HTTP/1.1 200 OK\r\n") and transport.writes[0].endswith(body)
+
+    transport = _WriteLog(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport, backend=AsyncioBackend(), max_buf_size=8192)
+    req = await conn.next_request()
+    await req.respond(200, body=body)
+    assert len(transport.writes) == 2  # over the cap: the head first, the body as its own write
+    assert transport.writes[0].startswith(b"HTTP/1.1 200 OK\r\n") and transport.writes[0].endswith(b"\r\n\r\n")
+    assert transport.writes[1] is body  # and the body is the caller's own object (item 1)

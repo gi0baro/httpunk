@@ -509,6 +509,14 @@ impl H1Codec {
         self.inner.lock().unwrap().response_close_delimited
     }
 
+    /// hyper's `max_buf_size` (io.rs): the cap on an incomplete head, and the amount
+    /// hyper is willing to hold in its write buffer before flushing — the driver's
+    /// coalescing cap for an immediate body (`H1Framing._send_head_and_body`).
+    #[getter]
+    fn max_buf_size(&self) -> usize {
+        self.max_buf_size
+    }
+
     /// After a failed `receive_request_head`: the automatic response status hyper's
     /// server writes (`Server::on_error`: 400 / 414 / 431), or `None` when it answers
     /// nothing and just closes (an HTTP/2 preface: `Parse::VersionH2`).
