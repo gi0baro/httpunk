@@ -9,11 +9,11 @@
 //! can never be observed; in debug a poisoned lock surfaces as a clean panic.)
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use http::header::{CONTENT_LENGTH, DATE, HeaderValue};
+use http::header::{CONTENT_LENGTH, DATE};
 use http::{Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyString};
 use std::sync::Mutex;
 
 use super::errors::{H2ProtocolError, map_user_err, user_payload_too_big};
@@ -22,6 +22,8 @@ use vendor_h2::codec::UserError;
 use vendor_h2::frame::{self, HEADER_LEN, Head, Kind};
 use vendor_h2::hpack;
 use vendor_hyper::{H2_PREFACE, date_header_value};
+
+use crate::py::{method_str, scheme_str};
 
 /// Default HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE, RFC 7540 §6.5.2).
 const DEFAULT_HEADER_TABLE_SIZE: usize = 4096;
@@ -188,10 +190,19 @@ fn headers_event(py: Python<'_>, h: frame::Headers) -> PyResult<Py<PyAny>> {
             stream_id,
             end_stream,
             end_headers: true,
-            method: pseudo.method.map(|m| m.to_string()),
-            scheme: pseudo.scheme.map(|s| s.as_str().to_string()),
-            authority: pseudo.authority.map(|s| s.as_str().to_string()),
-            path: pseudo.path.map(|s| s.as_str().to_string()),
+            // Each pseudo-header becomes ONE `str`, here, handed out by reference on
+            // every read (BOUNDARY_NOTES rule 7); method and scheme are the shared
+            // interned objects of their closed sets (rule 6).
+            method: pseudo.method.as_ref().map(|m| method_str(py, m)),
+            scheme: pseudo.scheme.as_ref().map(|s| scheme_str(py, s.as_str())),
+            authority: pseudo
+                .authority
+                .as_ref()
+                .map(|s| PyString::new(py, s.as_str()).unbind()),
+            path: pseudo
+                .path
+                .as_ref()
+                .map(|s| PyString::new(py, s.as_str()).unbind()),
             status: pseudo.status.map(|s| s.as_u16()),
             headers,
             content_length,
@@ -213,13 +224,13 @@ pub struct Headers {
     #[pyo3(get)]
     pub end_headers: bool,
     #[pyo3(get)]
-    pub method: Option<String>,
+    pub method: Option<Py<PyString>>,
     #[pyo3(get)]
-    pub scheme: Option<String>,
+    pub scheme: Option<Py<PyString>>,
     #[pyo3(get)]
-    pub authority: Option<String>,
+    pub authority: Option<Py<PyString>>,
     #[pyo3(get)]
-    pub path: Option<String>,
+    pub path: Option<Py<PyString>>,
     #[pyo3(get)]
     pub status: Option<u16>,
     /// Regular header fields as a `httpunk.http.HeaderMap`.
@@ -659,10 +670,7 @@ pub(super) fn build_response_headers(
     let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
     let pseudo = frame::Pseudo::response(status);
     if auto_date {
-        fields.entry(DATE).or_insert_with(|| {
-            HeaderValue::from_bytes(&date_header_value())
-                .expect("IMF-fixdate is a valid header value")
-        });
+        fields.entry(DATE).or_insert_with(date_header_value);
     }
     let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
     // A bodyless response carries END_STREAM on HEADERS (e.g. a HEAD response,

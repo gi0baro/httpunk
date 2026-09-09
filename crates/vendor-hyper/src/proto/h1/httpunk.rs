@@ -19,7 +19,7 @@ use http::header::{HeaderValue, CONNECTION};
 use super::decode::Decoder;
 use super::io::MemRead;
 use super::role::{Client, Server};
-use super::{Encode, Encoder, Http1Transaction, ParseContext};
+use super::{Encode, EncodedBuf, Encoder, Http1Transaction, ParseContext};
 use crate::body::DecodedLength;
 use crate::error::{Header, Kind, Parse, User};
 use crate::headers::connection_keep_alive;
@@ -189,10 +189,12 @@ pub struct ParsedHead {
 
 /// A parsed request head (server side), with everything the Python driver needs.
 pub struct ParsedRequest {
-    pub method: String,
+    /// The parsed method and request-target as hyper holds them (`RequestLine`):
+    /// no string is rendered here — the caller decides what to build from them.
+    pub method: Method,
     /// The request-target verbatim: origin-form path+query, absolute-form (proxy),
     /// or authority-form (CONNECT).
-    pub target: String,
+    pub target: Uri,
     pub headers: HeaderMap,
     pub body: BodyDecode,
     pub keep_alive: bool,
@@ -218,9 +220,94 @@ pub fn connection_any_close(headers: &HeaderMap) -> bool {
     crate::headers::connection_any_close(headers)
 }
 
-/// Owns the vendored body `Encoder` and frames request-body chunks into bytes,
-/// so hyper's body `Encoder` never crosses the crate boundary.
+/// Owns the vendored body `Encoder` and frames body chunks, so hyper's body
+/// `Encoder` never crosses the crate boundary. Nothing here copies payload bytes:
+/// a chunk is framed over a BORROW of the caller's buffer (`FramedChunk`) and
+/// written out once, into the caller's destination, by `write_to` — hyper's own
+/// shape, where `Encoder::encode` wraps the caller's `Buf` (`BufKind::Exact` /
+/// `Chunked`) and the write buffer copies it at most once.
 pub struct BodyEncoder(Encoder);
+
+/// One body chunk as hyper's `Encoder` framed it, over a borrowed chunk: the
+/// chunked size line + chunk + CRLF, the chunk verbatim (content-length within the
+/// declared length, or close-delimited), or the chunk truncated to what the declared
+/// Content-Length still allows (`BufKind::Limited`). Payload bytes are touched only
+/// by `write_to`.
+pub struct FramedChunk<'a> {
+    buf: EncodedBuf<&'a [u8]>,
+    verbatim: bool,
+}
+
+impl FramedChunk<'_> {
+    /// Bytes `write_to` will produce.
+    pub fn len(&self) -> usize {
+        self.buf.remaining()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The framed bytes ARE the chunk (hyper `BufKind::Exact`): the caller can hand
+    /// its own buffer on without copying anything.
+    pub fn is_verbatim(&self) -> bool {
+        self.verbatim
+    }
+
+    /// Write the framed chunk into `dst`, which must be exactly `len()` long.
+    pub fn write_to(self, dst: &mut [u8]) {
+        write_buf(self.buf, dst);
+    }
+}
+
+/// How a body ends: nothing (content-length / close-delimited), the fixed chunked
+/// terminator, or a chunked terminator carrying a trailer block.
+pub enum BodyTail {
+    None,
+    /// `0\r\n\r\n` (`CHUNKED_TERMINATOR`), what hyper's `Encoder::end` emits for a
+    /// chunked body — a constant, so the caller may keep one buffer for it.
+    Terminator,
+    Trailers(EncodedBuf<Bytes>),
+}
+
+/// The chunked body terminator hyper's `Encoder::end` emits (encode.rs
+/// `BufKind::ChunkedEnd`).
+pub const CHUNKED_TERMINATOR: &[u8] = b"0\r\n\r\n";
+
+impl BodyTail {
+    pub fn len(&self) -> usize {
+        match self {
+            BodyTail::None => 0,
+            BodyTail::Terminator => CHUNKED_TERMINATOR.len(),
+            BodyTail::Trailers(b) => b.remaining(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Write the tail into `dst`, which must be exactly `len()` long.
+    pub fn write_to(self, dst: &mut [u8]) {
+        match self {
+            BodyTail::None => {}
+            BodyTail::Terminator => dst.copy_from_slice(CHUNKED_TERMINATOR),
+            BodyTail::Trailers(b) => write_buf(b, dst),
+        }
+    }
+}
+
+fn write_buf(mut buf: impl Buf, dst: &mut [u8]) {
+    debug_assert_eq!(buf.remaining(), dst.len());
+    let mut off = 0;
+    while buf.has_remaining() {
+        let chunk = buf.chunk();
+        let n = chunk.len();
+        dst[off..off + n].copy_from_slice(chunk);
+        off += n;
+        buf.advance(n);
+    }
+}
 
 impl BodyEncoder {
     /// True when the framing carries no body (a `Content-Length: 0` / bodyless
@@ -245,43 +332,50 @@ impl BodyEncoder {
         self.0.is_close_delimited()
     }
 
-    /// Frame one body chunk (chunked size-prefix/CRLF, or raw for content-length).
-    pub fn encode(&mut self, chunk: &[u8]) -> Vec<u8> {
-        if chunk.is_empty() {
-            return Vec::new();
-        }
-        let mut buf = self.0.encode(Bytes::copy_from_slice(chunk));
-        let n = buf.remaining();
-        buf.copy_to_bytes(n).to_vec()
+    /// The body is `Transfer-Encoding: chunked` (`Encoder::is_chunked`).
+    pub fn is_chunked(&self) -> bool {
+        self.0.is_chunked()
     }
 
-    /// Finish the body: chunked terminator `0\r\n\r\n`, or empty for a
-    /// content-length body. `Err` if a declared Content-Length wasn't filled —
+    /// Frame one non-empty body chunk over a borrow of it: hyper's `Encoder::encode`
+    /// with the chunk as the `Buf` — the encoder's Content-Length accounting and its
+    /// truncation of an over-long chunk (`BufKind::Limited`) run exactly as upstream's.
+    pub fn encode<'a>(&mut self, chunk: &'a [u8]) -> FramedChunk<'a> {
+        debug_assert!(!chunk.is_empty(), "encode() called with an empty chunk");
+        let chunked = self.0.is_chunked();
+        let buf = self.0.encode(chunk);
+        // `Exact` is the only kind whose output is the input: a content-length chunk
+        // within the declared length, or a close-delimited one. `Limited` is shorter,
+        // `Chunked` longer.
+        let verbatim = !chunked && buf.remaining() == chunk.len();
+        FramedChunk { buf, verbatim }
+    }
+
+    /// Finish the body: the chunked terminator, or nothing for a content-length /
+    /// close-delimited body. `Err` if a declared Content-Length wasn't filled —
     /// hyper's `end_body` maps the encoder's `NotEof` to
     /// `Error::new_body_write_aborted()` (`User::BodyWriteAborted`, conn.rs
     /// `end_body`) and closes the write side; the driver does the same.
-    pub fn end(self) -> Result<Vec<u8>, crate::Error> {
+    pub fn end(self) -> Result<BodyTail, crate::Error> {
         match self.0.end::<Bytes>() {
-            Ok(Some(mut buf)) => {
-                let n = buf.remaining();
-                Ok(buf.copy_to_bytes(n).to_vec())
+            Ok(Some(buf)) => {
+                // encode.rs `end`: the one buffer it returns is `ChunkedEnd(b"0\r\n\r\n")`.
+                debug_assert_eq!(buf.remaining(), CHUNKED_TERMINATOR.len());
+                Ok(BodyTail::Terminator)
             }
-            Ok(None) => Ok(Vec::new()),
+            Ok(None) => Ok(BodyTail::None),
             Err(not_eof) => Err(crate::Error::new_body_write_aborted().with(not_eof)),
         }
     }
 
-    /// Finish a chunked body with trailing headers: emits the terminating `0\r\n` +
-    /// the trailer block + `\r\n`. Only fields declared via
+    /// Finish a chunked body with trailing headers: the terminating `0\r\n` + the
+    /// trailer block + `\r\n`. Only fields declared via
     /// `into_chunked_with_trailing_fields` (the `Trailer` header) are sent (hyper's
     /// `encode_trailers` filters + validates). Falls back to the plain terminator when
     /// no declared trailer survives (or the body isn't chunked).
-    pub fn end_with_trailers(self, trailers: HeaderMap) -> Result<Vec<u8>, crate::Error> {
+    pub fn end_with_trailers(self, trailers: HeaderMap) -> Result<BodyTail, crate::Error> {
         match self.0.encode_trailers::<Bytes>(trailers, false) {
-            Some(mut buf) => {
-                let n = buf.remaining();
-                Ok(buf.copy_to_bytes(n).to_vec())
-            }
+            Some(buf) => Ok(BodyTail::Trailers(buf)),
             None => self.end(),
         }
     }
@@ -300,7 +394,7 @@ fn map_body(d: DecodedLength) -> BodyDecode {
     }
 }
 
-/// Encode a request head into bytes and return the body `BodyEncoder`.
+/// Encode a request head into `dst` and return the body `BodyEncoder`.
 ///
 /// `body`: `None` = no body; `Some(Some(n))` = `Content-Length: n`; `Some(None)`
 /// = `Transfer-Encoding: chunked`. (hyper's `set_length` injects the matching
@@ -311,7 +405,8 @@ pub fn encode_request(
     headers: HeaderMap,
     body: Option<Option<u64>>,
     http10: bool,
-) -> Result<(Vec<u8>, BodyEncoder), crate::Error> {
+    dst: &mut Vec<u8>,
+) -> Result<BodyEncoder, crate::Error> {
     // The request-target is serialized *as given* (hyper role.rs L1200 writes
     // `msg.head.subject.1` via its `Display`, "not enforced or validated" —
     // client/conn/http1.rs L194-204): a path-and-query `Uri` yields origin-form
@@ -346,12 +441,14 @@ pub fn encode_request(
         title_case_headers: false,
         date_header: false,
     };
-    let mut dst = Vec::new();
+    // `dst` is the caller's reusable head buffer (hyper's `WriteBuf.headers`, kept
+    // across messages): cleared here, written once; on error hyper rewinds it.
+    dst.clear();
     // `Client::encode` reads the request's own `Trailer` header to allow-list the
     // chunked trailer fields the body may emit (role.rs L1420-1431); undeclared
     // fields are dropped by `encode_trailers`, as on the server.
-    let encoder = Client::encode(enc, &mut dst)?;
-    Ok((dst, BodyEncoder(encoder)))
+    let encoder = Client::encode(enc, dst)?;
+    Ok(BodyEncoder(encoder))
 }
 
 /// Parse a response head from `buf`. `Ok(None)` means "need more bytes"; on
@@ -423,8 +520,8 @@ pub fn parse_request(
         Some(parsed) => {
             let RequestLine(m, uri) = parsed.head.subject;
             Ok(Some(ParsedRequest {
-                method: m.to_string(),
-                target: uri.to_string(),
+                method: m,
+                target: uri,
                 allow_trailers: crate::headers::te_is_trailers(&parsed.head.headers),
                 headers: parsed.head.headers,
                 body: map_body(parsed.decode),
@@ -438,7 +535,7 @@ pub fn parse_request(
     }
 }
 
-/// Encode a response head into bytes and return the body `BodyEncoder` (server
+/// Encode a response head into `dst` and return the body `BodyEncoder` (server
 /// side; hyper role.rs `Server::encode` L364). `body`: `None` = no body;
 /// `Some(Some(n))` = `Content-Length: n`; `Some(None)` = `Transfer-Encoding:
 /// chunked`. `req_method` is the method of the request being answered (a response
@@ -458,7 +555,8 @@ pub fn encode_response(
     http10: bool,
     title_case_headers: bool,
     date_header: bool,
-) -> Result<(Vec<u8>, BodyEncoder), crate::Error> {
+    dst: &mut Vec<u8>,
+) -> Result<BodyEncoder, crate::Error> {
     // `keep_alive` is hyper's `wants_keep_alive()` (the request was keep-alive, no
     // graceful shutdown, keep-alive enabled); `http10` its `state.version == HTTP_10`
     // (the request was 1.0). conn.rs `encode_head` runs `enforce_version` over the
@@ -495,23 +593,25 @@ pub fn encode_response(
     if date_header {
         crate::common::date::update();
     }
-    let mut dst = Vec::new();
+    // `dst` is the caller's reusable head buffer (hyper's `WriteBuf.headers`, kept
+    // across messages): cleared here, written once; on error hyper rewinds it.
+    dst.clear();
     // `Server::encode` fails for the user errors hyper reports on the connection
     // (`User::UnexpectedHeader`, `User::UnsupportedStatusCode`); `dst` is rewound
     // to before the half-pushed head, so nothing of it reaches the wire.
-    let encoder = Server::encode(enc, &mut dst)?;
-    Ok((dst, BodyEncoder(encoder)))
+    let encoder = Server::encode(enc, dst)?;
+    Ok(BodyEncoder(encoder))
 }
 
 /// The current `Date` header value, from hyper's per-thread once-a-second cache
 /// (common/date.rs `update` + `extend`) — so the h2 server's `Date` (hyper
 /// proto/h2/server.rs L484 `or_insert_with(date::update_and_header_value)`) is the
 /// same bytes the h1 encoder writes.
-pub fn date_header_value() -> Vec<u8> {
-    crate::common::date::update();
-    let mut out = Vec::with_capacity(crate::common::date::DATE_VALUE_LENGTH);
-    crate::common::date::extend(&mut out);
-    out
+pub fn date_header_value() -> HeaderValue {
+    // hyper's h2 server path (proto/h2/server.rs `date::update_and_header_value`):
+    // the cached `HeaderValue` beside the cached bytes, refreshed once a second and
+    // handed out as a clone (a refcount bump). The vendoring shim un-gates it.
+    crate::common::date::update_and_header_value()
 }
 
 /// A synchronous `MemRead` over an in-memory buffer, so the vendored `Decoder`
@@ -585,6 +685,14 @@ impl BodyDecoder {
         self.read.buf.extend_from_slice(data);
     }
 
+    /// Take over a buffer of body bytes another Rust buffer already holds (the
+    /// bytes that arrived with the head, split off the codec's read buffer): a move
+    /// when this decoder's buffer is empty, an append after any it already holds —
+    /// `BytesMut::unsplit` — never a copy through a Python object.
+    pub fn feed_buf(&mut self, data: BytesMut) {
+        self.read.buf.unsplit(data);
+    }
+
     pub fn mark_eof(&mut self) {
         self.read.eof = true;
     }
@@ -598,8 +706,8 @@ impl BodyDecoder {
     /// connection read buffer; the sans-IO facade hands them back so the driver
     /// can carry them into the next request's codec (else a pipelined request is
     /// lost and the connection deadlocks). Empty if none buffered.
-    pub fn take_buffered(&mut self) -> Vec<u8> {
-        self.read.buf.split().to_vec()
+    pub fn take_buffered(&mut self) -> BytesMut {
+        self.read.buf.split()
     }
 
     /// Bytes buffered past the body (hyper's `read_buf` non-emptiness check,

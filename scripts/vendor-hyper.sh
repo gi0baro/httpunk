@@ -78,9 +78,13 @@ perl -0pi -e 's/use futures_core::ready;/use std::task::ready;/' "$DST/proto/h1/
 perl -0pi -e 's/\n    #\[cfg\(test\)\]\n    async fn decode_fut<R: MemRead>.*?\n    \}\n/\n/s' "$DST/proto/h1/decode.rs"
 perl -0pi -e 's/\n+#\[cfg\(test\)\]\nmod tests \{.*\z/\n/s' "$DST/proto/h1/decode.rs"
 
-# 3b. common/date.rs shim: strip the trailing `#[cfg(test)]` test module (like
-#     decode.rs). The `#[cfg(feature = "http2")]` bits compile out (http2 off).
+# 3b. common/date.rs shims: strip the trailing `#[cfg(test)]` test module (like
+#     decode.rs), and drop the `#[cfg(feature = "http2")]` gates so hyper's cached
+#     `HeaderValue` form of the date (`update_and_header_value`, what its h2 server
+#     inserts per response) compiles with `http2` off — it needs nothing from h2,
+#     the gate only mirrors where hyper happens to use it. Behaviour-identical.
 perl -0pi -e 's/\n+#\[cfg\(test\)\]\nmod tests \{.*\z/\n/s' "$DST/common/date.rs"
+perl -0pi -e 's/^[ \t]*#\[cfg\(feature = "http2"\)\]\n//mg; s/\n[ \t]*#\[cfg\(not\(feature = "http2"\)\)\]\n[^\n]*\n//mg' "$DST/common/date.rs"
 
 # 4. The ONE byte-parity exception (same as h2): widen `pub(crate)` -> `pub` on
 #    the copied files so the main `_httpunk` crate (a separate workspace member)

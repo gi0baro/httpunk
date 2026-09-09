@@ -227,3 +227,20 @@ def test_max_frame_size_setters_reject_out_of_range_values():
             codec.set_send_max_frame_size(bad)
     codec.set_max_recv_frame_size(16384)
     codec.set_send_max_frame_size((1 << 24) - 1)
+
+
+def test_pseudo_header_strings_are_shared_and_built_once():
+    # BOUNDARY_NOTES rules 6/7: method and scheme are the interned objects of their
+    # closed sets; authority and path are built once at decode and handed out by
+    # reference on every read.
+    client = _httpunk.H2Codec("client")
+    wire = client.serialize_settings()
+    for sid in (1, 3):
+        wire += client.serialize_request_headers(sid, "GET", f"https://h/p{sid}", headers=HeaderMap())
+    wire += client.serialize_request_headers(5, "PURGE", "https://h/x", headers=HeaderMap())
+    _settings, a, b, ext = _httpunk.H2Codec("server").receive(wire)
+    assert a.method == "GET" and a.method is b.method
+    assert a.scheme == "https" and a.scheme is b.scheme
+    assert a.authority == "h" and a.path == "/p1" and b.path == "/p3"
+    assert a.path is a.path and a.authority is a.authority
+    assert ext.method == "PURGE"

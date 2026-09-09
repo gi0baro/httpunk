@@ -53,7 +53,7 @@ def test_remote_settings_acked_applied_and_initial_once():
     assert conn.peer_max_concurrent_streams == 128
     assert conn.stream_limit == 128  # the client gates on it
     # The ACK was queued BEFORE the values were applied (h2 `poll_send` order).
-    [ack] = H2Codec("server").receive(conn.take_pending()[0])
+    [ack] = H2Codec("server").receive(bytes(conn.take_pending()[0]))
     assert ack.ack
     # A second remote SETTINGS is no longer the initial one.
     initial2, _wake, _flags = conn.recv_settings(_settings_frame(max_frame_size=32_768))
@@ -101,3 +101,15 @@ def test_constructor_validates_ranges():
             max_header_list_size=1,
             max_send_buf_size=1,
         )
+
+
+def test_goaway_debug_data_is_the_frames_own_object():
+    # BOUNDARY_NOTES U5: the peer's GOAWAY debug data is stored as the frame's `bytes`
+    # and handed back as-is by `goaway_info` — no Rust copy in between.
+    conn = _client()
+    conn.recv_settings(_settings_frame())  # the peer's SETTINGS come first
+    [frame] = H2Codec("client").receive(H2Codec("server").serialize_go_away(0, 0, b"drain"))
+    conn.recv_go_away(frame)
+    last, code, debug = conn.goaway_info()
+    assert (last, code, debug) == (0, 0, b"drain")
+    assert debug is frame.debug_data

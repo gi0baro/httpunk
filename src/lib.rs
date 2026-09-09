@@ -6,6 +6,7 @@ mod h1;
 mod h2;
 mod http;
 mod proxy;
+mod py;
 
 pub fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();

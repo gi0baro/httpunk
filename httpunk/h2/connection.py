@@ -202,8 +202,11 @@ class H2ConnectionBase(H2Streams):
         wire order equals commit order against the pump)."""
         async with self._send_lock:
             data, _stopping = self.take_pending()
-            if data:
-                await self._transport.send_all(data)
+            try:
+                if data:
+                    await self._transport.send_all(data)
+            finally:
+                data.release()  # the batch's buffer goes back to the state for reuse
         for handle in self.credit_written():
             handle.window_evt.set()
 
@@ -237,7 +240,8 @@ class H2ConnectionBase(H2Streams):
     async def _write_pump(self):
         """Flush the pending-send buffer to the transport. Each wake takes EVERYTHING
         accumulated since the last flush and writes it as one send (control frames
-        coalesce, h2 `poll_complete`). The clear precedes the take: an append landing
+        coalesce, h2 `poll_complete`) — the buffer itself, exported through a
+        memoryview, never a copy (BOUNDARY_NOTES V2). The clear precedes the take: an append landing
         after the take sets the event after our clear, so its wake survives. A write
         failure fails the whole connection (h2: a connection-task write error is fatal)."""
         while True:
@@ -253,6 +257,10 @@ class H2ConnectionBase(H2Streams):
                         failed = ConnectionClosedError(f"connection closed: {exc}")
                     except Exception as exc:
                         failed = exc
+                # `take_pending` hands out the pending buffer itself, as a memoryview,
+                # no copy; releasing it here (not when the name is rebound next turn)
+                # returns the buffer to the state NOW, so two buffers alternate.
+                data.release()
             # The batch is on the wire (or the connection is dead): credit each
             # stream's send buffer back and wake its sender.
             for handle in self.credit_written():

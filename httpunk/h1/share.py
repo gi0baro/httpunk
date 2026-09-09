@@ -31,7 +31,7 @@ class H1Upgraded:
 
     def __init__(self, transport, leftover):
         self._transport = transport
-        self._leftover = bytes(leftover)  # bytes read past the head, not yet consumed
+        self._leftover = leftover  # `bytes` read past the head, not yet consumed
         self._close_latch = OnceLatch()  # `aclose` runs once, whichever task gets there first
 
     async def receive_some(self, max_bytes=65536):

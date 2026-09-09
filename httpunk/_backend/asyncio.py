@@ -16,6 +16,7 @@ a pure byte-mover + stream interface, no h1/h2 or driver logic.
 """
 
 import asyncio
+import collections as _collections
 import errno as _errno
 import ssl as _ssl
 import time as _time
@@ -34,7 +35,14 @@ class _AsyncioStream(asyncio.Protocol):
     def __init__(self):
         self._loop = asyncio.get_running_loop()
         self._transport = None
-        self._buffer = bytearray()
+        # Received `bytes` objects as they came from the socket, in order, plus the
+        # unread offset into the first one. A reader that asks for at least a whole
+        # object gets THAT object, no copy (BOUNDARY_NOTES S2); only a read smaller than
+        # the object at the head copies out its slice. `_buffered` is the unread total
+        # (the backpressure watermark).
+        self._chunks = _collections.deque()
+        self._head_off = 0
+        self._buffered = 0
         self._eof = False
         self._error = None
         self._read_waiter = None  # Future parked in receive_some (single reader)
@@ -49,9 +57,14 @@ class _AsyncioStream(asyncio.Protocol):
         self._transport = transport
 
     def data_received(self, data):
-        self._buffer += data
+        if not data:
+            return
+        if type(data) is not bytes:  # a host loop may feed a bytearray/memoryview
+            data = bytes(data)
+        self._chunks.append(data)
+        self._buffered += len(data)
         self._wake_reader()
-        if not self._reading_paused and len(self._buffer) >= _READ_HIGH_WATER:
+        if not self._reading_paused and self._buffered >= _READ_HIGH_WATER:
             self._transport.pause_reading()
             self._reading_paused = True
 
@@ -97,7 +110,7 @@ class _AsyncioStream(asyncio.Protocol):
     async def receive_some(self, max_bytes=65536):
         """Up to `max_bytes` of the next available bytes; `b""` at EOF. Blocks only
         when the buffer is empty and no EOF/error has arrived yet."""
-        if self._buffer:
+        if self._buffered:
             return self._take(max_bytes)
         if self._eof:
             if self._error is not None:
@@ -116,7 +129,7 @@ class _AsyncioStream(asyncio.Protocol):
             await self._read_waiter
         finally:
             self._read_waiter = None
-        if self._buffer:
+        if self._buffered:
             return self._take(max_bytes)
         if self._error is not None:
             raise _fresh_exc(self._error) from self._error
@@ -129,7 +142,7 @@ class _AsyncioStream(asyncio.Protocol):
         with None and the timer handle is cancelled — no task, no `wait_for`, nothing
         cancelled. Bytes first (hyper polls its timer after `parse`): a timer wake that
         finds bytes buffered returns them."""
-        if self._buffer:
+        if self._buffered:
             return self._take(max_bytes)
         if self._eof:
             if self._error is not None:
@@ -144,7 +157,7 @@ class _AsyncioStream(asyncio.Protocol):
         finally:
             self._read_waiter = None
             handle.cancel()
-        if self._buffer:
+        if self._buffered:
             return self._take(max_bytes)
         if self._error is not None:
             raise _fresh_exc(self._error) from self._error
@@ -196,20 +209,28 @@ class _AsyncioStream(asyncio.Protocol):
         """Synchronous non-blocking peek: whatever is buffered right now, `b""` once
         EOF arrived, else `None` (the `receive_nowait` primitive — approach B peeks
         *our* buffer)."""
-        if self._buffer:
+        if self._buffered:
             return self._take(max_bytes)
         return b"" if self._eof else None
 
     # ----- helpers -----
 
     def _take(self, max_bytes):
-        if max_bytes >= len(self._buffer):
-            data = bytes(self._buffer)
-            self._buffer.clear()
+        head = self._chunks[0]
+        off = self._head_off
+        if off == 0 and max_bytes >= len(head):
+            data = head  # the received object itself
+            self._chunks.popleft()
         else:
-            data = bytes(self._buffer[:max_bytes])
-            del self._buffer[:max_bytes]
-        if self._reading_paused and len(self._buffer) < _READ_HIGH_WATER:
+            end = min(off + max_bytes, len(head))
+            data = head[off:end]
+            if end == len(head):
+                self._chunks.popleft()
+                self._head_off = 0
+            else:
+                self._head_off = end
+        self._buffered -= len(data)
+        if self._reading_paused and self._buffered < _READ_HIGH_WATER:
             self._transport.resume_reading()
             self._reading_paused = False
         return data

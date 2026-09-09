@@ -12,16 +12,42 @@ use bytes::BytesMut;
 use http::{Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyString};
 use std::sync::Mutex;
 
 use super::errors::map_hyper_err;
 use crate::http::HeaderMap;
+use crate::py::{body_kind_str, bytes_filled, method_str};
+use pyo3::sync::PyOnceLock;
 use vendor_hyper::{
-    BodyDecode, BodyDecoder, BodyEncoder, CONTINUE_RESPONSE, DEFAULT_MAX_BUFFER_SIZE,
-    MINIMUM_MAX_BUFFER_SIZE, connection_any_close, encode_request, encode_response, parse_request,
-    parse_response, server_parse_failure, too_large_error,
+    BodyDecode, BodyDecoder, BodyEncoder, BodyTail, CHUNKED_TERMINATOR, CONTINUE_RESPONSE,
+    DEFAULT_MAX_BUFFER_SIZE, FramedChunk, MINIMUM_MAX_BUFFER_SIZE, connection_any_close,
+    encode_request, encode_response, parse_request, parse_response, server_parse_failure,
+    too_large_error,
 };
+
+/// The chunked terminator as ONE `bytes` for the process: hyper's `Encoder::end`
+/// emits the same five bytes for every chunked body, so every `serialize_end` hands
+/// out the same object (BOUNDARY_NOTES.md rule 6).
+static CHUNKED_END: PyOnceLock<Py<PyBytes>> = PyOnceLock::new();
+
+fn chunked_end(py: Python<'_>) -> Py<PyBytes> {
+    CHUNKED_END
+        .get_or_init(py, || PyBytes::new(py, CHUNKED_TERMINATOR).unbind())
+        .clone_ref(py)
+}
+
+/// A body's tail as a `bytes`: nothing, the shared terminator, or a trailer block
+/// written once into an exact-size object.
+fn tail_bytes(py: Python<'_>, tail: BodyTail) -> PyResult<Py<PyBytes>> {
+    match tail {
+        BodyTail::None => Ok(PyBytes::new(py, b"").unbind()),
+        BodyTail::Terminator => Ok(chunked_end(py)),
+        trailers @ BodyTail::Trailers(_) => {
+            Ok(bytes_filled(py, trailers.len(), |dst| trailers.write_to(dst))?.unbind())
+        }
+    }
+}
 
 /// Map a facade `BodyDecode` to the `(body_kind, content_length)` a Python driver
 /// hands to `H1BodyDecoder`. Shared by the request (server) and response (client)
@@ -52,6 +78,10 @@ struct State {
     req_method: Option<Method>,
     /// Body framing for the in-flight request (chunked / content-length).
     encoder: Option<BodyEncoder>,
+    /// hyper's `WriteBuf.headers`: the one buffer every head is encoded into, kept
+    /// across messages so a head costs no allocation — only its copy into the
+    /// `bytes` the driver writes.
+    head_buf: Vec<u8>,
     /// The in-flight request carried `Connection: close` (any line): hyper's client
     /// `encode_head` -> `connection_any_close` -> `disable_keep_alive` (1.11.1).
     request_connection_close: bool,
@@ -108,6 +138,7 @@ impl H1Codec {
                 buf: BytesMut::new(),
                 req_method: None,
                 encoder: None,
+                head_buf: Vec::new(),
                 request_connection_close: false,
                 allow_trailer_fields: true,
                 parse_error_status: None,
@@ -178,13 +209,13 @@ impl H1Codec {
             content_length.map(Some)
         };
         let connection_close = connection_any_close(&fields);
-        let (dst, encoder) =
-            encode_request(m.clone(), uri, fields, body, http10).map_err(map_hyper_err)?;
         let mut st = self.inner.lock().unwrap();
+        let encoder = encode_request(m.clone(), uri, fields, body, http10, &mut st.head_buf)
+            .map_err(map_hyper_err)?;
         st.req_method = Some(m);
         st.encoder = Some(encoder);
         st.request_connection_close = connection_close;
-        Ok(PyBytes::new(py, &dst).unbind())
+        Ok(PyBytes::new(py, &st.head_buf).unbind())
     }
 
     /// The request serialized by `serialize_request` carried `Connection: close` on any
@@ -203,29 +234,39 @@ impl H1Codec {
         headers.with_inner(connection_any_close)
     }
 
-    /// Frame one body chunk (chunked prefix/CRLF, or raw for content-length).
-    fn serialize_data(&self, py: Python<'_>, chunk: &[u8]) -> PyResult<Py<PyBytes>> {
-        if chunk.is_empty() {
-            return Ok(PyBytes::new(py, b"").unbind());
+    /// Frame one body chunk: `chunk` itself when the framing leaves it untouched
+    /// (content-length within the declared length, or close-delimited — hyper's
+    /// `BufKind::Exact`, which wraps the caller's buffer without copying), else one
+    /// exact-size `bytes` written once (the chunked size line + chunk + CRLF, or the
+    /// chunk truncated to what the declared Content-Length still allows). The
+    /// encoder's accounting is hyper's own either way.
+    fn serialize_data(&self, py: Python<'_>, chunk: &Bound<'_, PyBytes>) -> PyResult<Py<PyBytes>> {
+        let data = chunk.as_bytes();
+        if data.is_empty() {
+            return Ok(chunk.clone().unbind());
         }
         let mut st = self.inner.lock().unwrap();
         let enc = st
             .encoder
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("serialize_data with no request in flight"))?;
-        Ok(PyBytes::new(py, &enc.encode(chunk)).unbind())
+        let framed = enc.encode(data);
+        if framed.is_verbatim() {
+            return Ok(chunk.clone().unbind());
+        }
+        Ok(bytes_filled(py, framed.len(), |dst| framed.write_to(dst))?.unbind())
     }
 
-    /// Finish the body: the chunked terminator `0\r\n\r\n`, or empty for a
-    /// content-length body. Raises `H1UserError(kind="body_write_aborted")` if a
-    /// declared Content-Length wasn't filled (hyper `end_body` -> `NotEof`).
+    /// Finish the body: the chunked terminator `0\r\n\r\n` (one shared object), or
+    /// empty for a content-length body. Raises `H1UserError(kind="body_write_aborted")`
+    /// if a declared Content-Length wasn't filled (hyper `end_body` -> `NotEof`).
     fn serialize_end(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
-        let out = match st.encoder.take() {
+        let tail = match st.encoder.take() {
             Some(enc) => enc.end().map_err(map_hyper_err)?,
-            None => Vec::new(),
+            None => BodyTail::None,
         };
-        Ok(PyBytes::new(py, &out).unbind())
+        tail_bytes(py, tail)
     }
 
     /// Finish a chunked body with trailing headers instead of a bare terminator.
@@ -237,20 +278,21 @@ impl H1Codec {
     fn serialize_trailers(&self, py: Python<'_>, trailers: &HeaderMap) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
         let allowed = st.allow_trailer_fields;
-        let out = match st.encoder.take() {
+        let tail = match st.encoder.take() {
             Some(enc) if allowed => enc
                 .end_with_trailers(trailers.snapshot())
                 .map_err(map_hyper_err)?,
             Some(enc) => enc.end().map_err(map_hyper_err)?,
-            None => Vec::new(),
+            None => BodyTail::None,
         };
-        Ok(PyBytes::new(py, &out).unbind())
+        tail_bytes(py, tail)
     }
 
     /// One message in one buffer: `head` + the framed `body` (if any) + the body's end
     /// (`trailers`, else the bare terminator) — hyper's `WriteBuf` flatten strategy for
-    /// a small immediate body, so the driver issues a single write and copies nothing.
-    /// A bodyless framing (`body_is_eof`) writes no body, whatever `body` holds.
+    /// a small immediate body: the driver issues a single write, and the message is
+    /// written ONCE, into an exact-size `bytes`. A bodyless framing (`body_is_eof`)
+    /// writes no body, whatever `body` holds.
     #[pyo3(signature = (head, body=None, trailers=None))]
     fn serialize_head_and_body(
         &self,
@@ -261,23 +303,31 @@ impl H1Codec {
     ) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
         let allowed = st.allow_trailer_fields;
-        let mut out = Vec::with_capacity(head.len() + body.map_or(0, <[u8]>::len) + 16);
-        out.extend_from_slice(head);
-        match st.encoder.take() {
-            None => {}
-            Some(enc) if enc.is_eof() => out.extend(enc.end().map_err(map_hyper_err)?),
+        let (framed, tail) = match st.encoder.take() {
+            None => (None, BodyTail::None),
+            Some(enc) if enc.is_eof() => (None, enc.end().map_err(map_hyper_err)?),
             Some(mut enc) => {
-                if let Some(chunk) = body {
-                    out.extend(enc.encode(chunk));
-                }
-                let end = match trailers {
+                let framed = body.filter(|b| !b.is_empty()).map(|b| enc.encode(b));
+                let tail = match trailers {
                     Some(t) if allowed => enc.end_with_trailers(t.snapshot()),
                     _ => enc.end(),
-                };
-                out.extend(end.map_err(map_hyper_err)?);
+                }
+                .map_err(map_hyper_err)?;
+                (framed, tail)
             }
-        }
-        Ok(PyBytes::new(py, &out).unbind())
+        };
+        let body_len = framed.as_ref().map_or(0, FramedChunk::len);
+        let total = head.len() + body_len + tail.len();
+        Ok(bytes_filled(py, total, |dst| {
+            let (h, rest) = dst.split_at_mut(head.len());
+            h.copy_from_slice(head);
+            let (b, t) = rest.split_at_mut(body_len);
+            if let Some(framed) = framed {
+                framed.write_to(b);
+            }
+            tail.write_to(t);
+        })?
+        .unbind())
     }
 
     /// True when the in-flight body framing carries no body (a bodyless response
@@ -314,7 +364,8 @@ impl H1Codec {
                         status: head.status,
                         keep_alive: head.keep_alive,
                         headers,
-                        body_kind: kind.to_string(),
+                        kind,
+                        body_kind: body_kind_str(py, kind),
                         content_length,
                         is_upgrade: head.wants_upgrade,
                         http10: head.http10,
@@ -361,17 +412,19 @@ impl H1Codec {
                 let (kind, content_length) = body_kind(&head.body);
                 // Remember the method so a response's bodyless-ness (HEAD/204/304)
                 // is computed correctly by `encode_response`.
-                st.req_method = Method::from_bytes(head.method.as_bytes()).ok();
+                st.req_method = Some(head.method.clone());
                 st.allow_trailer_fields = head.allow_trailers; // conn.rs `read_head` L328
                 let headers = Py::new(py, HeaderMap::from_inner(head.headers))?;
                 let event = Py::new(
                     py,
                     RequestHead {
-                        method: head.method,
-                        target: head.target,
+                        is_connect: head.method == Method::CONNECT,
+                        method: method_str(py, &head.method),
+                        target: target_str(py, &head.target),
                         keep_alive: head.keep_alive,
                         headers,
-                        body_kind: kind.to_string(),
+                        kind,
+                        body_kind: body_kind_str(py, kind),
                         content_length,
                         expect_continue: head.expect_continue,
                         is_upgrade: head.wants_upgrade,
@@ -421,25 +474,24 @@ impl H1Codec {
         // content-length + transfer-encoding pair as `User` errors
         // (`H1UserError`); the connection then closes (conn.rs `encode_head`
         // -> `Writing::Closed` + the error stored on the connection).
-        let dst = {
-            let mut st = self.inner.lock().unwrap();
-            let (dst, encoder) = encode_response(
-                status,
-                fields,
-                body,
-                st.req_method.clone(),
-                keep_alive,
-                http10,
-                self.title_case_headers,
-                self.date_header,
-            )
-            .map_err(map_hyper_err)?;
-            st.response_is_last = encoder.is_last();
-            st.response_close_delimited = encoder.is_close_delimited();
-            st.encoder = Some(encoder);
-            dst
-        };
-        Ok(PyBytes::new(py, &dst).unbind())
+        let mut st = self.inner.lock().unwrap();
+        let req_method = st.req_method.clone();
+        let encoder = encode_response(
+            status,
+            fields,
+            body,
+            req_method,
+            keep_alive,
+            http10,
+            self.title_case_headers,
+            self.date_header,
+            &mut st.head_buf,
+        )
+        .map_err(map_hyper_err)?;
+        st.response_is_last = encoder.is_last();
+        st.response_close_delimited = encoder.is_close_delimited();
+        st.encoder = Some(encoder);
+        Ok(PyBytes::new(py, &st.head_buf).unbind())
     }
 
     /// hyper `Encoder::is_last` of the last `serialize_response`: the connection
@@ -471,6 +523,15 @@ impl H1Codec {
         PyBytes::new(py, &self.take_body_raw()).unbind()
     }
 
+    /// `take_body` straight into a body decoder (the client's response body bytes
+    /// that came with the head): the split buffer moves, nothing crosses to Python.
+    fn take_body_into(&self, decoder: &H1BodyDecoder) {
+        let body = self.take_body_raw();
+        if !body.is_empty() {
+            decoder.feed_buf(body);
+        }
+    }
+
     /// Number of bytes currently buffered (unparsed head, or post-head body).
     pub(super) fn buffered(&self) -> usize {
         self.inner.lock().unwrap().buf.len()
@@ -481,6 +542,14 @@ impl H1Codec {
     /// `take_body` for a Rust consumer (the server state feeds the decoder itself).
     pub(super) fn take_body_raw(&self) -> BytesMut {
         self.inner.lock().unwrap().buf.split()
+    }
+
+    /// Bytes another Rust buffer read past the current message (the body decoder's
+    /// pipelined leftover) go back into the read buffer where hyper would have kept
+    /// them: a move when the buffer is empty, an append after any probe bytes it
+    /// already holds (`BytesMut::unsplit`).
+    pub(super) fn feed_buf(&self, data: BytesMut) {
+        self.inner.lock().unwrap().buf.unsplit(data);
     }
 }
 
@@ -493,9 +562,11 @@ pub struct ResponseHead {
     pub keep_alive: bool,
     #[pyo3(get)]
     pub headers: Py<HeaderMap>,
-    /// One of "empty" | "length" | "chunked" | "close".
+    /// One of "empty" | "length" | "chunked" | "close" — `kind` for Rust readers, the
+    /// shared interned `str` for Python (BOUNDARY_NOTES rules 6/7).
+    pub(super) kind: &'static str,
     #[pyo3(get)]
-    pub body_kind: String,
+    pub body_kind: Py<PyString>,
     #[pyo3(get)]
     pub content_length: Option<u64>,
     /// The response switches protocols (101 upgrade, or 2xx to CONNECT): the
@@ -513,7 +584,7 @@ impl ResponseHead {
     fn __repr__(&self) -> String {
         format!(
             "H1ResponseHead(status={}, body_kind={:?}, keep_alive={})",
-            self.status, self.body_kind, self.keep_alive,
+            self.status, self.kind, self.keep_alive,
         )
     }
 }
@@ -521,18 +592,25 @@ impl ResponseHead {
 /// A parsed HTTP/1 request head (the event `receive_request_head` yields).
 #[pyclass(module = "httpunk._httpunk", name = "H1RequestHead", frozen)]
 pub struct RequestHead {
+    /// `CONNECT` — the one method the state's tunnel rules switch on (hyper
+    /// `Method::CONNECT` checks in `Server::encode` / `read_head`); Rust-side.
+    pub(super) is_connect: bool,
+    /// The method: the shared interned `str` for a standard one (rule 6).
     #[pyo3(get)]
-    pub method: String,
-    /// The request-target verbatim (origin/absolute/authority form).
+    pub method: Py<PyString>,
+    /// The request-target verbatim (origin/absolute/authority form): ONE `str`, built
+    /// at parse and handed out by reference on every read (rule 7).
     #[pyo3(get)]
-    pub target: String,
+    pub target: Py<PyString>,
     #[pyo3(get)]
     pub keep_alive: bool,
     #[pyo3(get)]
     pub headers: Py<HeaderMap>,
-    /// One of "empty" | "length" | "chunked" | "close".
+    /// One of "empty" | "length" | "chunked" | "close" — `kind` for Rust readers, the
+    /// shared interned `str` for Python.
+    pub(super) kind: &'static str,
     #[pyo3(get)]
-    pub body_kind: String,
+    pub body_kind: Py<PyString>,
     #[pyo3(get)]
     pub content_length: Option<u64>,
     /// The client sent `Expect: 100-continue`.
@@ -552,12 +630,27 @@ pub struct RequestHead {
 
 #[pymethods]
 impl RequestHead {
-    fn __repr__(&self) -> String {
+    fn __repr__(&self, py: Python<'_>) -> String {
         format!(
             "H1RequestHead(method={:?}, target={:?}, body_kind={:?})",
-            self.method, self.target, self.body_kind,
+            self.method.bind(py),
+            self.target.bind(py),
+            self.kind,
         )
     }
+}
+
+/// The request-target as ONE `str`. Origin-form (every ordinary request) is a
+/// zero-copy view on the `Uri` (`path_and_query`), so one allocation; absolute- and
+/// authority-form targets are reassembled by `Uri`'s `Display` first.
+fn target_str(py: Python<'_>, uri: &Uri) -> Py<PyString> {
+    if uri.scheme().is_none()
+        && uri.authority().is_none()
+        && let Some(pq) = uri.path_and_query()
+    {
+        return PyString::new(py, pq.as_str()).unbind();
+    }
+    PyString::new(py, &uri.to_string()).unbind()
 }
 
 /// A synchronous HTTP/1 response-body decoder (content-length / chunked /
@@ -566,6 +659,20 @@ impl RequestHead {
 #[pyclass(module = "httpunk._httpunk", name = "H1BodyDecoder", frozen)]
 pub struct H1BodyDecoder {
     inner: Mutex<BodyDecoder>,
+}
+
+impl H1BodyDecoder {
+    /// Take over a Rust buffer of body bytes (the codec's post-head split) — a move.
+    pub(super) fn feed_buf(&self, data: BytesMut) {
+        self.inner.lock().unwrap().feed_buf(data);
+    }
+
+    /// Drain and return the bytes buffered past the completed body — the start of
+    /// the next pipelined request (hyper keeps these in its persistent read
+    /// buffer). The server driver feeds them back to the codec (`H1Codec.feed`).
+    pub(super) fn take_buffered(&self) -> BytesMut {
+        self.inner.lock().unwrap().take_buffered()
+    }
 }
 
 #[pymethods]
@@ -604,13 +711,6 @@ impl H1BodyDecoder {
     #[getter]
     pub(super) fn is_complete(&self) -> bool {
         self.inner.lock().unwrap().is_complete()
-    }
-
-    /// Drain and return the bytes buffered past the completed body — the start of
-    /// the next pipelined request (hyper keeps these in its persistent read
-    /// buffer). The server driver feeds them back to the codec (`H1Codec.feed`).
-    pub(super) fn take_buffered(&self, py: Python<'_>) -> Py<PyBytes> {
-        PyBytes::new(py, &self.inner.lock().unwrap().take_buffered()).unbind()
     }
 
     /// Bytes buffered past the body, without moving them — hyper's

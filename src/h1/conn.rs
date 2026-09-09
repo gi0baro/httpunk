@@ -186,7 +186,7 @@ impl Inner {
     /// -> Pending). Armed: `done` is the watcher's and `None` comes back — the caller
     /// must spawn the watcher. Not armed: `done` comes back, to be dropped once the
     /// guard is released (no `Py` drop under the lock).
-    fn arm_decision(&mut self, py: Python<'_>, done: Py<PyAny>) -> Option<Py<PyAny>> {
+    fn arm_decision(&mut self, done: Py<PyAny>) -> Option<Py<PyAny>> {
         let c = &self.current;
         if !c.watch_wanted {
             return Some(done);
@@ -209,8 +209,7 @@ impl Inner {
         if let Some(dec) = &c.decoder
             && dec.get().buffered() > 0
         {
-            let leftover = dec.get().take_buffered(py);
-            self.codec.get().feed(leftover.as_bytes(py));
+            self.codec.get().feed_buf(dec.get().take_buffered());
             return Some(done);
         }
         self.watcher = Some(Watcher {
@@ -262,7 +261,7 @@ impl Inner {
     ) -> (u64, Option<Py<H1BodyDecoder>>) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let is_connect = head.method == "CONNECT";
+        let is_connect = head.is_connect;
         let old = std::mem::replace(
             &mut self.current,
             Current {
@@ -353,26 +352,25 @@ impl Inner {
         if want {
             self.current.watch_wanted = true;
         }
-        let unused = self.arm_decision(py, done);
+        let unused = self.arm_decision(done);
         let armed = unused.is_none();
         (Ok((REQ_OK, Some(head), armed)), unused)
     }
 
     /// Any pipelined bytes the body decoder read past this request's body go back
     /// into the codec's persistent buffer (hyper keeps them in its single `read_buf`).
-    fn feed_decoder_leftover(&mut self, py: Python<'_>) {
+    fn feed_decoder_leftover(&mut self) {
         if let Some(dec) = &self.current.decoder
             && dec.get().buffered() > 0
         {
-            let leftover = dec.get().take_buffered(py);
-            self.codec.get().feed(leftover.as_bytes(py));
+            self.codec.get().feed_buf(dec.get().take_buffered());
         }
     }
 
     /// Positioned at the next head: leftover fed back, the codec's per-message
     /// state reset (its read buffer persists), the request forgotten.
-    fn ready_for_next(&mut self, py: Python<'_>) -> Option<Py<H1BodyDecoder>> {
-        self.feed_decoder_leftover(py);
+    fn ready_for_next(&mut self) -> Option<Py<H1BodyDecoder>> {
+        self.feed_decoder_leftover();
         self.codec.get().reset();
         let old = self.current.decoder.take();
         self.current.response_done = true;
@@ -563,7 +561,7 @@ impl H1ServerState {
                 return (NEXT_DRAIN, None);
             }
         }
-        let old = me.ready_for_next(py);
+        let old = me.ready_for_next();
         let verdict = me.read_verdict(py);
         drop(me);
         drop(old);
@@ -581,7 +579,7 @@ impl H1ServerState {
             return (NEXT_CLOSE, t);
         }
         me.current.body_done = true;
-        let old = me.ready_for_next(py);
+        let old = me.ready_for_next();
         let verdict = me.read_verdict(py);
         drop(me);
         drop(old);
@@ -625,12 +623,12 @@ impl H1ServerState {
             .get();
         let decoder = Py::new(
             py,
-            H1BodyDecoder::new(&h.body_kind, h.content_length.unwrap_or(0)),
+            H1BodyDecoder::new(h.kind, h.content_length.unwrap_or(0)),
         )?;
         // state → decoder: the body bytes that came with the head.
         let body = me.codec.get().take_body_raw();
         if !body.is_empty() {
-            decoder.get().feed(&body);
+            decoder.get().feed_buf(body);
         }
         let complete = decoder.get().is_complete();
         let (seq, old) = me.begin_request(decoder.clone_ref(py), h, complete);
@@ -762,14 +760,7 @@ impl H1ServerState {
     /// event the watcher will set. Returns whether to spawn the watcher; the caller
     /// then spawns it and `store_watcher_handle`s the handle.
     #[pyo3(signature = (seq, done, *, want=true, head_negotiated=false))]
-    fn arm_watcher(
-        &self,
-        py: Python<'_>,
-        seq: u64,
-        done: Py<PyAny>,
-        want: bool,
-        head_negotiated: bool,
-    ) -> bool {
+    fn arm_watcher(&self, seq: u64, done: Py<PyAny>, want: bool, head_negotiated: bool) -> bool {
         let mut me = self.lock();
         if !me.is_current(seq) {
             drop(me);
@@ -782,7 +773,7 @@ impl H1ServerState {
         if want {
             me.current.watch_wanted = true;
         }
-        let unused = me.arm_decision(py, done);
+        let unused = me.arm_decision(done);
         drop(me);
         let armed = unused.is_none();
         drop(unused);
@@ -953,7 +944,7 @@ impl H1ServerState {
         }
         me.current.response_done = true;
         if me.current.is_switch {
-            me.feed_decoder_leftover(py);
+            me.feed_decoder_leftover();
             let leftover = me.codec.get().take_body(py);
             me.upgraded = true;
             me.closed = true;
@@ -999,7 +990,7 @@ impl H1ServerState {
         }
         me.current.responded = true;
         me.current.response_done = true;
-        me.feed_decoder_leftover(py);
+        me.feed_decoder_leftover();
         if let Some(w) = me.watcher.as_mut()
             && let Some(data) = w.data.take()
         {

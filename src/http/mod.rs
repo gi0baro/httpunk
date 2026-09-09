@@ -307,7 +307,7 @@ impl HeaderMap {
 /// server's `Date` (hyper proto/h2/server.rs L484).
 #[pyfunction]
 fn http_date(py: Python<'_>) -> Py<PyBytes> {
-    PyBytes::new(py, &vendor_hyper::date_header_value()).unbind()
+    PyBytes::new(py, vendor_hyper::date_header_value().as_bytes()).unbind()
 }
 
 /// Split a URL into `(scheme, host, port, authority)` with the `http` crate's `Uri`

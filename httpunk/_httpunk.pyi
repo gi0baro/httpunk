@@ -218,10 +218,15 @@ class H1Codec:
         suppresses the body for HEAD/204/304 via the recorded request method)."""
 
     def serialize_data(self, chunk: bytes) -> bytes:
-        """Frame one body chunk (chunked prefix/CRLF, or raw for content-length)."""
+        """Frame one body chunk. Returns `chunk` ITSELF when the framing leaves it
+        untouched (content-length within the declared length, or close-delimited:
+        hyper wraps the caller's buffer and copies nothing), else a new `bytes`
+        (chunked size line + chunk + CRLF, or the chunk truncated to the declared
+        Content-Length still owed)."""
 
     def serialize_end(self) -> bytes:
-        """Finish the body: the chunked terminator, or empty for content-length."""
+        """Finish the body: the chunked terminator (one shared `bytes` object for the
+        whole process), or empty for content-length."""
 
     def serialize_head_and_body(self, head: bytes, body: bytes | None = ..., trailers: HeaderMap | None = ...) -> bytes:
         """One message in one buffer: `head` + the framed `body` (if any) + its end
@@ -265,6 +270,10 @@ class H1Codec:
 
     def take_body(self) -> bytes:
         """Drain the bytes buffered after the head (the body bytes already read)."""
+
+    def take_body_into(self, decoder: H1BodyDecoder) -> None:
+        """`take_body` moved straight into `decoder`, in Rust: the body bytes that came
+        with the head never cross to Python."""
 
     def buffered(self) -> int:
         """Number of bytes currently buffered (unparsed head, or post-head body)."""
@@ -323,10 +332,6 @@ class H1BodyDecoder:
     def buffered(self) -> int:
         """Bytes buffered past the body, without moving them (hyper's
         `!read_buf().is_empty()`, `require_empty_read`)."""
-
-    def take_buffered(self) -> bytes:
-        """Bytes buffered past the completed body (the start of the next pipelined
-        request) — carried into the next codec / used to reject stray bytes."""
 
 # ===========================================================================
 # HTTP/2 frame events  (src/py/h2/codec.rs — produced by `H2Codec.receive`)
@@ -1016,8 +1021,10 @@ class H2Streams:
 
     # ----- the write pump -----
     def stop_pump(self) -> None: ...
-    def take_pending(self) -> tuple[bytes, bool]:
-        """`(bytes, stopping)`: everything committed to the pending buffer."""
+    def take_pending(self) -> tuple[memoryview, bool]:
+        """`(batch, stopping)`: everything committed to the pending buffer, as a read-only
+        memoryview over the buffer itself (no copy). Release it once written: the buffer
+        then returns to the state for the next batch."""
 
     def credit_written(self) -> list[object]:
         """Credit the flushed batch back; returns the handles whose senders to wake."""

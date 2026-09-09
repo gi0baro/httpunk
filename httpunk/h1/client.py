@@ -343,7 +343,7 @@ class Connection(H1Framing, H1ClientState):
                 body = H1ResponseBody(self, None, keep_alive=False, upgraded=upgraded)
                 return Response(resp_head.status, resp_head.headers, body, version=_version_of(resp_head))
             decoder = H1BodyDecoder(resp_head.body_kind, resp_head.content_length or 0)
-            decoder.feed(codec.take_body())  # body bytes already read alongside the head
+            codec.take_body_into(decoder)  # body bytes already read alongside the head: moved, in Rust
             # The response's own keep-alive contribution; `release_slot` ANDs it with
             # "the request body was fully sent". A close-delimited body can never be
             # reused (hyper conn.rs L458-489); a request carrying `Connection: close`

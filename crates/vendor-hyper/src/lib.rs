@@ -58,7 +58,7 @@ pub mod proto;
 pub use crate::proto::h1::httpunk::{
     connection_any_close, date_header_value, encode_request, encode_response, error_kind,
     error_parse_kind, error_user_kind, has_h2_prefix, parse_request, parse_response,
-    server_parse_failure, too_large_error, BodyDecode, BodyDecoder, BodyEncoder, ParsedHead,
-    ParsedRequest, CONTINUE_RESPONSE, DEFAULT_MAX_BUFFER_SIZE, H2_PREFACE,
-    MINIMUM_MAX_BUFFER_SIZE,
+    server_parse_failure, too_large_error, BodyDecode, BodyDecoder, BodyEncoder, BodyTail,
+    FramedChunk, ParsedHead, ParsedRequest, CHUNKED_TERMINATOR, CONTINUE_RESPONSE,
+    DEFAULT_MAX_BUFFER_SIZE, H2_PREFACE, MINIMUM_MAX_BUFFER_SIZE,
 };

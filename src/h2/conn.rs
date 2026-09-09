@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyMemoryView};
 use pyo3::{PyTraverseError, PyVisit};
 
 use vendor_h2::frame::{self, Reason, StreamId};
@@ -281,7 +281,8 @@ enum ConnError {
 struct GoAwayInfo {
     last_stream_id: u32,
     reason: u32,
-    debug_data: Bytes,
+    /// The frame's own `bytes`, handed back as-is by `goaway_info` (BOUNDARY_NOTES U5).
+    debug_data: Py<PyBytes>,
 }
 
 struct Inner {
@@ -293,6 +294,11 @@ struct Inner {
     /// The pending-send buffer (h2's single frame queue drained by the connection
     /// task). Every frame goes through it; wire order == commit order.
     pending: BytesMut,
+    /// The write batch that came back from the pump (`H2WriteBatch::drop`): an empty
+    /// buffer with its capacity kept, the next `take_pending` installs it as `pending`.
+    /// Two buffers ping-pong — one on its way to the transport, one receiving frames —
+    /// so a batch is neither copied nor allocated in steady state (BOUNDARY_NOTES V2).
+    spare: Option<BytesMut>,
     /// `close()` asked the write pump to drain and exit.
     stop: bool,
     /// DATA payload bytes queued per stream since the last flush; credited back to
@@ -488,13 +494,17 @@ impl Inner {
     /// nginx-compat rule) and the in-flight body's connection window is returned
     /// (`release_closed_capacity`). Returns the handle to notify when a reset was
     /// sent, the stop its readers must see, and the flags.
-    fn finish_stream(&mut self, sid: u32) -> (Option<Py<PyAny>>, Option<Stopped>, u8) {
+    fn finish_stream(
+        &mut self,
+        py: Python<'_>,
+        sid: u32,
+    ) -> (Option<Py<PyAny>>, Option<Stopped>, u8) {
         let flags = self.close_stream(sid);
         if self.role == Role::Server {
             match self.streams.get(&sid) {
                 Some(e) if !e.state.is_closed() => {
                     let (handle, stop, more) =
-                        self.reset_stream(sid, u32::from(Reason::NO_ERROR), Initiator::User);
+                        self.reset_stream(py, sid, u32::from(Reason::NO_ERROR), Initiator::User);
                     return (handle, stop, flags | more);
                 }
                 Some(_) => self.reclaim_stream_accounting(sid),
@@ -622,7 +632,11 @@ impl Inner {
 
     // ----- SETTINGS application (h2 streams.rs apply_*_settings) -----
 
-    fn apply_remote_settings(&mut self, f: &SettingsFrame) -> PyResult<(Vec<Py<PyAny>>, u8)> {
+    fn apply_remote_settings(
+        &mut self,
+        py: Python<'_>,
+        f: &SettingsFrame,
+    ) -> PyResult<(Vec<Py<PyAny>>, u8)> {
         let mut flags = 0;
         if let Some(v) = f.header_table_size {
             self.peer.header_table_size = v;
@@ -655,7 +669,7 @@ impl Inner {
                 if new >= old {
                     e.send_flow.inc_window(new - old).map_err(map_reason)?;
                     e.send_flow.assign_capacity(new - old).map_err(map_reason)?;
-                    wake.push(e.handle.clone_ref_unchecked());
+                    wake.push(e.handle.clone_ref(py));
                 } else {
                     e.send_flow.dec_send_window(old - new).map_err(map_reason)?;
                     e.send_flow.claim_capacity(old - new).map_err(map_reason)?;
@@ -728,6 +742,7 @@ impl Inner {
     /// reader-facing error (`None` = clean EOF).
     fn reset_stream(
         &mut self,
+        py: Python<'_>,
         sid: u32,
         reason: u32,
         initiator: Initiator,
@@ -735,7 +750,7 @@ impl Inner {
         let Some(e) = self.streams.get_mut(&sid) else {
             return (None, None, 0);
         };
-        let handle = e.handle.clone_ref_unchecked();
+        let handle = e.handle.clone_ref(py);
         if e.state.is_closed() {
             // Already Closed (F18: e.g. a bad content-length on a final HEADERS). h2
             // send.rs `send_reset`: "transition the state to reset no matter what" —
@@ -771,6 +786,7 @@ impl Inner {
     /// GOAWAY reason when one dropped it. `None` for a closed (already EOF'd) entry.
     fn abort_stream(
         &mut self,
+        py: Python<'_>,
         sid: u32,
         reason: Option<u32>,
     ) -> (Option<(Py<PyAny>, Stopped)>, u8) {
@@ -789,7 +805,7 @@ impl Inner {
         let out = if was_closed {
             None
         } else {
-            Some((e.handle.clone_ref_unchecked(), e.stopped()))
+            Some((e.handle.clone_ref(py), e.stopped()))
         };
         // Drop it regardless of the recv ledger: the connection is gone.
         e.recv_unreleased = 0;
@@ -804,12 +820,12 @@ impl Inner {
 
     /// h2 streams.rs `Streams::handle_error` (L362) / `recv_eof` (L386): fan the
     /// connection failure out to every stream.
-    fn fail_all(&mut self) -> Vec<(Py<PyAny>, Stopped)> {
+    fn fail_all(&mut self, py: Python<'_>) -> Vec<(Py<PyAny>, Stopped)> {
         let ids: Vec<u32> = self.streams.keys().copied().collect();
         let mut out = Vec::new();
         for sid in ids {
             // The error slot is set, so no GOAWAY reply can fire here: flags are moot.
-            if let (Some(x), _) = self.abort_stream(sid, None) {
+            if let (Some(x), _) = self.abort_stream(py, sid, None) {
                 out.push(x);
             }
         }
@@ -837,21 +853,6 @@ impl Inner {
             return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
         }
         Ok(())
-    }
-}
-
-/// `Py<T>::clone_ref` without a `Python` token: an incref is a single atomic
-/// operation on the free-threaded build (and GIL-protected otherwise), never a
-/// call into Python — safe under the guard (rule 3 forbids *drops*, not increfs).
-trait CloneRefUnchecked {
-    fn clone_ref_unchecked(&self) -> Self;
-}
-
-impl CloneRefUnchecked for Py<PyAny> {
-    fn clone_ref_unchecked(&self) -> Self {
-        // SAFETY: every `H2Streams` method runs attached to the interpreter (it is a
-        // `#[pymethods]` entry point), so a `Python` token exists for this thread.
-        Python::attach(|py| self.clone_ref(py))
     }
 }
 
@@ -957,6 +958,7 @@ impl H2Streams {
                 role,
                 encoder: Encoder::new(),
                 pending: BytesMut::new(),
+                spare: None,
                 stop: false,
                 credit: Vec::new(),
                 inflight_credit: Vec::new(),
@@ -1104,6 +1106,7 @@ impl H2Streams {
     #[pyo3(signature = (frame, spare=None))]
     fn recv_headers(
         &self,
+        py: Python<'_>,
         frame: &Headers,
         spare: Option<Py<PyAny>>,
     ) -> PyResult<RecvHeadersVerdict> {
@@ -1174,7 +1177,7 @@ impl H2Streams {
                         e.state
                             .recv_open(frame.end_stream, false)
                             .map_err(|err| map_proto_err(&err))?;
-                        let handle = e.handle.clone_ref_unchecked();
+                        let handle = e.handle.clone_ref(py);
                         me.streams.insert(sid, e);
                         me.num_active += 1;
                         // Processed (h2 recv.rs L167 `last_processed_id`): only accepted
@@ -1195,7 +1198,7 @@ impl H2Streams {
             };
         };
         let e = me.streams.get_mut(&target).expect("resolved");
-        let handle = e.handle.clone_ref_unchecked();
+        let handle = e.handle.clone_ref(py);
         if e.state.is_recv_headers() {
             // A response head (or an interim 1xx); recv_open fully applies END_STREAM.
             let informational = frame.is_informational;
@@ -1297,7 +1300,7 @@ impl H2Streams {
             return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
         }
         e.recv_unreleased += sz;
-        let handle = e.handle.clone_ref_unchecked();
+        let handle = e.handle.clone_ref(py);
         // The app only ever sees the payload and can release only that much:
         // auto-release the padding overhead now (h2 recv.rs L740-750).
         if frame.padding > 0 {
@@ -1335,7 +1338,7 @@ impl H2Streams {
 
     /// h2 streams.rs `recv_window_update` (L376) -> send.rs. Returns the handles
     /// whose senders must be woken (`window_evt`).
-    fn recv_window_update(&self, frame: &WindowUpdate) -> PyResult<Vec<Py<PyAny>>> {
+    fn recv_window_update(&self, py: Python<'_>, frame: &WindowUpdate) -> PyResult<Vec<Py<PyAny>>> {
         let mut me = self.lock();
         if frame.stream_id == 0 {
             // h2 prioritize.rs `recv_connection_window_update`: `inc_window` then
@@ -1348,7 +1351,7 @@ impl H2Streams {
                 .streams
                 .values()
                 .filter(|e| !e.finished)
-                .map(|e| e.handle.clone_ref_unchecked())
+                .map(|e| e.handle.clone_ref(py))
                 .collect());
         }
         let sid = frame.stream_id;
@@ -1368,14 +1371,18 @@ impl H2Streams {
         {
             return Err(stream_err(sid, Reason::FLOW_CONTROL_ERROR));
         }
-        Ok(vec![e.handle.clone_ref_unchecked()])
+        Ok(vec![e.handle.clone_ref(py)])
     }
 
     /// h2 streams.rs `recv_reset` (L355). Returns `(handle, stop, notify_body, flags)`
     /// for a live stream: the driver publishes `stop` on the handle, then sets
     /// `reset_evt` + `window_evt`, and — only when the body had not ended
     /// (`notify_body`) — wakes the head waiter and ends the body queue with `stop`.
-    fn recv_reset(&self, frame: &RstStream) -> PyResult<Option<(Py<PyAny>, Stopped, bool, u8)>> {
+    fn recv_reset(
+        &self,
+        py: Python<'_>,
+        frame: &RstStream,
+    ) -> PyResult<Option<(Py<PyAny>, Stopped, bool, u8)>> {
         let mut me = self.lock();
         let before = me.pending.len();
         let sid = frame.stream_id;
@@ -1415,7 +1422,7 @@ impl H2Streams {
         // The reason now lives in the state: the SEND side observes every reset,
         // post-END_STREAM included (`ensure_reason`); the reader only if the message
         // had not stood (`ensure_recv_open`).
-        let handle = e.handle.clone_ref_unchecked();
+        let handle = e.handle.clone_ref(py);
         let stop = e.stopped();
         // Reclaim the connection window consumed by this stream's unread data (h2
         // recv.rs `release_closed_capacity` on `transition_after`).
@@ -1429,7 +1436,11 @@ impl H2Streams {
     /// Returns `(initial, wake_windows, flags)`: `initial` = the peer's first
     /// SETTINGS landed (the client is now ready); `wake_windows` = handles whose
     /// send window grew.
-    fn recv_settings(&self, frame: &SettingsFrame) -> PyResult<(bool, Vec<Py<PyAny>>, u8)> {
+    fn recv_settings(
+        &self,
+        py: Python<'_>,
+        frame: &SettingsFrame,
+    ) -> PyResult<(bool, Vec<Py<PyAny>>, u8)> {
         let mut me = self.lock();
         let before = me.pending.len();
         if frame.ack {
@@ -1441,7 +1452,7 @@ impl H2Streams {
         // ACK first, then apply (h2 `poll_send` orders the ACK before the application).
         codec::encode_settings_ack(&mut me.pending);
         let initial = me.settings.recv_remote();
-        let (wake, flags) = me.apply_remote_settings(frame)?;
+        let (wake, flags) = me.apply_remote_settings(py, frame)?;
         let flags = flags | me.wake_flag(before);
         Ok((initial, wake, flags))
     }
@@ -1454,9 +1465,9 @@ impl H2Streams {
     fn recv_ping(&self, py: Python<'_>, frame: &Ping) -> PyResult<u8> {
         let mut me = self.lock();
         let before = me.pending.len();
-        let data = frame.data.bind(py).as_bytes().to_vec();
+        let data = frame.data.bind(py).as_bytes(); // borrowed: the PONG copies it into `pending`
         if !frame.ack {
-            codec::encode_ping(&mut me.pending, &data, true)?;
+            codec::encode_ping(&mut me.pending, data, true)?;
             return Ok(me.wake_flag(before));
         }
         if me.role != Role::Server || data != SHUTDOWN_PING || !me.graceful || me.shutdown_final {
@@ -1497,14 +1508,14 @@ impl H2Streams {
         me.goaway = Some(GoAwayInfo {
             last_stream_id: last,
             reason: frame.error_code,
-            debug_data: Bytes::copy_from_slice(frame.debug_data.bind(py).as_bytes()),
+            debug_data: frame.debug_data.clone_ref(py),
         });
         let mut aborted = Vec::new();
         let mut flags = 0;
         if me.role == Role::Client {
             let ids: Vec<u32> = me.streams.keys().copied().filter(|id| *id > last).collect();
             for sid in ids {
-                let (x, f) = me.abort_stream(sid, Some(frame.error_code));
+                let (x, f) = me.abort_stream(py, sid, Some(frame.error_code));
                 flags |= f;
                 if let Some(x) = x {
                     aborted.push(x);
@@ -1537,7 +1548,12 @@ impl H2Streams {
     /// it out to every stream. Returns the `(handle, stop)` pairs to notify; the
     /// caller then wakes the role waiters (FLAG_CONN_DONE semantics).
     #[pyo3(signature = (exc=None, message="connection closed"))]
-    fn fail(&self, exc: Option<Py<PyAny>>, message: &str) -> Vec<(Py<PyAny>, Stopped)> {
+    fn fail(
+        &self,
+        py: Python<'_>,
+        exc: Option<Py<PyAny>>,
+        message: &str,
+    ) -> Vec<(Py<PyAny>, Stopped)> {
         let mut me = self.lock();
         let unused = if me.error.is_none() {
             me.error = Some(match exc {
@@ -1548,7 +1564,7 @@ impl H2Streams {
         } else {
             exc // not stored: dropped below, outside the guard
         };
-        let out = me.fail_all();
+        let out = me.fail_all(py);
         drop(me);
         drop(unused);
         out
@@ -1576,13 +1592,9 @@ impl H2Streams {
     /// The peer's GOAWAY as `(last_stream_id, error_code, debug_data)`, if any.
     fn goaway_info(&self, py: Python<'_>) -> Option<(u32, u32, Py<PyBytes>)> {
         let me = self.lock();
-        me.goaway.as_ref().map(|g| {
-            (
-                g.last_stream_id,
-                g.reason,
-                PyBytes::new(py, &g.debug_data).unbind(),
-            )
-        })
+        me.goaway
+            .as_ref()
+            .map(|g| (g.last_stream_id, g.reason, g.debug_data.clone_ref(py)))
     }
 
     /// The connection can serve no more requests: failed, or the peer sent GOAWAY.
@@ -1699,6 +1711,7 @@ impl H2Streams {
     /// as an empty DATA frame (h2 prioritize.rs L202-213).
     fn send_data(
         &self,
+        py: Python<'_>,
         sid: u32,
         data: &[u8],
         offset: usize,
@@ -1707,15 +1720,18 @@ impl H2Streams {
         let mut me = self.lock();
         let before = me.pending.len();
         let Some(e) = me.streams.get(&sid) else {
-            return Ok(stopped_send(Stopped {
-                reason: None,
-                conn: false,
-            }));
+            return Ok(stopped_send(
+                py,
+                Stopped {
+                    reason: None,
+                    conn: false,
+                },
+            ));
         };
         // h2 `send_data` first checks `is_send_streaming()` and errors if not: never
         // frame on a stream the peer reset.
         if !e.state.is_send_streaming() {
-            return Ok(stopped_send(e.stopped()));
+            return Ok(stopped_send(py, e.stopped()));
         }
         if data.is_empty() {
             let mut pending = std::mem::take(&mut me.pending);
@@ -1725,12 +1741,12 @@ impl H2Streams {
             let tail = if end_stream {
                 // h2 `send_data`: the END_STREAM frame closes the send half in the same step.
                 me.streams.get_mut(&sid).expect("live").state.send_close();
-                me.finish_stream(sid)
+                me.finish_stream(py, sid)
             } else {
                 (None, None, 0)
             };
             let flags = me.wake_flag(before);
-            return Ok(completed_send(0, flags, tail));
+            return Ok(completed_send(py, 0, flags, tail));
         }
         let budget = me.send_budget(e);
         if budget == 0 {
@@ -1764,9 +1780,9 @@ impl H2Streams {
             // h2 `send_data`: the END_STREAM frame closes the send half in the same step
             // (`is_send_streaming` held above, under this same lock: no reset in between).
             me.streams.get_mut(&sid).expect("live").state.send_close();
-            let tail = me.finish_stream(sid);
+            let tail = me.finish_stream(py, sid);
             let flags = me.wake_flag(before);
-            return Ok(completed_send(n, flags, tail));
+            return Ok(completed_send(py, n, flags, tail));
         }
         Ok(SendVerdict {
             sent: n,
@@ -1780,26 +1796,29 @@ impl H2Streams {
 
     /// A trailing HEADERS frame (END_STREAM) after the body (h2 `send_trailers`): the
     /// send half closes in this same step, as h2's does.
-    fn send_trailers(&self, sid: u32, trailers: &HeaderMap) -> SendVerdict {
+    fn send_trailers(&self, py: Python<'_>, sid: u32, trailers: &HeaderMap) -> SendVerdict {
         let hframe = codec::build_trailers(sid, trailers.snapshot());
         let mut me = self.lock();
         let before = me.pending.len();
         let Some(e) = me.streams.get_mut(&sid) else {
-            return stopped_send(Stopped {
-                reason: None,
-                conn: false,
-            });
+            return stopped_send(
+                py,
+                Stopped {
+                    reason: None,
+                    conn: false,
+                },
+            );
         };
         if !e.state.is_send_streaming() {
-            return stopped_send(e.stopped());
+            return stopped_send(py, e.stopped());
         }
         e.state.send_close();
         let mut pending = std::mem::take(&mut me.pending);
         me.encoder.encode_headers(hframe, &mut pending);
         me.pending = pending;
-        let tail = me.finish_stream(sid);
+        let tail = me.finish_stream(py, sid);
         let flags = me.wake_flag(before);
-        completed_send(0, flags, tail)
+        completed_send(py, 0, flags, tail)
     }
 
     /// Server: send the response HEADERS (h2 server.rs `SendResponse::send_response`;
@@ -1810,6 +1829,7 @@ impl H2Streams {
     #[pyo3(signature = (sid, status, headers, end_stream))]
     fn send_response_head(
         &self,
+        py: Python<'_>,
         sid: u32,
         status: u16,
         headers: Option<&HeaderMap>,
@@ -1826,13 +1846,16 @@ impl H2Streams {
         // the stop the pump published on the handle decides (a post-END_STREAM reset,
         // hyper's `poll_reset` window) — else the caller reports "already closed".
         let Some(e) = me.streams.get_mut(&sid) else {
-            return Ok(stopped_send(Stopped {
-                reason: None,
-                conn: false,
-            }));
+            return Ok(stopped_send(
+                py,
+                Stopped {
+                    reason: None,
+                    conn: false,
+                },
+            ));
         };
         if e.state.is_closed() {
-            return Ok(stopped_send(e.stopped()));
+            return Ok(stopped_send(py, e.stopped()));
         }
         let hframe = codec::build_response_headers(sid, status, fields, end_stream, auto_date)?;
         e.state.send_open(end_stream).map_err(map_user_err)?;
@@ -1842,37 +1865,42 @@ impl H2Streams {
         // A bodiless response: HEADERS closed the send half — the response is complete
         // in this step (the request's recv half goes with it, `finish_stream`).
         let tail = if end_stream {
-            me.finish_stream(sid)
+            me.finish_stream(py, sid)
         } else {
             (None, None, 0)
         };
         let flags = me.wake_flag(before);
-        Ok(completed_send(0, flags, tail))
+        Ok(completed_send(py, 0, flags, tail))
     }
 
     /// Abort a stream: RST_STREAM(reason) + full teardown (h2 `send_reset`).
     /// `initiator`: "user" (a caller cancel) | "library" (a reset we force after a
     /// peer violation). Returns the handle to notify (`None`: no live stream).
     #[pyo3(signature = (sid, reason, initiator="user"))]
-    fn reset_stream(&self, sid: u32, reason: u32, initiator: &str) -> PyResult<ResetVerdict> {
+    fn reset_stream(
+        &self,
+        py: Python<'_>,
+        sid: u32,
+        reason: u32,
+        initiator: &str,
+    ) -> PyResult<ResetVerdict> {
         let initiator = parse_initiator(initiator)?;
         let mut me = self.lock();
         let before = me.pending.len();
-        let (handle, stop, flags) = me.reset_stream(sid, reason, initiator);
+        let (handle, stop, flags) = me.reset_stream(py, sid, reason, initiator);
         let flags = flags | me.wake_flag(before);
         Ok(ResetVerdict {
             handle,
-            stop: None,
+            stop: stop.map(|s| stop_py(py, s)),
             flags,
-        }
-        .with_stop_py(stop))
+        })
     }
 
     /// Reset a stream after a stream-level protocol violation by the peer, counting
     /// toward the ENHANCE_YOUR_CALM cap (h2 `max_local_error_reset_streams`, the
     /// Rapid-Reset / malformed-flood defence; F17). A stream we've already forgotten
     /// enters the reset store and draws one RST_STREAM.
-    fn reset_on_error(&self, sid: u32, reason: u32) -> PyResult<ResetVerdict> {
+    fn reset_on_error(&self, py: Python<'_>, sid: u32, reason: u32) -> PyResult<ResetVerdict> {
         let mut me = self.lock();
         let before = me.pending.len();
         me.local_error_resets += 1;
@@ -1885,14 +1913,13 @@ impl H2Streams {
             ));
         }
         if me.streams.contains_key(&sid) {
-            let (handle, stop, flags) = me.reset_stream(sid, reason, Initiator::Library);
+            let (handle, stop, flags) = me.reset_stream(py, sid, reason, Initiator::Library);
             let flags = flags | me.wake_flag(before);
             return Ok(ResetVerdict {
                 handle,
-                stop: None,
+                stop: stop.map(|s| stop_py(py, s)),
                 flags,
-            }
-            .with_stop_py(stop));
+            });
         }
         me.clear_expired_reset_streams();
         if me.reset_streams.len() < RESET_STREAM_MAX {
@@ -1911,7 +1938,7 @@ impl H2Streams {
     /// Drop-reset on `!eos`) but still releases every buffered-but-unread byte's
     /// connection window (`release_closed_capacity`, streams.rs L1670-1676); an
     /// unfinished one is cancelled (RST_STREAM(CANCEL)).
-    fn aclose_body(&self, sid: u32) -> ResetVerdict {
+    fn aclose_body(&self, py: Python<'_>, sid: u32) -> ResetVerdict {
         let mut me = self.lock();
         let before = me.pending.len();
         let Some(e) = me.streams.get(&sid) else {
@@ -1931,14 +1958,13 @@ impl H2Streams {
             };
         }
         let (handle, stop, flags) =
-            me.reset_stream(sid, u32::from(Reason::CANCEL), Initiator::User);
+            me.reset_stream(py, sid, u32::from(Reason::CANCEL), Initiator::User);
         let flags = flags | me.wake_flag(before);
         ResetVerdict {
             handle,
-            stop: None,
+            stop: stop.map(|s| stop_py(py, s)),
             flags,
         }
-        .with_stop_py(stop)
     }
 
     // ===== recv-side flow control (h2 recv.rs release_capacity) =====
@@ -1988,19 +2014,34 @@ impl H2Streams {
 
     /// Swap out everything committed to the pending-send buffer as `(bytes,
     /// stopping)`. The per-stream credit batch moves to `credit_written`'s.
-    fn take_pending(&self, py: Python<'_>) -> (Py<PyBytes>, bool) {
-        let mut me = self.lock();
-        let data = PyBytes::new(py, &me.pending).unbind();
-        me.pending.clear();
-        let batch = std::mem::take(&mut me.credit);
-        me.inflight_credit.extend(batch);
-        (data, me.stop)
+    fn take_pending<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyMemoryView>, bool)> {
+        let this = slf.get();
+        let mut me = this.lock();
+        // The batch leaves the state whole — buffer, capacity and all — and the spare
+        // (or a fresh buffer) takes its place for the frames queued from now on.
+        let next = me.spare.take().unwrap_or_default();
+        let batch = std::mem::replace(&mut me.pending, next);
+        let credit = std::mem::take(&mut me.credit);
+        me.inflight_credit.extend(credit);
+        let stop = me.stop;
+        drop(me);
+        let holder = Py::new(
+            py,
+            H2WriteBatch {
+                buf: batch,
+                owner: slf.clone().unbind(),
+            },
+        )?;
+        Ok((PyMemoryView::from(holder.bind(py).as_any())?, stop))
     }
 
     /// The batch is on the wire (or the connection is dead): credit each stream's
     /// `send_buffered` back and return the handles whose senders must be woken —
     /// one handle per stream, however many of its frames the batch carried.
-    fn credit_written(&self) -> Vec<Py<PyAny>> {
+    fn credit_written(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
         let mut me = self.lock();
         let batch = std::mem::take(&mut me.inflight_credit);
         let mut wake = Vec::new();
@@ -2009,7 +2050,7 @@ impl H2Streams {
             if let Some(e) = me.streams.get_mut(&sid) {
                 e.send_buffered = e.send_buffered.saturating_sub(n);
                 if woken.insert(sid) {
-                    wake.push(e.handle.clone_ref_unchecked());
+                    wake.push(e.handle.clone_ref(py));
                 }
             }
         }
@@ -2245,11 +2286,75 @@ fn ignored(sid: u32) -> RecvHeadersVerdict {
     }
 }
 
-fn stopped_send(stop: Stopped) -> SendVerdict {
+/// One write batch on its way to the transport: the state's `pending` buffer,
+/// moved out whole by `take_pending` and exported to Python read-only through the
+/// buffer protocol (the pump gets a `memoryview` over it, which both transports
+/// take as-is). Nothing is copied. The holder owns the memory, so a view can never
+/// dangle; when the last view is released and the holder is dropped, the buffer —
+/// cleared, capacity kept — goes back to the state as its `spare`.
+///
+/// `Drop` takes the state lock. It runs when the last reference dies, which is a
+/// Python-side release on the pump's thread, never inside a state method: Rust holds
+/// no reference to a batch, and the shared-state rule forbids dropping Python
+/// objects under the lock — the same discipline that keeps this from self-deadlocking.
+#[pyclass(module = "httpunk._httpunk", name = "H2WriteBatch", frozen)]
+struct H2WriteBatch {
+    buf: BytesMut,
+    owner: Py<H2Streams>,
+}
+
+#[pymethods]
+impl H2WriteBatch {
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        let buf = &slf.get().buf;
+        // SAFETY: `view` is the buffer request CPython hands to the slot; the pointer
+        // and length describe `buf`'s storage, which is never modified or reallocated
+        // while the holder exists (no method touches `buf` after construction, and
+        // `Drop` runs only once every export was released). `readonly = 1`: a request
+        // for a writable buffer is refused by `PyBuffer_FillInfo` itself.
+        let ret = unsafe {
+            pyo3::ffi::PyBuffer_FillInfo(
+                view,
+                slf.as_ptr(),
+                buf.as_ptr().cast_mut().cast(),
+                pyo3::ffi::Py_ssize_t::try_from(buf.len()).expect("batch length fits Py_ssize_t"),
+                1,
+                flags,
+            )
+        };
+        if ret == -1 {
+            return Err(PyErr::fetch(slf.py()));
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
+
+    fn __len__(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl Drop for H2WriteBatch {
+    fn drop(&mut self) {
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.clear();
+        let mut me = self.owner.get().lock();
+        if me.spare.is_none() {
+            me.spare = Some(buf);
+        }
+    }
+}
+
+fn stopped_send(py: Python<'_>, stop: Stopped) -> SendVerdict {
     SendVerdict {
         sent: 0,
         done: false,
-        stopped: Some(stop.into_py_unchecked()),
+        stopped: Some(stop_py(py, stop)),
         flags: 0,
         handle: None,
         reader_stop: None,
@@ -2259,6 +2364,7 @@ fn stopped_send(stop: Stopped) -> SendVerdict {
 /// The verdict of a completed send step: `flags`, plus the server's end-of-response
 /// notification when the request's recv half was reset (`finish_stream`).
 fn completed_send(
+    py: Python<'_>,
     sent: usize,
     flags: u8,
     tail: (Option<Py<PyAny>>, Option<Stopped>, u8),
@@ -2270,19 +2376,10 @@ fn completed_send(
         stopped: None,
         flags: flags | tail_flags,
         handle,
-        reader_stop: stop.map(Stopped::into_py_unchecked),
+        reader_stop: stop.map(|s| stop_py(py, s)),
     }
 }
 
-impl Stopped {
-    fn into_py_unchecked(self) -> Py<Stopped> {
-        Python::attach(|py| Py::new(py, self).expect("alloc"))
-    }
-}
-
-impl ResetVerdict {
-    fn with_stop_py(mut self, stop: Option<Stopped>) -> Self {
-        self.stop = stop.map(Stopped::into_py_unchecked);
-        self
-    }
+fn stop_py(py: Python<'_>, stop: Stopped) -> Py<Stopped> {
+    Py::new(py, stop).expect("alloc")
 }

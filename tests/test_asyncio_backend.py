@@ -336,3 +336,38 @@ async def test_backend_bounded_reader_and_timed_event_wait():
     evt.set()
     await evt.wait(0.01)
     assert evt.is_set()
+
+
+@pytest.mark.asyncio
+async def test_received_objects_are_handed_through_without_copying():
+    # BOUNDARY_NOTES S2: a read that covers a whole received object gets that object.
+    s = _AsyncioStream()
+    first, second = b"first-segment", b"second"
+    s.data_received(first)
+    s.data_received(second)
+    assert await s.receive_some() is first
+    assert s.read_nowait() is second
+    assert s.read_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_partial_reads_walk_one_object_then_the_next():
+    s = _AsyncioStream()
+    s.data_received(b"abcdef")
+    s.data_received(b"gh")
+    assert await s.receive_some(2) == b"ab"
+    assert await s.receive_some(3) == b"cde"
+    assert await s.receive_some(10) == b"f"  # the rest of the first object, never merged with the next
+    assert await s.receive_some(10) == b"gh"
+    assert s.read_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_backpressure_counts_unread_bytes_across_objects():
+    s = _AsyncioStream()
+    s.connection_made(_FakeTransport())
+    for _ in range(4):
+        s.data_received(b"x" * (2**14))  # four objects reach the 64 KiB watermark together
+    assert s._transport.reading_paused
+    await s.receive_some(2**14)  # one object out: 48 KiB left, below the mark
+    assert not s._transport.reading_paused

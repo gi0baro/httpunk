@@ -197,3 +197,184 @@ def test_head_terminated_by_bare_lf_then_crlf_parses():
     codec.serialize_request("GET", "http://h/", HeaderMap([("host", "h")]))
     head = codec.receive_head(b"HTTP/1.1 204 No Content\r\na: b\n\r\n")
     assert head is not None and head.status == 204 and head.headers["a"] == b"b"
+
+
+# ----- body framing crosses the boundary without copying (BOUNDARY_NOTES.md §2.2) -----
+
+
+def test_serialize_data_content_length_returns_the_callers_object():
+    # hyper `BufKind::Exact`: the chunk within the declared length is the frame itself.
+    codec = H1Codec()
+    codec.serialize_request("POST", "/", HeaderMap([("host", "h")]), content_length=10)
+    first, second = b"hello", b"world"
+    assert codec.serialize_data(first) is first
+    assert codec.serialize_data(second) is second
+    assert codec.serialize_end() == b""
+
+
+def test_serialize_data_over_long_chunk_is_truncated_to_the_declared_length():
+    # hyper `BufKind::Limited`: a chunk past the declared Content-Length is cut, not sent.
+    codec = H1Codec()
+    codec.serialize_request("POST", "/", HeaderMap([("host", "h")]), content_length=3)
+    chunk = b"hello"
+    out = codec.serialize_data(chunk)
+    assert out == b"hel"
+    assert out is not chunk
+    assert codec.serialize_data(b"more") == b""  # nothing left to send
+    assert codec.serialize_end() == b""
+
+
+def test_serialize_data_close_delimited_returns_the_callers_object():
+    # An HTTP/1.0 response with no length: close-delimited, the body goes out as is.
+    codec = H1Codec()
+    codec.receive_request_head(b"GET / HTTP/1.0\r\n\r\n")
+    # An unknown-length body to a 1.0 peer cannot be chunked: hyper makes it
+    # close-delimited (role.rs `Server::encode`, `set_length`).
+    codec.serialize_response(200, keep_alive=False, http10=True, chunked=True)
+    assert codec.response_close_delimited
+    chunk = b"raw body"
+    assert codec.serialize_data(chunk) is chunk
+    assert codec.serialize_end() == b""
+
+
+def test_serialize_data_chunked_is_a_new_exact_object_and_empty_chunks_pass_through():
+    codec = H1Codec()
+    codec.serialize_request("POST", "/", HeaderMap([("host", "h")]), chunked=True)
+    chunk = b"abc"
+    out = codec.serialize_data(chunk)
+    assert out == b"3\r\nabc\r\n" and out is not chunk
+    empty = b""
+    assert codec.serialize_data(empty) is empty  # hyper never encodes an empty chunk
+    assert codec.serialize_end() == b"0\r\n\r\n"
+
+
+def test_serialize_end_hands_out_one_shared_terminator():
+    ends = []
+    for _ in range(2):
+        codec = H1Codec()
+        codec.serialize_request("POST", "/", HeaderMap([("host", "h")]), chunked=True)
+        codec.serialize_data(b"x")
+        ends.append(codec.serialize_end())
+    assert ends[0] == b"0\r\n\r\n"
+    assert ends[0] is ends[1]
+
+
+def test_serialize_trailers_block_and_fallback():
+    codec = H1Codec()
+    codec.serialize_request("POST", "/", HeaderMap([("host", "h"), ("trailer", "x-t")]), chunked=True)
+    codec.serialize_data(b"ab")
+    out = codec.serialize_trailers(HeaderMap([("x-t", "1"), ("x-dropped", "2")]))
+    assert out == b"0\r\nx-t: 1\r\n\r\n"  # only the declared field survives (hyper `encode_trailers`)
+    # No declared trailer: the bare terminator, the shared object.
+    codec = H1Codec()
+    codec.serialize_request("POST", "/", HeaderMap([("host", "h")]), chunked=True)
+    codec.serialize_data(b"ab")
+    assert codec.serialize_trailers(HeaderMap([("x-t", "1")])) is _shared_chunked_end()
+
+
+def _shared_chunked_end():
+    codec = H1Codec()
+    codec.serialize_request("POST", "/", HeaderMap([("host", "h")]), chunked=True)
+    codec.serialize_data(b"x")
+    return codec.serialize_end()
+
+
+def test_serialize_head_and_body_is_the_pieces_in_one_object():
+    for framing, body, expect_body in (
+        ({"content_length": 5}, b"hello", b"hello"),
+        ({"chunked": True}, b"hello", b"5\r\nhello\r\n0\r\n\r\n"),
+        ({"content_length": 3}, b"hello", b"hel"),  # truncated, as `serialize_data` would
+        ({}, b"", b""),  # no framing: the head alone
+    ):
+        codec = H1Codec()
+        codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
+        head = codec.serialize_response(200, **framing)
+        out = codec.serialize_head_and_body(head, body)
+        assert out == head + expect_body, framing
+    # Trailers ride the coalesced write when the request allowed them.
+    codec = H1Codec()
+    codec.receive_request_head(b"GET / HTTP/1.1\r\nte: trailers\r\n\r\n")
+    head = codec.serialize_response(200, HeaderMap([("trailer", "x-t")]), chunked=True)
+    out = codec.serialize_head_and_body(head, b"hi", HeaderMap([("x-t", "1")]))
+    assert out == head + b"2\r\nhi\r\n0\r\nx-t: 1\r\n\r\n"
+
+
+def test_head_buffer_is_reused_across_messages():
+    # hyper keeps one `WriteBuf.headers`; each head is still its own `bytes` object.
+    codec = H1Codec()
+    codec.receive_request_head(b"GET /a HTTP/1.1\r\n\r\n")
+    h1 = codec.serialize_response(200, content_length=0)
+    codec.receive_request_head(b"GET /b HTTP/1.1\r\n\r\n")
+    h2 = codec.serialize_response(404, content_length=0)
+    assert h1.startswith(b"HTTP/1.1 200 OK\r\n") and h2.startswith(b"HTTP/1.1 404 Not Found\r\n")
+    assert h1 is not h2
+
+
+def test_take_body_into_moves_head_adjacent_body_bytes_and_later_feeds_continue():
+    # The client's shape (BOUNDARY_NOTES S9): body bytes that arrived with the head move
+    # from the codec's read buffer straight into the decoder, then the decoder keeps
+    # taking transport bytes; the body decodes whole and in order.
+    from httpunk._httpunk import H1BodyDecoder
+
+    codec = H1Codec()
+    codec.serialize_request("GET", "/", HeaderMap([("host", "h")]))
+    head = codec.receive_head(b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\nhello, ")
+    assert head is not None and head.body_kind == "length" and head.content_length == 12
+    decoder = H1BodyDecoder(head.body_kind, head.content_length)
+    codec.take_body_into(decoder)
+    assert codec.buffered() == 0
+    assert decoder.decode() == b"hello, "
+    assert decoder.decode() is None and not decoder.is_complete
+    decoder.feed(b"world")
+    assert decoder.decode() == b"world"
+    assert decoder.is_complete
+
+
+def test_take_body_into_with_nothing_buffered_is_a_no_op():
+    from httpunk._httpunk import H1BodyDecoder
+
+    codec = H1Codec()
+    codec.serialize_request("GET", "/", HeaderMap([("host", "h")]))
+    head = codec.receive_head(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\n")
+    decoder = H1BodyDecoder(head.body_kind, head.content_length)
+    codec.take_body_into(decoder)
+    assert decoder.decode() is None and decoder.buffered == 0
+    decoder.feed(b"abc")
+    assert decoder.decode() == b"abc" and decoder.is_complete
+
+
+# ----- head strings are built once and shared where the set is closed (rules 6/7) -----
+
+
+def _request_head(codec, raw):
+    head = codec.receive_request_head(raw)
+    assert head is not None
+    codec.take_body()
+    return head
+
+
+def test_request_head_strings_are_shared_and_built_once():
+    a = _request_head(H1Codec(), b"GET /a?x=1 HTTP/1.1\r\nhost: h\r\n\r\n")
+    b = _request_head(H1Codec(), b"GET /b HTTP/1.1\r\nhost: h\r\ncontent-length: 2\r\n\r\nhi")
+    assert a.method == "GET" and a.method is b.method  # one interned object per standard method
+    assert a.target == "/a?x=1" and a.target is a.target  # built at parse, handed out by reference
+    assert b.target == "/b"
+    assert a.body_kind == "empty" and b.body_kind == "length"
+    assert b.body_kind is _request_head(H1Codec(), b"POST / HTTP/1.1\r\ncontent-length: 1\r\n\r\nx").body_kind
+    ext = _request_head(H1Codec(), b"PURGE /c HTTP/1.1\r\nhost: h\r\n\r\n")
+    assert ext.method == "PURGE"  # an extension method: a plain str
+
+
+def test_request_target_forms_survive_the_parse():
+    assert _request_head(H1Codec(), b"GET http://h/p?q=1 HTTP/1.1\r\nhost: h\r\n\r\n").target == "http://h/p?q=1"
+    assert _request_head(H1Codec(), b"CONNECT h:443 HTTP/1.1\r\nhost: h:443\r\n\r\n").target == "h:443"
+    assert _request_head(H1Codec(), b"OPTIONS * HTTP/1.1\r\nhost: h\r\n\r\n").target == "*"
+
+
+def test_response_head_body_kind_is_shared():
+    heads = []
+    for _ in range(2):
+        codec = H1Codec()
+        codec.serialize_request("GET", "/", HeaderMap([("host", "h")]))
+        heads.append(codec.receive_head(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"))
+    assert heads[0].body_kind == "chunked" and heads[0].body_kind is heads[1].body_kind
