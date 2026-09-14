@@ -145,10 +145,17 @@ class TonioBackend:
         and the plain-socket reader is one coroutine over bound methods resolved here —
         the cost of tonio's own `receive_some`, plus one arm on the (cold) timer path.
 
-        Bytes first, hyper's order (`poll_read_head` polls the timer only after `parse`
-        returned Pending): a wake that finds bytes returns them, whatever the timer did.
+        Bytes first, hyper's order (`poll_read_head`: `parse` -> `poll_read`, and the timer
+        is polled only once that returned Pending): every pass tries the syscall before it
+        looks at the clock, and a wake that finds bytes returns them, whatever the timer did.
 
-        - **Plain socket**: the socket's own arm (`_io_arm_r(timeout)`) puts the readiness
+        - **Plain socket**: the syscall comes first — the readiness bits are stale-set after
+          any successful read (nothing but a failed syscall clears them), exactly as tokio's
+          readiness word is when hyper's `poll_read` runs, so both pay one `EAGAIN` probe
+          per head; only on `EAGAIN` (`clear_r`, as tonio's own `recv`) is the remaining time
+          computed. Past the deadline that is the answer at once: hyper's Pending followed
+          by a ready timer poll (`new_header_timeout`) — no zero-length timer is ever
+          armed. Otherwise the socket's own arm (`_io_arm_r(timeout)`) puts the readiness
           wait and the timer on ONE suspension (a `Waiter` with a timer). Both wakes resume
           with `None`; the readiness word tells them apart: a readiness wake set bits
           before waking (`set_readiness` precedes `wake`), a timer wake set none — so a
@@ -174,18 +181,21 @@ class TonioBackend:
 
         async def read(max_bytes, deadline):
             while True:
-                micros = round((deadline - _now()) * 1_000_000)
-                waiter = arm(0 if micros < 0 else micros)
-                if waiter is not None:
-                    await waiter
-                    if arm() is not None:  # no readiness bits: the timer woke us
-                        return None
                 try:
-                    return recv(max_bytes)  # bytes first, whatever the timer did
+                    return recv(max_bytes)  # bytes first: hyper's `poll_read` before its timer poll
                 except InterruptedError:
                     continue
                 except BlockingIOError:
-                    clear()  # a spurious readiness wake: re-arm for the remaining time
+                    clear()  # EAGAIN: the bits were stale (or a spurious wake) — now the timer
+                micros = round((deadline - _now()) * 1_000_000)
+                if micros <= 0:
+                    return None  # nothing readable and the deadline passed: hyper's timer poll is ready
+                waiter = arm(micros)
+                if waiter is None:
+                    continue  # bits landed between the EAGAIN and the arm: read now
+                await waiter
+                if arm() is not None:  # no readiness bits: the timer woke us
+                    return None
 
         return read
 

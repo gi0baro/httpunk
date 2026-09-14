@@ -215,34 +215,56 @@ async def _bounded(sock, timeout=1.0):
 
 
 @pytest.mark.tonio
-async def test_receive_bounded_readable_at_once_never_parks():
-    sock = _FakeArmSocket(arms=[False], recvs=[b"head"])
+async def test_receive_bounded_readable_at_once_never_arms():
+    # The syscall comes first (hyper `poll_read` before its timer poll): bytes there = done.
+    sock = _FakeArmSocket(arms=[], recvs=[b"head"])
     assert await _bounded(sock) == b"head"
-    assert len(sock.calls) == 1  # bits were set: no wait
+    assert sock.calls == [] and sock.cleared == 0  # no arm, no clock, no clear
 
 
 @pytest.mark.tonio
 async def test_receive_bounded_timer_wake_is_told_by_the_readiness_word():
-    # park -> wake -> the readiness question hands out a waiter: no bits, so the timer fired.
-    sock = _FakeArmSocket(arms=[True, True], recvs=[])
+    # EAGAIN (the probe: stale bits, as tokio's readiness) -> clear -> arm with the remaining
+    # time -> park -> wake -> the readiness question hands out a waiter: no bits, the timer fired.
+    sock = _FakeArmSocket(arms=[True, True], recvs=[BlockingIOError])
     assert await _bounded(sock, 0.5) is None
     assert 499_000 < sock.calls[0] <= 500_000  # the arm carried the timer (micros; the clock ran a little)
     assert sock.calls[1] is None  # the question carries none
-    assert sock.cleared == 0  # no syscall on the timer path
+    assert sock.cleared == 1  # the one probe; no syscall after the timer wake
 
 
 @pytest.mark.tonio
 async def test_receive_bounded_readiness_wake_reads_bytes_first():
-    sock = _FakeArmSocket(arms=[True, False], recvs=[b"head"])
+    # EAGAIN -> clear -> arm -> park -> wake -> readable? yes -> the bytes.
+    sock = _FakeArmSocket(arms=[True, False], recvs=[BlockingIOError, b"head"])
     assert await _bounded(sock) == b"head"
+    assert sock.cleared == 1
+
+
+@pytest.mark.tonio
+async def test_receive_bounded_bits_landing_before_the_arm_read_at_once():
+    # EAGAIN -> clear -> arm finds the bits already set (data landed in between) -> read now.
+    sock = _FakeArmSocket(arms=[False], recvs=[BlockingIOError, b"head"])
+    assert await _bounded(sock) == b"head"
+    assert len(sock.calls) == 1 and sock.cleared == 1
 
 
 @pytest.mark.tonio
 async def test_receive_bounded_spurious_wake_rearms_with_the_remaining_time():
-    # park -> wake -> readable? yes -> EAGAIN (a spurious wake) -> clear -> re-arm, then bytes.
-    sock = _FakeArmSocket(arms=[True, False, True, False], recvs=[BlockingIOError, b"head"])
+    # ... -> park -> wake -> readable? yes -> EAGAIN (a spurious wake) -> clear -> re-arm, then bytes.
+    sock = _FakeArmSocket(arms=[True, False, True, False], recvs=[BlockingIOError, BlockingIOError, b"head"])
     assert await _bounded(sock, 0.5) == b"head"
-    assert sock.cleared == 1
+    assert sock.cleared == 2
     first, again = sock.calls[0], sock.calls[2]
     assert 499_000 < first <= 500_000
     assert 0 < again <= first  # the deadline is absolute: never reset to the full timeout
+
+
+@pytest.mark.tonio
+async def test_receive_bounded_past_deadline_expires_without_arming():
+    # Nothing readable and the deadline already passed (a spurious wake landing after it, a
+    # partial head whose next read starts late): hyper's Pending + a ready timer poll ->
+    # `None` at once. No zero-length timer is ever armed.
+    sock = _FakeArmSocket(arms=[], recvs=[BlockingIOError])
+    assert await _bounded(sock, -0.001) is None
+    assert sock.calls == [] and sock.cleared == 1
