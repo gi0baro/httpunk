@@ -239,6 +239,12 @@ await stream.send_data(b"data: 2\n\n", end_stream=True)
 # stream.send_trailers({...}) ends the body with trailers; stream.send_reset() aborts it
 ```
 
+On HTTP/1, `send_response` arms the mid-message detection described above (the body may
+park between chunks); `detect_eof=False` skips that, so no read is parked for the response
+and a client that closes is noticed one write later, at the peer's RST, instead — unless
+`peer_closed()` asks, which still arms on demand. This is httpunk's own knob (hyper's read is
+always on); HTTP/2 accepts it and ignores it, a reset arrives through the connection anyway.
+
 `end_stream=True` on `send_response` is a bodyless response. Framing follows hyper: a
 `content-length` you set is honoured, otherwise the body is chunked (HTTP/1.1) or
 close-delimited (HTTP/1.0); on HEAD/204/304 body chunks are discarded, as hyper never polls

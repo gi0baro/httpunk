@@ -110,11 +110,17 @@ class ServerRequest:
         cleanup ran — before this raises."""
         return self._conn._send_response(self._stream, status, headers, body, trailers)
 
-    async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
+    async def send_response(
+        self, status: int, *, headers: HeadersInput = None, end_stream: bool = False, detect_eof: bool = True
+    ) -> SendStream:
         """Push-style response: send HEADERS now and return a `SendStream` to write the
         body with (`send_data` / `send_trailers` / `send_reset`). `end_stream=True` ends
         the stream on the HEADERS frame (a bodyless response). h2:
-        `SendResponse::send_response(response, end_of_stream) -> SendStream`."""
+        `SendResponse::send_response(response, end_of_stream) -> SendStream`.
+
+        `detect_eof` is accepted for API symmetry with the HTTP/1 twin and has no effect
+        here: a client abandoning the request is a RST_STREAM the connection's pump
+        delivers regardless (`reset_received`), there is no per-response read to arm."""
         await self._conn._send_response_head(self._stream, status, headers, end_stream=end_stream)
         stream = SendStream(self._conn, self._stream)
         if end_stream:

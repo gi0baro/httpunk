@@ -489,14 +489,15 @@ async def test_server_response_date_header_option():
 @pytest.mark.tonio
 async def test_server_push_response_streams_data_frames():
     """`send_response` + `send_data(..., end_stream=True)`: HEADERS (with Date) then DATA
-    frames, END_STREAM on the last; the connection keeps multiplexing afterwards."""
+    frames, END_STREAM on the last; the connection keeps multiplexing afterwards.
+    `detect_eof` (the h1 twin's knob) is accepted and has no effect here."""
     listener, host, port = await _listener()
 
     async def serve():
         transport = await listener.accept()
         async with H2Server(transport) as server:
             async for req in server:
-                stream = await req.send_response(200, headers={"x-path": req.path})
+                stream = await req.send_response(200, headers={"x-path": req.path}, detect_eof=req.path == "/2")
                 await stream.send_data(b"a" * 10)
                 await stream.send_data(b"b" * 5, end_stream=True)
 

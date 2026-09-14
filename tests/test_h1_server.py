@@ -1990,6 +1990,31 @@ async def test_server_header_read_timeout_bounds_the_watcher_hand_off():
     await conn.close()  # joins the watcher (its read ended by the close)
 
 
+@pytest.mark.tonio
+async def test_server_push_response_detect_eof_off_parks_nothing_until_asked():
+    """`send_response(detect_eof=False)` (httpunk's own knob): the head arms no
+    mid-message watcher — no read parked, no task — and the body still goes out; a
+    later `peer_closed()` arms on demand, exactly as it does before the head. The
+    default keeps today's arm (`test_server_header_read_timeout_bounds_the_watcher_hand_off`)."""
+    stub = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(stub)
+    await conn.start()
+    req = await conn.next_request()
+    stream = await req.send_response(200, headers={"content-length": "4"}, detect_eof=False)
+    assert not conn.has_watcher and not stub.parked.is_set()  # nothing parked by the head
+    await stream.send_data(b"ti")
+    assert not conn.has_watcher and not stub.parked.is_set()  # nor mid-body
+    seen = []
+    async with scope() as s:
+        s.spawn(_watch(req, seen))  # the explicit ask: arms now
+        await stub.parked.wait()
+        assert conn.has_watcher
+        await stream.send_data(b"ck", end_stream=True)  # the exchange completes: `False`
+    assert seen == [False]
+    assert stub.sent.endswith(b"tick")
+    await conn.close()  # joins the watcher (its read ended by the close)
+
+
 @pytest.mark.asyncio
 async def test_immediate_body_coalesces_with_the_head_up_to_the_codecs_buffer_cap():
     """hyper `WriteBuf` Flatten up to `max_buf_size`: an immediate body no larger than the

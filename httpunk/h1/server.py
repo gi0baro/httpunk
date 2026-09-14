@@ -260,7 +260,9 @@ class ServerRequest:
         cancels the producer the same way."""
         await self._conn._send_response(self, status, headers, body, trailers)
 
-    async def send_response(self, status: int, *, headers: HeadersInput = None, end_stream: bool = False) -> SendStream:
+    async def send_response(
+        self, status: int, *, headers: HeadersInput = None, end_stream: bool = False, detect_eof: bool = True
+    ) -> SendStream:
         """Push-style response: send the head now and return a `SendStream` to write
         the body with (`send_data` / `send_trailers` / `send_reset`). `end_stream=True`
         = a bodyless response (hyper: a `Body` that `is_end_stream()` at encode time —
@@ -269,8 +271,18 @@ class ServerRequest:
         `content-length`, which the encoder honours (hyper `set_length`'s
         `existing_con_len`). hyper's h1 has no push API; this is the h1 twin of h2's
         `SendResponse::send_response -> SendStream`, over the same codec calls
-        `respond()` makes, so the wire behaviour is hyper's either way."""
-        return await self._conn._send_response_head(self, status, headers, end_stream=end_stream)
+        `respond()` makes, so the wire behaviour is hyper's either way.
+
+        `detect_eof` (httpunk's own — hyper has no per-response knob, its mid-message read
+        is always on; the connection-level twin is `half_close`): a push body may park
+        between chunks, so by default this head arms the mid-message watcher (hyper
+        `mid_message_detect_eof`) so a client FIN mid-response is seen as it lands. `False`
+        skips that ask: nothing is parked for this response, saving the watcher task and
+        its hand-off at the next head read. A client that closes then is noticed one write
+        later — at the kernel's RST, not at the FIN — unless something asks: `peer_closed()`
+        still arms on demand, exactly as it does before the head. Meant for a caller whose
+        disconnect detection IS that explicit ask (an ASGI `receive()`)."""
+        return await self._conn._send_response_head(self, status, headers, end_stream=end_stream, detect_eof=detect_eof)
 
     def detach(self) -> bytes:
         """Take over the raw connection for a protocol upgrade (WebSocket, or a custom protocol):
@@ -890,15 +902,17 @@ class ServerConnection(H1Framing, H1ServerState):
                 await self._fail_response(req, exc)
         await self._finish_response(req)
 
-    async def _send_response_head(self, req, status, headers, *, end_stream):
+    async def _send_response_head(self, req, status, headers, *, end_stream, detect_eof):
         """The push path (`ServerRequest.send_response`): write the head now, return
         the `SendStream`. `end_stream` maps onto hyper's two encode inputs the same way a
         pull body does: True = no body (`_body_framing(None)`), False = a body of unknown
         length (streamed -> chunked, or length if the headers carry `content-length`).
         The peer-closed check is the claim's (`_claim_response`), which precedes this."""
         content_length, chunked = self._body_framing(None) if end_stream else (None, True)
-        # A push producer may park between chunks: make the FIN observable (`want`).
-        head = await self._respond_head(req, status, headers, content_length, chunked, want=not end_stream)
+        # A push producer may park between chunks: make the FIN observable (`want`) —
+        # unless the caller declined (`detect_eof=False`) or there is no body to park in.
+        want = detect_eof and not end_stream
+        head = await self._respond_head(req, status, headers, content_length, chunked, want=want)
         stream = SendStream(self, req, self._codec)
         if end_stream:
             stream._done = True
