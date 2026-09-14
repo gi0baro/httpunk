@@ -238,9 +238,9 @@ class ServerRequest:
         self._conn.close_window(self._seq)
         self._peer_closed_evt.set()
 
-    async def respond(
+    def respond(
         self, status: int, *, headers: HeadersInput = None, body: Body = None, trailers: HeadersInput = None
-    ) -> None:
+    ) -> Awaitable[None]:
         """Send the whole response: head + body (+ trailers). `body` is None, `bytes`,
         or a (sync/async) iterable of `bytes`. hyper: `Server::encode` + the dispatcher
         polling the response `Body`. The pull convenience over `send_response`: same
@@ -258,11 +258,11 @@ class ServerRequest:
         cancelled at that await (hyper drops the body future) and has unwound — its
         cleanup ran — before this raises. Cancelling the task awaiting `respond()`
         cancels the producer the same way."""
-        await self._conn._send_response(self, status, headers, body, trailers)
+        return self._conn._send_response(self, status, headers, body, trailers)
 
-    async def send_response(
+    def send_response(
         self, status: int, *, headers: HeadersInput = None, end_stream: bool = False, detect_eof: bool = True
-    ) -> SendStream:
+    ) -> Awaitable[SendStream]:
         """Push-style response: send the head now and return a `SendStream` to write
         the body with (`send_data` / `send_trailers` / `send_reset`). `end_stream=True`
         = a bodyless response (hyper: a `Body` that `is_end_stream()` at encode time —
@@ -282,7 +282,7 @@ class ServerRequest:
         later — at the kernel's RST, not at the FIN — unless something asks: `peer_closed()`
         still arms on demand, exactly as it does before the head. Meant for a caller whose
         disconnect detection IS that explicit ask (an ASGI `receive()`)."""
-        return await self._conn._send_response_head(self, status, headers, end_stream=end_stream, detect_eof=detect_eof)
+        return self._conn._send_response_head(self, status, headers, end_stream=end_stream, detect_eof=detect_eof)
 
     def detach(self) -> bytes:
         """Take over the raw connection for a protocol upgrade (WebSocket, or a custom protocol):
@@ -335,7 +335,11 @@ class SendStream:
         Fails with `ConnectionClosedError` once the client closed its side mid-request
         (hyper: the connection errored with `IncompleteMessage`, nothing more is written)."""
         self._check_open()
-        await self._conn._check_peer_open(self._req)
+        conn, req = self._conn, self._req
+        if conn.peer_closed_flag(req._seq):
+            # hyper: once `mid_message_detect_eof` saw EOF the connection is errored and
+            # nothing more is written for this exchange. Poison + close, `IncompleteMessage`.
+            await conn._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
         codec = self._codec
         try:
             if codec.body_is_eof():
@@ -348,28 +352,35 @@ class SendStream:
             # `serialize_end` on a body short of its Content-Length: hyper `end_body` ->
             # `User::BodyWriteAborted` + `Writing::Closed`. Same poison as a failed write.
             self._done = True
-            await self._conn._fail_response(self._req, exc)
+            await conn._fail_response(req, exc)
         if end_stream:
             self._done = True
         if buf:
-            await self._write(buf)
-        if end_stream:
-            await self._conn._finish_response(self._req)
+            try:
+                await conn.write(buf)
+            except BaseException as exc:
+                self._done = True
+                await conn._fail_response(req, exc)
+        if end_stream and (end := conn._finish_response(req)) is not None:
+            await end
 
     async def send_trailers(self, trailers: HeadersInput) -> None:
         """Finish a chunked body with a trailer block (hyper `Server::encode` allow-lists
         the fields named in the response's `Trailer` header; others are dropped, and a
         non-chunked body gets a bare terminator — `Encoder::encode_trailers`)."""
         self._check_open()
-        await self._conn._check_peer_open(self._req)
+        conn, req = self._conn, self._req
+        if conn.peer_closed_flag(req._seq):  # as `send_data`
+            await conn._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
         hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
         self._done = True
         try:
             buf = self._codec.serialize_trailers(hdrs)  # bare terminator unless the request said `TE: trailers`
+            await conn.write(buf)
         except BaseException as exc:
-            await self._conn._fail_response(self._req, exc)
-        await self._write(buf)
-        await self._conn._finish_response(self._req)
+            await conn._fail_response(req, exc)
+        if (end := conn._finish_response(req)) is not None:
+            await end
 
     async def send_reset(self, reason: int | None = None) -> None:
         """Abort the response. HTTP/1 has no per-stream reset frame, so this is what
@@ -384,13 +395,6 @@ class SendStream:
     def _check_open(self):
         if self._done:
             raise RuntimeError("response body already complete")
-
-    async def _write(self, data):
-        try:
-            await self._conn.write(data)
-        except BaseException as exc:
-            self._done = True
-            await self._conn._fail_response(self._req, exc)
 
 
 class ServerConnection(H1Framing, H1ServerState):
@@ -614,12 +618,6 @@ class ServerConnection(H1Framing, H1ServerState):
             return transport.receive_some(n)
         return self._read_bounded(n, deadline)
 
-    async def _check_peer_open(self, req):
-        # hyper: once `mid_message_detect_eof` saw EOF the connection is errored and nothing
-        # more is written for this exchange. Poison + close, surface `IncompleteMessage`.
-        if self.peer_closed_flag(req._seq):
-            await self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
-
     async def _send_async_body(self, req, body, trailers):
         """Stream an ASYNC response body and fail fast on a client FIN. hyper polls the
         connection (so `mid_message_detect_eof`) while the body's next chunk is pending,
@@ -711,8 +709,16 @@ class ServerConnection(H1Framing, H1ServerState):
         if code == H1_NEXT_NONE:
             return None
         codec = self._codec
+        # hyper's `header_read_timeout` (slowloris defence, http1.rs L249; default 30s, `None`
+        # disables it): ONE deadline per head, armed at the first poll for it — i.e. from the
+        # moment the connection is idle between requests, so it covers the keep-alive wait
+        # plus the head's bytes — never reset by partial bytes (conn.rs `poll_read_head`:
+        # `h1_header_read_timeout_running` stays set until a head parses). The bound rides
+        # each read (`_read_bounded`), so no task is spawned per head and no parked read is
+        # ever cancelled.
+        deadline = None if self._header_read_timeout is None else self._now() + self._header_read_timeout
         try:
-            accepted = await self._read_request_head(code, obj)
+            accepted = await self._read_head_frames(code, obj, deadline)
         except H1ParseError:
             # hyper conn.rs `on_parse_error`: an HTTP/2 preface is `Parse::VersionH2` and
             # the connection errors (dropped: the abortive end); any other malformed head
@@ -732,6 +738,11 @@ class ServerConnection(H1Framing, H1ServerState):
             # close without close_notify (which httpunk's own abortive
             # `close_transport` produces). The wire outcome is identical to
             # the clean EOF below, so it surfaces as a clean end-of-iteration (F47).
+            self._close(self.fail_read())
+            return None
+        if accepted is _DEADLINE:
+            # Expiry is `Error::new_header_timeout` out of the dispatcher: closed, no
+            # response, the abortive end.
             self._close(self.fail_read())
             return None
         if accepted is None:  # clean EOF between requests (or a shutdown released the idle read)
@@ -767,22 +778,6 @@ class ServerConnection(H1Framing, H1ServerState):
         except Exception:  # noqa: S110 - a decode failure just means "not drainable → close"
             pass
         return dec.is_complete
-
-    async def _read_request_head(self, code, obj):
-        # hyper's `header_read_timeout` (slowloris defence, http1.rs L249; default 30s, `None`
-        # disables it): ONE deadline per head, armed at the first poll for it — i.e. from the
-        # moment the connection is idle between requests, so it covers the keep-alive wait
-        # plus the head's bytes — never reset by partial bytes (conn.rs `poll_read_head`:
-        # `h1_header_read_timeout_running` stays set until a head parses). Expiry is
-        # `Error::new_header_timeout` out of the dispatcher: closed, no response, the
-        # abortive end. The bound rides each read (`_read_bounded`), so no task is spawned
-        # per head and no parked read is ever cancelled.
-        deadline = None if self._header_read_timeout is None else self._now() + self._header_read_timeout
-        accepted = await self._read_head_frames(code, obj, deadline)
-        if accepted is _DEADLINE:
-            self._close(self.fail_read())
-            return None
-        return accepted
 
     async def _read_head_frames(self, code, obj, deadline):
         """Read + parse the next head from `begin_read`'s verdict: `READ_PARSE` = bytes of
@@ -900,7 +895,8 @@ class ServerConnection(H1Framing, H1ServerState):
                 await self._send_head_and_body(self._codec, head, body, trailers)
             except BaseException as exc:
                 await self._fail_response(req, exc)
-        await self._finish_response(req)
+        if (end := self._finish_response(req)) is not None:
+            await end
 
     async def _send_response_head(self, req, status, headers, *, end_stream, detect_eof):
         """The push path (`ServerRequest.send_response`): write the head now, return
@@ -922,8 +918,8 @@ class ServerConnection(H1Framing, H1ServerState):
             await self.write(head)
         except BaseException as exc:
             await self._fail_response(req, exc)
-        if end_stream:
-            await self._finish_response(req)
+        if end_stream and (end := self._finish_response(req)) is not None:
+            await end
         return stream
 
     async def _respond_head(self, req, status, headers, content_length, chunked, *, want):
@@ -1004,12 +1000,15 @@ class ServerConnection(H1Framing, H1ServerState):
         self._close(self.fail_response(req._seq))
         req._peer_closed_evt.set()
 
-    async def _finish_response(self, req):
+    def _finish_response(self, req):
         """Completion, shared by both paths: the response is fully on the wire — apply
         the head-time reuse decision (hyper `try_keep_alive` after `Writing::KeepAlive`),
         or hand off the tunnel for a protocol switch. One step in the state; the
         `peer_closed()` waiters wake after it. A non-reusable connection completes:
-        `try_keep_alive` closes it and the future `poll_shutdown`s — the orderly end."""
+        `try_keep_alive` closes it and the future `poll_shutdown`s — the orderly end.
+        Sync: the reusable case (the hot path) suspends nowhere; the close is handed back
+        as the awaitable to finish with (None otherwise), so no wrapper coroutine rides
+        every response."""
         switch, close, transport, leftover = self.finish_response(req._seq)
         req._peer_closed_evt.set()
         if switch:
@@ -1017,7 +1016,8 @@ class ServerConnection(H1Framing, H1ServerState):
             # the start of the tunnel) is the caller's; the state detached.
             req.upgraded = H1Upgraded(transport, leftover)
         elif close:
-            await self._shutdown(transport)
+            return self._shutdown(transport)
+        return None
 
 
 class H1Server(BaseServer[ServerRequest]):
