@@ -18,7 +18,7 @@
 //! Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.19 (see
 //! crates/vendor-h2), paths relative to its `src/`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,8 @@ const MAX_STREAM_ID: u32 = u32::MAX >> 1;
 /// Opaque payload of the graceful-shutdown PING (h2 `Ping::SHUTDOWN`).
 const SHUTDOWN_PING: [u8; 8] = *b"SHUTDOWN";
 const DEFAULT_INITIAL_WINDOW_SIZE: u32 = frame::DEFAULT_INITIAL_WINDOW_SIZE;
+/// DATA frames a stream sharing the connection may queue per flush (`Inner::burst_frames`).
+const DEFAULT_SEND_BURST_FRAMES: usize = 4;
 
 // ===== verdict flags: what the Python caller must do now, after the call =====
 
@@ -67,6 +69,9 @@ pub const FLAG_CONN_DONE: u8 = 4;
 /// Server: the graceful drain reached phase 2 and the last stream is gone: end
 /// the accept loop.
 pub const FLAG_STOP_ACCEPTING: u8 = 8;
+/// The send rotation moved (a turn ended, a stream left, window arrived for a
+/// waiter): ask `next_capacity_wake` which sender's turn it is now.
+pub const FLAG_CAPACITY: u8 = 16;
 
 /// `H2RecvHeadersVerdict.kind` values.
 pub const HEADERS_IGNORED: u8 = 0;
@@ -188,11 +193,18 @@ struct StreamEntry {
     holds_slot: bool,
     /// Left the active set (slot freed, counted out); kept only for the recv ledger.
     finished: bool,
+    /// Queued in `Inner::pending_capacity` (h2 stream.rs `is_pending_send_capacity`).
+    is_pending_capacity: bool,
+    /// Queued in `Inner::pending_send` (h2 stream.rs `is_pending_send`).
+    is_pending_send: bool,
+    /// DATA frames queued in the current turn at the front of `pending_send`;
+    /// `Inner::burst_frames` bounds it while other streams wait behind.
+    turn_frames: usize,
 }
 
 impl StreamEntry {
     fn new(handle: Py<PyAny>, send_window: u32, recv_window: u32, is_head: bool) -> Self {
-        // Send side: `available` is kept equal to the window (see `send_budget`), so
+        // Send side: `available` is kept equal to the window (see `stream_room`), so
         // it is assigned here and on every later increment, never left at zero.
         let mut send_flow = FlowControl::new();
         let _ = send_flow.inc_window(send_window);
@@ -212,6 +224,9 @@ impl StreamEntry {
             data_budget_charged: 0,
             holds_slot: false,
             finished: false,
+            is_pending_capacity: false,
+            is_pending_send: false,
+            turn_frames: 0,
         }
     }
 
@@ -334,6 +349,30 @@ struct Inner {
     /// Per-stream recv window we advertise (h2 recv.rs `init_window_sz`).
     recv_init: u32,
     conn_send: FlowControl,
+    /// h2 prioritize.rs `pending_send`: the streams with DATA to send, in emission
+    /// order. h2's connection task pops the front, frames ONE DATA and re-queues the
+    /// stream at the back (`pop_frame`), so concurrent streams interleave frame by
+    /// frame on the wire. httpunk's senders frame their own chunks, so the queue
+    /// is a turn: only the front's `send_data` frames; it keeps the turn for up to
+    /// `burst_frames` frames, then goes to the back and the next front is woken
+    /// (`FLAG_CAPACITY` -> `next_capacity_wake`). A stream leaves when its chunk is
+    /// queued or its own window / buffer room ran out (it re-enters on its next
+    /// call), or moves to `pending_capacity` when the connection window ran out.
+    /// Alone in the queue, a stream never yields: a single-stream connection pays
+    /// nothing.
+    pending_send: VecDeque<u32>,
+    /// h2 prioritize.rs `pending_capacity`: the streams waiting for CONNECTION
+    /// window, in the order they asked for it. h2 assigns each WINDOW_UPDATE(0) to
+    /// the front (`assign_connection_capacity`) and schedules it; here the front is
+    /// admitted to an EMPTY `pending_send` on a WINDOW_UPDATE(0) or a hand-off
+    /// while window remains (`admit_capacity_front`), so the waiters take the
+    /// window strictly in order. Ids of streams since closed are skipped lazily at
+    /// the front ("may have been reset before capacity becomes available").
+    pending_capacity: VecDeque<u32>,
+    /// DATA frames per turn at the front of `pending_send` (h2: one). With other
+    /// streams active but none lined up, the front pauses at the bound until the
+    /// flush credit instead (`credit_written` resets `turn_frames`).
+    burst_frames: usize,
     conn_recv: FlowControl,
     conn_recv_target: u32,
     max_send_buf_size: usize,
@@ -486,7 +525,11 @@ impl Inner {
             self.num_open_streams -= 1;
             flags |= FLAG_SLOT_FREED;
         }
-        if e.recv_unreleased == 0 && e.data_budget_charged == 0 {
+        let drop_entry = e.recv_unreleased == 0 && e.data_budget_charged == 0;
+        // A closed stream leaves both queues (h2 `clear_pending_capacity` / the
+        // closed-stream skips in `pop_frame` and `assign_connection_capacity`).
+        flags |= self.leave_send_queue(sid) | self.leave_capacity_queue(sid);
+        if drop_entry {
             self.streams.remove(&sid);
         }
         flags | self.on_stream_gone()
@@ -724,20 +767,173 @@ impl Inner {
 
     // ----- send-side flow control (h2 send.rs / prioritize.rs) -----
 
-    /// Bytes a stream may queue now: within the flow-control windows AND the
+    /// Bytes a stream may queue on its own account: its send window AND the
     /// per-stream send buffer cap (hyper `max_send_buf_size` -> h2 `poll_capacity`).
+    /// The connection window is the other bound, handed out in `pending_capacity`
+    /// order (`send_data`).
     ///
-    /// Runtime-forced divergence from h2: h2 hands a stream send capacity from the
-    /// connection's pool on demand (prioritize.rs `try_assign_capacity`, claimed back
-    /// on a SETTINGS decrease), and its senders wait on that `available`. httpunk has
-    /// no prioritize queue — a sender reserves against the windows right here — so
-    /// each send window's `available` is simply kept EQUAL to its `window_size`:
-    /// assigned wherever the window is opened or incremented, claimed where it is
-    /// decremented. Without that, `FlowControl::send_data` (which decrements both)
-    /// drives `available` negative by every byte sent and underflows after 2 GiB.
-    fn send_budget(&self, e: &StreamEntry) -> usize {
-        let window = self.conn_send.window_size().min(e.send_flow.window_size()) as usize;
-        window.min(self.max_send_buf_size.saturating_sub(e.send_buffered))
+    /// Divergence from h2, by choice: h2's `send_data` accepts the whole chunk into
+    /// the stream's queue and the connection task frames it later, holding the
+    /// caller's buffer meanwhile; it hands a stream send capacity from the
+    /// connection's pool on demand (prioritize.rs `try_assign_capacity`, claimed
+    /// back on a SETTINGS decrease) and its senders wait on that `available`.
+    /// httpunk's sender frames its own chunk, one DATA per call, and reserves
+    /// against the windows right here — so the state never holds a Python buffer
+    /// across calls (no cross-thread refcounts, no drops under the lock, no
+    /// per-stream chunk queue). Nothing in the runtime forces this; measured
+    /// against the alternative (2026-09), the only visible difference was emission
+    /// order across streams, which `pending_send` / `pending_capacity` restore.
+    /// Consequence for the bookkeeping: each send window's `available` is simply
+    /// kept EQUAL to its `window_size` — assigned wherever the window is opened or
+    /// incremented, claimed where it is decremented. Without that,
+    /// `FlowControl::send_data` (which decrements both) drives `available` negative
+    /// by every byte sent and underflows after 2 GiB.
+    fn stream_room(&self, e: &StreamEntry) -> usize {
+        (e.send_flow.window_size() as usize)
+            .min(self.max_send_buf_size.saturating_sub(e.send_buffered))
+    }
+
+    /// The front of `pending_send`, past entries whose stream is gone, closed on
+    /// the send side, or no longer queued (h2 `pop_frame` skips those).
+    fn send_front(&mut self) -> Option<u32> {
+        while let Some(&sid) = self.pending_send.front() {
+            match self.streams.get(&sid) {
+                Some(e) if e.is_pending_send && !e.finished && e.state.is_send_streaming() => {
+                    return Some(sid);
+                }
+                _ => {
+                    self.pending_send.pop_front();
+                }
+            }
+        }
+        None
+    }
+
+    /// The front of `pending_capacity`, past stale entries (h2
+    /// `assign_connection_capacity` skips those).
+    fn capacity_front(&mut self) -> Option<u32> {
+        while let Some(&sid) = self.pending_capacity.front() {
+            match self.streams.get(&sid) {
+                Some(e) if e.is_pending_capacity && !e.finished && e.state.is_send_streaming() => {
+                    return Some(sid);
+                }
+                _ => {
+                    self.pending_capacity.pop_front();
+                }
+            }
+        }
+        None
+    }
+
+    /// `sid` takes a place at the back of `pending_send` (h2 `schedule_send`: once).
+    fn enqueue_send(&mut self, sid: u32) {
+        if let Some(e) = self.streams.get_mut(&sid)
+            && !e.is_pending_send
+        {
+            e.is_pending_send = true;
+            e.turn_frames = 0;
+            self.pending_send.push_back(sid);
+        }
+    }
+
+    /// `sid` lines up for connection window (h2 `pending_capacity.push`: once).
+    fn enqueue_capacity(&mut self, sid: u32) {
+        if let Some(e) = self.streams.get_mut(&sid)
+            && !e.is_pending_capacity
+        {
+            e.is_pending_capacity = true;
+            self.pending_capacity.push_back(sid);
+        }
+    }
+
+    /// Something may be waiting for a wake the caller cannot deliver itself: a
+    /// stream at the front of `pending_send`, or one waiting for connection window
+    /// while there is some. The verdict carries `FLAG_CAPACITY` and the driver asks
+    /// `next_capacity_wake` (the one shape that reaches every path: `close_stream`
+    /// funnels resets and completions alike).
+    fn queue_wake_flag(&self) -> u8 {
+        if !self.pending_send.is_empty()
+            || (!self.pending_capacity.is_empty() && self.conn_send.window_size() > 0)
+        {
+            // (the second arm: an empty rotation with a waiter to admit)
+            FLAG_CAPACITY
+        } else {
+            0
+        }
+    }
+
+    /// `sid` leaves `pending_send` (chunk queued, own window / buffer room out, or
+    /// waiting for connection window). Returns the wake flag when the turn moved
+    /// (it was the front); a stream leaving from behind, or not queued, changes
+    /// nothing for the front.
+    fn leave_send_queue(&mut self, sid: u32) -> u8 {
+        let Some(e) = self.streams.get_mut(&sid) else {
+            return 0;
+        };
+        if !e.is_pending_send {
+            return 0;
+        }
+        e.is_pending_send = false;
+        e.turn_frames = 0;
+        if self.pending_send.front() == Some(&sid) {
+            self.pending_send.pop_front();
+            self.queue_wake_flag()
+        } else {
+            self.pending_send.retain(|&id| id != sid);
+            0
+        }
+    }
+
+    /// `sid` no longer waits for connection window (closed). The flag only when it
+    /// was the first in line and there is window: the next waiter gets admitted.
+    fn leave_capacity_queue(&mut self, sid: u32) -> u8 {
+        let Some(e) = self.streams.get_mut(&sid) else {
+            return 0;
+        };
+        if !e.is_pending_capacity {
+            return 0;
+        }
+        e.is_pending_capacity = false;
+        if self.pending_capacity.front() == Some(&sid) {
+            self.pending_capacity.pop_front();
+            self.queue_wake_flag()
+        } else {
+            self.pending_capacity.retain(|&id| id != sid);
+            0
+        }
+    }
+
+    /// The front's turn is over with more to send: back of the line (h2
+    /// `pop_frame` re-queues the stream after each frame).
+    fn yield_send_turn(&mut self, sid: u32) -> u8 {
+        if self.pending_send.front() == Some(&sid) {
+            self.pending_send.pop_front();
+            self.pending_send.push_back(sid);
+            if let Some(e) = self.streams.get_mut(&sid) {
+                e.turn_frames = 0;
+            }
+        }
+        self.queue_wake_flag()
+    }
+
+    /// Admit the first stream waiting for connection window to the rotation (h2
+    /// `assign_connection_capacity` -> `schedule_send`), if there is window and the
+    /// rotation is empty. h2's admitted stream OWNS the capacity it was assigned;
+    /// here the window is shared, so a waiter admitted behind a running front would
+    /// find the window spent at its turn and fall to the back of the line, losing
+    /// its place. Admitted alone, it is the front and the window is its.
+    fn admit_capacity_front(&mut self) -> Option<u32> {
+        if self.conn_send.window_size() == 0 || self.send_front().is_some() {
+            return None;
+        }
+        let sid = self.capacity_front()?;
+        self.streams
+            .get_mut(&sid)
+            .expect("live")
+            .is_pending_capacity = false;
+        self.pending_capacity.pop_front();
+        self.enqueue_send(sid);
+        Some(sid)
     }
 
     // ----- resets (h2 streams.rs send_reset / recv_reset) -----
@@ -979,6 +1175,9 @@ impl H2Streams {
                 settings: Settings::new(local),
                 recv_init,
                 conn_send,
+                pending_send: VecDeque::new(),
+                pending_capacity: VecDeque::new(),
+                burst_frames: DEFAULT_SEND_BURST_FRAMES,
                 conn_recv,
                 conn_recv_target: connection_window,
                 max_send_buf_size,
@@ -1387,11 +1586,14 @@ impl H2Streams {
                 .inc_window(frame.increment)
                 .and_then(|()| me.conn_send.assign_capacity(frame.increment))
                 .map_err(map_reason)?;
-            return Ok(me
-                .streams
-                .values()
-                .filter(|e| !e.finished)
-                .map(|e| e.handle.clone_ref(py))
+            // h2 `assign_connection_capacity` -> `schedule_send`: the first stream
+            // waiting for connection window joins the rotation; the rotation's front
+            // is woken (it is the admitted stream when nobody else was sending).
+            me.admit_capacity_front();
+            let front = me.send_front();
+            return Ok(front
+                .map(|sid| me.streams[&sid].handle.clone_ref(py))
+                .into_iter()
                 .collect());
         }
         let sid = frame.stream_id;
@@ -1788,16 +1990,53 @@ impl H2Streams {
             let flags = me.wake_flag(before);
             return Ok(completed_send(py, 0, flags, tail));
         }
-        let budget = me.send_budget(e);
+        // Readiness first (h2 `schedule_send` queues only a stream with capacity):
+        // a stream without window has no place in the rotation. It waits for the
+        // connection window in `pending_capacity` when that is the limit and its
+        // own window is not (h2 `try_assign_capacity`), otherwise for its own
+        // WINDOW_UPDATE / buffer credit. A stream that was at the front passes the
+        // turn on. Queuing an unready stream would let waiters hand the turn round
+        // in a circle with nothing to send.
+        let e = me.streams.get(&sid).expect("live");
+        let stream_room = me.stream_room(e);
+        let conn = me.conn_send.window_size() as usize;
+        let budget = stream_room.min(conn);
         if budget == 0 {
-            return Ok(SendVerdict {
-                sent: 0,
-                done: false,
-                stopped: None,
-                flags: 0,
-                handle: None,
-                reader_stop: None,
-            });
+            if conn == 0 && stream_room > 0 {
+                me.enqueue_capacity(sid);
+            }
+            let flags = me.leave_send_queue(sid);
+            return Ok(no_window(flags));
+        }
+        // Ready: no longer waiting for connection window (h2: the stream was
+        // assigned capacity and popped from `pending_capacity`).
+        if me.streams[&sid].is_pending_capacity {
+            me.streams.get_mut(&sid).expect("live").is_pending_capacity = false;
+            me.pending_capacity.retain(|&id| id != sid);
+        }
+        // Emission order is `pending_send` order (h2 `pop_frame`): the front frames,
+        // anyone else lines up and parks — the driver wakes it when its turn comes
+        // (`FLAG_CAPACITY` -> `next_capacity_wake`).
+        match me.send_front() {
+            Some(front) if front != sid => {
+                me.enqueue_send(sid);
+                return Ok(no_window(0));
+            }
+            Some(_) => {}
+            None => me.enqueue_send(sid),
+        }
+        // The turn is over (h2: after one frame): to the back when others wait;
+        // when other streams are active but none has lined up yet (they have not
+        // had the thread), pause as the front until the flush credit — the pause
+        // is what lets them run and line up. Alone, no bound.
+        if me.streams[&sid].turn_frames >= me.burst_frames {
+            if me.pending_send.len() > 1 {
+                let flags = me.yield_send_turn(sid);
+                return Ok(no_window(flags));
+            }
+            if me.num_active > 1 {
+                return Ok(no_window(0));
+            }
         }
         let want = data.len() - offset;
         let n = budget.min(want).min(me.peer.max_frame_size as usize);
@@ -1806,6 +2045,26 @@ impl H2Streams {
         let e = me.streams.get_mut(&sid).expect("live");
         fc_send_data(&mut e.send_flow, n as u32).map_err(map_reason)?;
         e.send_buffered += n;
+        e.turn_frames += 1;
+        // After this frame: chunk queued -> leave the rotation; connection window
+        // out with more to send -> wait for it (h2: `pending_capacity`); own window
+        // or buffer room out -> leave, the WINDOW_UPDATE / credit re-enters it;
+        // otherwise keep the turn: the sender loops, `burst_frames` ends it.
+        let queue_flags = if n == want {
+            me.leave_send_queue(sid)
+        } else {
+            let e = me.streams.get(&sid).expect("live");
+            let room_after = me.stream_room(e);
+            let conn_after = me.conn_send.window_size() as usize;
+            if conn_after == 0 && room_after > 0 {
+                me.enqueue_capacity(sid);
+                me.leave_send_queue(sid)
+            } else if room_after == 0 {
+                me.leave_send_queue(sid)
+            } else {
+                0
+            }
+        };
         let mut pending = std::mem::take(&mut me.pending);
         let r = me
             .encoder
@@ -1821,14 +2080,14 @@ impl H2Streams {
             // (`is_send_streaming` held above, under this same lock: no reset in between).
             me.streams.get_mut(&sid).expect("live").state.send_close();
             let tail = me.finish_stream(py, sid);
-            let flags = me.wake_flag(before);
+            let flags = me.wake_flag(before) | queue_flags;
             return Ok(completed_send(py, n, flags, tail));
         }
         Ok(SendVerdict {
             sent: n,
             done: n == want,
             stopped: None,
-            flags: me.wake_flag(before),
+            flags: me.wake_flag(before) | queue_flags,
             handle: None,
             reader_stop: None,
         })
@@ -2089,6 +2348,7 @@ impl H2Streams {
         for (sid, n) in batch {
             if let Some(e) = me.streams.get_mut(&sid) {
                 e.send_buffered = e.send_buffered.saturating_sub(n);
+                e.turn_frames = 0; // the pause at the burst bound ends with the flush
                 if woken.insert(sid) {
                     wake.push(e.handle.clone_ref(py));
                 }
@@ -2192,6 +2452,18 @@ impl H2Streams {
     #[getter]
     fn conn_send_window(&self) -> u32 {
         self.lock().conn_send.window_size()
+    }
+
+    /// After a verdict with `FLAG_CAPACITY`: the sender whose turn it is now, to
+    /// wake (`window_evt`). A stream waiting for connection window is admitted to
+    /// the rotation first when there is window (h2 releases a closed stream's unused
+    /// capacity to `pending_capacity`); `None` when nobody waits (the next
+    /// WINDOW_UPDATE(0) wakes its own front).
+    fn next_capacity_wake(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let mut me = self.lock();
+        me.admit_capacity_front();
+        let sid = me.send_front()?;
+        Some(me.streams[&sid].handle.clone_ref(py))
     }
 
     #[getter]
@@ -2387,6 +2659,18 @@ impl Drop for H2WriteBatch {
         if me.spare.is_none() {
             me.spare = Some(buf);
         }
+    }
+}
+
+/// "No window now": nothing framed, the sender parks on `window_evt`.
+fn no_window(flags: u8) -> SendVerdict {
+    SendVerdict {
+        sent: 0,
+        done: false,
+        stopped: None,
+        flags,
+        handle: None,
+        reader_stop: None,
     }
 }
 

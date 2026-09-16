@@ -39,6 +39,7 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("H2_FLAG_SLOT_FREED", conn::FLAG_SLOT_FREED)?;
     m.add("H2_FLAG_CONN_DONE", conn::FLAG_CONN_DONE)?;
     m.add("H2_FLAG_STOP_ACCEPTING", conn::FLAG_STOP_ACCEPTING)?;
+    m.add("H2_FLAG_CAPACITY", conn::FLAG_CAPACITY)?;
     m.add("H2_HEADERS_IGNORED", conn::HEADERS_IGNORED)?;
     m.add("H2_HEADERS_OPENED", conn::HEADERS_OPENED)?;
     m.add("H2_HEADERS_HEAD", conn::HEADERS_HEAD)?;

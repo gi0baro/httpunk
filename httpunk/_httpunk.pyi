@@ -867,6 +867,7 @@ H2_FLAG_WAKE: int  # bytes were queued: wake the write pump
 H2_FLAG_SLOT_FREED: int  # client: a MAX_CONCURRENT slot freed / the limit changed
 H2_FLAG_CONN_DONE: int  # the connection failed or finished: wake the role waiters
 H2_FLAG_STOP_ACCEPTING: int  # server: the graceful drain completed
+H2_FLAG_CAPACITY: int  # the connection-capacity queue moved: ask `next_capacity_wake`
 
 # `H2RecvHeadersVerdict.kind`.
 H2_HEADERS_IGNORED: int
@@ -1060,6 +1061,9 @@ class H2Streams:
     def stream_send_window(self, sid: int) -> int | None: ...
     @property
     def conn_send_window(self) -> int: ...
+    def next_capacity_wake(self) -> object | None:
+        """After `H2_FLAG_CAPACITY`: the stream handle now first in line for connection
+        window (wake its `window_evt`), or None."""
     @property
     def conn_recv_available(self) -> int: ...
     @property

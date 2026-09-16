@@ -27,6 +27,7 @@ import contextlib
 from .. import _backend
 from .._common import PUMP_ABANDONED, PUMP_DONE, aclose_body, aiter_body, event_result
 from .._httpunk import (
+    H2_FLAG_CAPACITY,
     H2_FLAG_CONN_DONE,
     H2_FLAG_SLOT_FREED,
     H2_FLAG_STOP_ACCEPTING,
@@ -112,6 +113,12 @@ class H2ConnectionBase(H2Streams):
             self._on_conn_done()
         if flags & H2_FLAG_STOP_ACCEPTING:
             self._on_stop_accepting()
+        if flags & H2_FLAG_CAPACITY:
+            # The front of the connection-capacity queue moved on: hand the turn
+            # to the next sender in line (h2 `assign_connection_capacity`).
+            handle = self.next_capacity_wake()
+            if handle is not None:
+                handle.window_evt.set()
 
     @staticmethod
     def _notify_stopped(handle, stop, notify_body):
