@@ -136,16 +136,21 @@ async def test_server_multiplexed_requests():
             async for req in server:
                 handlers.spawn(handle(req))  # serve concurrently (h2 multiplexing)
 
-    results = {}
+    results, errors = {}, []
     async with scope() as s:
         s.spawn(serve())
         async with open_h2(host, port) as conn:
             done = [Event(), Event()]
 
             async def fetch(i, path):
-                resp = await conn.request("GET", path)
-                results[path] = (resp.status, await resp.read())
-                done[i].set()
+                try:
+                    resp = await conn.request("GET", path)
+                    results[path] = (resp.status, await resp.read())
+                except BaseException as exc:
+                    errors.append(exc)
+                    raise
+                finally:
+                    done[i].set()  # set on failure too: the waits below must not hang
 
             async with scope() as reqs:
                 reqs.spawn(fetch(0, "/a"))
@@ -155,6 +160,7 @@ async def test_server_multiplexed_requests():
                 reqs.cancel()
         s.cancel()
 
+    assert not errors, errors
     assert results == {"/a": (200, b"/a"), "/b": (200, b"/b")}
 
 

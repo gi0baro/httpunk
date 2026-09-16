@@ -70,9 +70,12 @@ class H2ConnectionBase(H2Streams):
         # pumps read it, `close()` closes it — never reassigned.
         self.backend = _backend.resolve(backend)
         self._transport = transport
-        # A scope for background request-body writers (client full-duplex send, F6) —
-        # the one group that legitimately gets CANCELLED at teardown.
-        self._write_scope = self.backend.scope()
+        # Set by the last background request-body writer to finish once `close()` is
+        # draining (client full-duplex send, F6): hyper's connection task ends only
+        # after every `PipeToSendStream` dropped its `conn_drop_ref`. Writers are bare
+        # tasks, never cancelled: a stopped stream (peer reset, GOAWAY, the connection
+        # failed or closed) is what ends one.
+        self._writers_evt = self.backend.event()
         # Orders socket writes: the write pump and the inline flushes (`_flush`).
         self._send_lock = self.backend.lock()
         # Wakes the write pump. Set by the driver after any verdict that appended to
@@ -187,7 +190,6 @@ class H2ConnectionBase(H2Streams):
         # Shared handshake start (h2 client.rs/server.rs `handshake`): the preface
         # (client) + our initial SETTINGS + the initial WINDOW_UPDATE(0) are queued by
         # the state and flushed here, BEFORE the pumps start, so nothing can precede them.
-        await self._write_scope.__aenter__()
         self.begin()
         await self._flush()
         # Bare tasks (`spawn_without_results`), never cancelled: every point they can
@@ -213,20 +215,21 @@ class H2ConnectionBase(H2Streams):
     async def close(self):
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never cancel it
         # (a cancellation landing between its take and its flush would lose control
-        # frames). Then cancel + join the body writers, drain what their teardown
-        # enqueued (h2 `codec.shutdown` = flush THEN shutdown, F23), shut the
-        # transport down — `FramedWrite::shutdown` ends in the IO's `poll_shutdown`
-        # (`close_notify` over TLS), which is also what ends the read pump's parked
-        # read — join it, and wake every straggler. On a transport that already died
-        # the alert cannot go out and the shutdown is the plain close hyper's drop
-        # would be: wire-identical.
+        # frames). Drain what is enqueued (h2 `codec.shutdown` = flush THEN shutdown,
+        # F23), shut the transport down — `FramedWrite::shutdown` ends in the IO's
+        # `poll_shutdown` (`close_notify` over TLS), which is also what ends the read
+        # pump's parked read — join it, and wake every straggler. On a transport that
+        # already died the alert cannot go out and the shutdown is the plain close
+        # hyper's drop would be: wire-identical. Last, wait for the background
+        # request-body writers: every stream is stopped by now, so each one wakes and
+        # exits — hyper's connection task likewise ends only after the last
+        # `PipeToSendStream` dropped its `conn_drop_ref`; the writers are never
+        # cancelled, here or there.
         self.stop_pump()
         self._write_evt.set()
         handle = self.take_pump_handle()
         if handle is not None:
             await handle
-        self._write_scope.cancel()
-        await self._write_scope.__aexit__(None, None, None)
         with contextlib.suppress(Exception):  # best-effort: the connection is closing regardless
             await self._flush()
         await self.backend.shutdown_transport(self._transport)
@@ -234,6 +237,8 @@ class H2ConnectionBase(H2Streams):
         if handle is not None:
             await handle
         self._fail(None)  # no-op when the pump already failed everyone (F44)
+        if not self.release_writers():
+            await self._writers_evt.wait()
 
     # ----- the write pump (h2 `poll_complete` draining its frame queue) -----
 
@@ -382,18 +387,19 @@ class H2ConnectionBase(H2Streams):
 
     # ----- sending (h2 share.rs SendStream over send.rs, hyper PipeToSendStream) -----
 
-    async def _send_body(self, st, body, trailers=None):
+    async def _send_body(self, st, body, trailers=None, offset=0):
         """Stream a body, marking END_STREAM on the final DATA frame (or on the
         trailing HEADERS), then close the send half. A bodyless message never reaches
-        here — its END_STREAM rode the HEADERS frame."""
+        here — its END_STREAM rode the HEADERS frame. `offset`: where a bytes body
+        resumes after the client's inline attempt queued its head (`_send_body_inline`)."""
         if isinstance(body, bytes):
             # hyper's `Full` body: one poll yields the whole chunk with `is_end_stream()`
             # set — one DATA carrying END_STREAM (or the trailers carry it, F45).
             if trailers is None:
-                await self._send_data(st, body, end_stream=True)
+                await self._send_data(st, body, end_stream=True, offset=offset)
                 return
             if body:
-                await self._send_data(st, body, end_stream=False)
+                await self._send_data(st, body, end_stream=False, offset=offset)
             self._send_trailers(st, trailers)
             return
         if body is not None and not isinstance(body, bytearray) and hasattr(body, "__aiter__"):
@@ -459,16 +465,16 @@ class H2ConnectionBase(H2Streams):
             await aclose_body(body)
             done.set()
 
-    async def _send_data(self, st, data, end_stream):
-        """Queue `data` as DATA frame(s), each reserved against min(connection window,
-        stream window, send-buffer room, peer max_frame_size) — h2 send.rs `send_data`
-        behind `poll_capacity`. `send_data` is one locked step (reserve + encode +
-        append — and, with END_STREAM on the last frame, the send half's close, as h2's;
-        on the server the request's recv half goes with it, hyper dropping the
-        `RecvStream`: `handle` is the reader to notify when its unread body was reset);
-        "no window now" is awaited on `window_evt` with the fixed waiter idiom: try,
-        clear, try again, wait (design §4)."""
-        offset = 0
+    def _try_send_data(self, st, data, offset, end_stream):
+        """Queue DATA frames from `data[offset:]` while the windows take them, each
+        reserved against min(connection window, stream window, send-buffer room, peer
+        max_frame_size) — h2 send.rs `send_data` behind `poll_capacity`. `send_data` is
+        one locked step (reserve + encode + append — and, with END_STREAM on the last
+        frame, the send half's close, as h2's; on the server the request's recv half
+        goes with it, hyper dropping the `RecvStream`: `handle` is the reader to notify
+        when its unread body was reset). Returns None once the last frame is queued, or
+        the offset to resume from on "no window now" (`sent == 0`, not `done`). Raises
+        the stopped error."""
         while True:
             v = self.send_data(st.id, data, offset, end_stream)
             if v.stopped is not None:
@@ -478,23 +484,25 @@ class H2ConnectionBase(H2Streams):
             if v.done:
                 if v.handle is not None:
                     self._notify_reset(v.handle, v.reader_stop)
-                return
-            offset += v.sent
-            if v.sent:
-                continue
-            st.window_evt.clear()
-            v = self.send_data(st.id, data, offset, end_stream)  # re-check after the clear
-            if v.stopped is not None:
-                raise self._stopped_error(st, v.stopped)
-            if v.flags:
-                self._after(v.flags)
-            if v.done:
-                if v.handle is not None:
-                    self._notify_reset(v.handle, v.reader_stop)
-                return
-            offset += v.sent
+                return None
             if not v.sent:
-                await st.window_evt.wait()
+                return offset
+            offset += v.sent
+
+    async def _send_data(self, st, data, end_stream, offset=0):
+        """`_try_send_data` until the body is queued, awaiting "no window now" on
+        `window_evt` with the fixed waiter idiom: try, clear, try again, wait
+        (design §4)."""
+        while True:
+            offset = self._try_send_data(st, data, offset, end_stream)
+            if offset is None:
+                return
+            st.window_evt.clear()
+            resumed = self._try_send_data(st, data, offset, end_stream)  # re-check after the clear
+            if resumed is None:
+                return
+            offset = resumed
+            await st.window_evt.wait()
 
     def _send_trailers(self, st, trailers):
         """The trailing HEADERS (END_STREAM) closes the send half in the same step

@@ -169,16 +169,41 @@ class Connection(H2ConnectionBase):
         """Send the request body concurrently with (not before) the caller awaiting
         the response head: h2's `SendStream` (body) and `ResponseFuture` (head) are
         independent — an early response that resets the request body (413 / redirect
-        during upload) must still deliver the received response. The write runs in the
-        connection's write scope so it can outlive `send_request` (full duplex) and is
-        torn down when the connection closes."""
-        self._write_scope.spawn(self._write_body(stream, body, trailers))
+        during upload) must still deliver the received response. hyper client.rs
+        `poll_pipe`: the pipe is polled once inline, and only if that leaves it pending
+        is it handed to the executor as a bare task that outlives `send_request` (full
+        duplex) and ends on its own — the body sent, or the stream stopped; `close()`
+        waits for the last one (`release_writers`), it never cancels them."""
+        offset = 0
+        if body is None or isinstance(body, bytes):
+            offset = self._send_body_inline(stream, body, trailers)
+            if offset is None:
+                return
+        if self.writer_start():  # refused: the stream is stopped already, nothing to write
+            self.backend.spawn_without_results(self._write_body(stream, body, trailers, offset))
 
-    async def _write_body(self, stream, body, trailers=None):
+    def _send_body_inline(self, stream, body, trailers):
+        """The inline first poll of a buffered body (hyper's `Full`: one chunk, EOS
+        set): queue what the windows take NOW. Returns the offset a background writer
+        resumes from, or None when nothing is left to write — the body (and trailers)
+        fully queued, or the stream already stopped, which the response reader sees."""
+        try:
+            offset = self._try_send_data(stream, body, 0, trailers is None) if body else None
+            if offset is None and trailers is not None:
+                self._send_trailers(stream, trailers)
+        except Exception:
+            return None
+        return offset
+
+    async def _write_body(self, stream, body, trailers, offset):
         # The stream may error/reset mid-send: that is surfaced when the response body
         # is read; a background writer has nowhere to propagate to.
-        with contextlib.suppress(Exception):
-            await self._send_body(stream, body, trailers)
+        try:
+            with contextlib.suppress(Exception):
+                await self._send_body(stream, body, trailers, offset)
+        finally:
+            if self.writer_end():
+                self._writers_evt.set()
 
 
 class H2Connection(BaseClientConnection):

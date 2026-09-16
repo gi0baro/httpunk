@@ -1002,6 +1002,10 @@ async def test_server_push_bodyless_end_stream_and_head_discards_chunks():
     chunks are DISCARDED, and the app's `content-length` still goes on the wire."""
     listener, host, port = await _listener()
     misuse = []
+    # The misuse is recorded AFTER the 204 head is on the wire, so the client seeing the
+    # complete 204 does not order it: wait for this event before asserting (the scope
+    # exit does not wait for the cancelled server task).
+    misuse_seen = Event()
 
     async def serve():
         transport = await listener.accept()
@@ -1016,6 +1020,7 @@ async def test_server_push_bodyless_end_stream_and_head_discards_chunks():
                         await stream.send_data(b"nope")
                     except RuntimeError as exc:
                         misuse.append(str(exc))
+                    misuse_seen.set()
 
     async with scope() as s:
         s.spawn(serve())
@@ -1032,6 +1037,7 @@ async def test_server_push_bodyless_end_stream_and_head_discards_chunks():
             assert b"\r\ncontent-length: 5\r\n" in head_resp
             assert b"hello" not in head_resp  # no body bytes for HEAD
             assert head_resp.endswith(b"\r\n\r\n")  # the 204 followed the HEAD head directly
+            await misuse_seen.wait()
         finally:
             transport.close()
             s.cancel()

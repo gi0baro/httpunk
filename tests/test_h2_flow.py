@@ -11,6 +11,7 @@ from tonio.colored.net import open_tcp_listeners
 from tonio.colored.sync import Lock
 
 from httpunk import H2Reason, StreamResetError
+from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2_DEFAULT_DATA_FRAME_BUDGET as _DATA_FRAME_BUDGET,
     H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD as _DATA_FRAME_OVERHEAD_THRESHOLD,
@@ -108,10 +109,18 @@ class _Server:
         async with self._slock:
             await self._stream.send_all(data)
 
+    async def _send_headers(self, sid, status, headers):
+        # HPACK encoding mutates the encoder's dynamic table: encode order MUST equal
+        # wire order, so the encode happens under the same lock as the write (as
+        # httpunk's own connection keeps its encoder under the pending buffer's mutex).
+        # Two responders encoding outside the lock and writing in the other order hand
+        # the peer a HEADERS that indexes a table entry it has not received yet
+        # (`Hpack(InvalidTableIndex)`, a connection error).
+        async with self._slock:
+            await self._stream.send_all(self._codec.serialize_response_headers(sid, status, headers))
+
     async def send_response(self, sid, body, *, status=200, chunk=16384):
-        await self._send(
-            self._codec.serialize_response_headers(sid, status, HeaderMap([("content-type", b"text/plain")]))
-        )
+        await self._send_headers(sid, status, HeaderMap([("content-type", b"text/plain")]))
         offset = 0
         while offset < len(body):
             while self._available(sid) <= 0:  # blocked on the peer's window
@@ -171,16 +180,21 @@ async def test_multiplexing_two_streams():
     async def responder(srv, sid):
         await srv.send_response(sid, f"stream-{sid}".encode())
 
-    results = {}
+    results, errors = {}, []
     async with scope() as s:
         s.spawn(server.serve(responder, s))
         async with open_h2(host, port) as conn:
             done = [Event(), Event()]
 
             async def fetch(i, path):
-                resp = await conn.request("GET", path)
-                results[path] = (resp.status, await resp.read())
-                done[i].set()
+                try:
+                    resp = await conn.request("GET", path)
+                    results[path] = (resp.status, await resp.read())
+                except BaseException as exc:
+                    errors.append(exc)
+                    raise
+                finally:
+                    done[i].set()  # set on failure too: the waits below must not hang
 
             async with scope() as reqs:
                 reqs.spawn(fetch(0, "/a"))
@@ -190,6 +204,7 @@ async def test_multiplexing_two_streams():
                 reqs.cancel()
         s.cancel()
 
+    assert not errors, errors
     # Two concurrent streams on one connection; the client assigns ids 1 and 3
     # (odd, increasing), but which path lands on which id is a scheduling race.
     assert set(results.values()) == {(200, b"stream-1"), (200, b"stream-3")}
@@ -212,16 +227,21 @@ async def test_max_concurrent_streams_gating():
             gating_held.append(set(srv.headers_seen) == {1})
         await srv.send_response(sid, f"stream-{sid}".encode())
 
-    results = {}
+    results, errors = {}, []
     async with scope() as s:
         s.spawn(server.serve(responder, s))
         async with open_h2(host, port) as conn:
             done = [Event(), Event()]
 
             async def fetch(i, path):
-                resp = await conn.request("GET", path)
-                results[path] = await resp.read()
-                done[i].set()
+                try:
+                    resp = await conn.request("GET", path)
+                    results[path] = await resp.read()
+                except BaseException as exc:
+                    errors.append(exc)
+                    raise
+                finally:
+                    done[i].set()  # set on failure too: the waits below must not hang
 
             async with scope() as reqs:
                 reqs.spawn(fetch(0, "/a"))
@@ -231,6 +251,7 @@ async def test_max_concurrent_streams_gating():
                 reqs.cancel()
         s.cancel()
 
+    assert not errors, errors
     assert set(results.values()) == {b"stream-1", b"stream-3"}
     # While stream 1 was still open, the client never opened stream 3.
     assert gating_held == [True]
@@ -503,3 +524,118 @@ async def test_data_frame_budget_resolve():
         max_send_buf_size=1,
     )
     assert tiny.data_frame_budget_available == _DATA_FRAME_BUDGET
+
+
+# ----- background request-body writers (hyper client.rs `poll_pipe` / `conn_drop_ref`) -----
+
+
+class _SpyBackend(TonioBackend):
+    """Counts the bare tasks the driver spawns: two for the pumps at `_begin`, plus
+    one per request-body writer that had to leave `send_request`."""
+
+    def __init__(self):
+        super().__init__()
+        self.spawned = 0
+
+    def spawn_without_results(self, *coros):
+        self.spawned += 1
+        return TonioBackend.spawn_without_results(*coros)
+
+
+async def _flow_blocked_peer(listener, *, on_first_data, seen):
+    """A raw h2c peer advertising a 5-byte stream window: the client queues 5 bytes of
+    its body inline and parks the rest. `on_first_data(codec, sid)` decides what the
+    peer sends back; `seen` collects the request body until END_STREAM."""
+    stream = await listener.accept()
+    codec = H2Codec("server")
+    await stream.send_all(codec.serialize_settings(initial_window_size=5))
+    raw = b""
+    while len(raw) < len(PREFACE):
+        raw += await stream.receive_some(65536)
+    data, first = raw[len(PREFACE) :], True
+    while True:
+        for f in codec.receive(data):
+            if isinstance(f, Settings) and not f.ack:
+                await stream.send_all(codec.serialize_settings_ack())
+            elif isinstance(f, Data):
+                seen.append(f.data)
+                if first:
+                    first = False
+                    await stream.send_all(on_first_data(codec, f.stream_id))
+                if f.end_stream:
+                    await stream.send_all(codec.serialize_response_headers(f.stream_id, 200, end_stream=True))
+        data = await stream.receive_some(65536)
+        if not data:
+            break
+
+
+@pytest.mark.tonio
+async def test_buffered_request_body_is_queued_inline():
+    """hyper `poll_pipe` polls the pipe once inline and only executes it if pending:
+    a bytes body the windows take whole is queued by `send_request` itself — no
+    background writer exists, only the two pump tasks."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    server = _Server(listener)
+    spy = _SpyBackend()
+
+    async def responder(srv, sid):
+        await srv.send_response(sid, srv.req_bodies.get(sid, b""))
+
+    async with scope() as s:
+        s.spawn(server.serve(responder, s))
+        async with open_h2(host, port, backend=spy) as conn:
+            r = await conn.request("POST", "/bytes", body=b"a fixed body")
+            assert await r.read() == b"a fixed body"
+            assert spy.spawned == 2  # the read pump and the write pump, nothing else
+        s.cancel()
+
+
+@pytest.mark.tonio
+async def test_flow_blocked_request_body_resumes_in_a_background_writer():
+    """The inline attempt queues the 5-byte window and the remainder goes to ONE bare
+    writer, which resumes at the right offset on WINDOW_UPDATE and ends on its own:
+    afterwards the connection has no writer to wait for."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    spy, seen = _SpyBackend(), []
+
+    def open_window(codec, sid):
+        return codec.serialize_window_update(sid, 100)
+
+    async with scope() as s:
+        s.spawn(_flow_blocked_peer(listener, on_first_data=open_window, seen=seen))
+        async with open_h2(host, port, backend=spy) as conn:
+            r = await conn.request("POST", "/x", body=bytes(range(50)))
+            assert await r.read() == b""
+        s.cancel()
+
+    assert b"".join(seen) == bytes(range(50))
+    assert seen[0] == bytes(range(5))  # the inline attempt: exactly the advertised window
+    assert spy.spawned == 3  # pumps + the one writer
+    assert conn._conn.release_writers()  # it ended by itself; close() had nothing to wait for
+
+
+@pytest.mark.tonio
+async def test_close_waits_for_a_flow_blocked_writer():
+    """The peer answers the first DATA and never opens the window: `send_request`
+    returns while the writer is parked on flow control. `close()` never cancels it
+    (hyper's pipes are untracked): the connection's failure wakes it, it exits, and
+    close() returns only after the last writer released its ref (`conn_drop_ref`)."""
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    spy, seen = _SpyBackend(), []
+
+    def answer_early(codec, sid):
+        return codec.serialize_response_headers(sid, 200, end_stream=True)
+
+    async with scope() as s:
+        s.spawn(_flow_blocked_peer(listener, on_first_data=answer_early, seen=seen))
+        async with open_h2(host, port, backend=spy) as conn:
+            r = await conn.request("POST", "/x", body=bytes(50))
+            assert r.status == 200
+            assert spy.spawned == 3  # the writer is alive, parked on window_evt
+        s.cancel()
+
+    assert seen == [bytes(5)]  # nothing past the window ever went out
+    assert conn._conn.release_writers()  # the drain completed before close() returned

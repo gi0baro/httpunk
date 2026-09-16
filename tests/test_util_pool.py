@@ -4,6 +4,8 @@ and `Map` routes destinations to lazily-built per-key inner pools. The pool owns
 connection's enter/close lifecycle; the connector hands back an un-entered connection.
 """
 
+import errno
+
 import pytest
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
@@ -19,6 +21,25 @@ async def _listener():
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     return listener, host, port
+
+
+async def _accept_loop(listener, s, serve, accepts=None):
+    """Accept until the listener is closed — the test body's `finally` closes it BEFORE
+    `s.cancel()`, and a parked accept ends on the closed fd (EBADF). Never leave the
+    loop to the cancel alone: a cancel landing on a loop that was woken by a connection
+    and has not re-parked yet is delivered only at its next suspension, and after the
+    runtime starts tearing down (every still-open fd is shut down, `accept` answers
+    EAGAIN forever) that loop has none — it spins, and the runtime waits on it."""
+    while True:
+        try:
+            transport = await listener.accept()
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                return  # the listener was closed: the orderly end
+            raise
+        if accepts is not None:
+            accepts["n"] += 1
+        s.spawn(serve(transport))
 
 
 @pytest.mark.tonio
@@ -38,34 +59,29 @@ async def test_singleton_coalesces_concurrent_gets_into_one_connection():
                 await req.respond(200, body=b"ok")
 
     async with scope() as s:
+        s.spawn(_accept_loop(listener, s, serve, accepts))
+        try:
+            # Two concurrent gets: one drives the connect, the other coalesces onto it.
+            got = {}
 
-        async def accept_loop():
-            while True:
-                transport = await listener.accept()
-                accepts["n"] += 1
-                s.spawn(serve(transport))
+            async def get(i):
+                got[i] = await pool.get()
 
-        s.spawn(accept_loop())
+            async with scope() as gs:
+                gs.spawn(get(1))
+                gs.spawn(get(2))
 
-        # Two concurrent gets: one drives the connect, the other coalesces onto it.
-        got = {}
+            assert got[1] is got[2]  # same shared connection
+            resp = await got[1].request("GET", "/")
+            assert await resp.read() == b"ok"
+            assert accepts["n"] == 1  # only one connection was ever made
+            assert not pool.is_empty()
 
-        async def get(i):
-            got[i] = await pool.get()
-
-        async with scope() as gs:
-            gs.spawn(get(1))
-            gs.spawn(get(2))
-
-        assert got[1] is got[2]  # same shared connection
-        resp = await got[1].request("GET", "/")
-        assert await resp.read() == b"ok"
-        assert accepts["n"] == 1  # only one connection was ever made
-        assert not pool.is_empty()
-
-        await pool.aclose()
-        assert pool.is_empty()
-        s.cancel()
+            await pool.aclose()
+            assert pool.is_empty()
+        finally:
+            listener.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -84,19 +100,17 @@ async def test_singleton_retain_drops_connection_when_predicate_false():
                 await req.respond(200, body=b"ok")
 
     async with scope() as s:
-
-        async def accept_loop():
-            while True:
-                s.spawn(serve(await listener.accept()))
-
-        s.spawn(accept_loop())
-        await pool.get()
-        assert not pool.is_empty()
-        await pool.retain(lambda _conn: True)  # keep
-        assert not pool.is_empty()
-        await pool.retain(lambda _conn: False)  # evict
-        assert pool.is_empty()
-        s.cancel()
+        s.spawn(_accept_loop(listener, s, serve))
+        try:
+            await pool.get()
+            assert not pool.is_empty()
+            await pool.retain(lambda _conn: True)  # keep
+            assert not pool.is_empty()
+            await pool.retain(lambda _conn: False)  # evict
+            assert pool.is_empty()
+        finally:
+            listener.close()
+            s.cancel()
 
 
 class _StubConn:
@@ -156,29 +170,24 @@ async def test_cache_reuses_idle_connection():
                 await req.respond(200, body=b"ok")
 
     async with scope() as s:
+        s.spawn(_accept_loop(listener, s, serve, accepts))
+        try:
+            async with cache.checkout() as c1:
+                resp = await c1.request("GET", "/", headers={"host": host})
+                assert await resp.read() == b"ok"
+            async with cache.checkout() as c2:
+                resp = await c2.request("GET", "/", headers={"host": host})
+                assert await resp.read() == b"ok"
 
-        async def accept_loop():
-            while True:
-                transport = await listener.accept()
-                accepts["n"] += 1
-                s.spawn(serve(transport))
+            assert c1 is c2  # the second checkout reused the idle connection
+            assert accepts["n"] == 1  # so only one TCP connection was ever opened
+            assert not cache.is_empty()
 
-        s.spawn(accept_loop())
-
-        async with cache.checkout() as c1:
-            resp = await c1.request("GET", "/", headers={"host": host})
-            assert await resp.read() == b"ok"
-        async with cache.checkout() as c2:
-            resp = await c2.request("GET", "/", headers={"host": host})
-            assert await resp.read() == b"ok"
-
-        assert c1 is c2  # the second checkout reused the idle connection
-        assert accepts["n"] == 1  # so only one TCP connection was ever opened
-        assert not cache.is_empty()
-
-        await cache.aclose()
-        assert cache.is_empty()
-        s.cancel()
+            await cache.aclose()
+            assert cache.is_empty()
+        finally:
+            listener.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -198,18 +207,15 @@ async def test_cache_closes_connection_on_exception_instead_of_reusing():
                 await req.respond(200, body=b"ok")
 
     async with scope() as s:
-
-        async def accept_loop():
-            while True:
-                s.spawn(serve(await listener.accept()))
-
-        s.spawn(accept_loop())
-
-        with pytest.raises(RuntimeError):
-            async with cache.checkout():
-                raise RuntimeError("boom")  # error during use -> connection closed, not reused
-        assert cache.is_empty()
-        s.cancel()
+        s.spawn(_accept_loop(listener, s, serve))
+        try:
+            with pytest.raises(RuntimeError):
+                async with cache.checkout():
+                    raise RuntimeError("boom")  # error during use -> connection closed, not reused
+            assert cache.is_empty()
+        finally:
+            listener.close()
+            s.cancel()
 
 
 @pytest.mark.tonio

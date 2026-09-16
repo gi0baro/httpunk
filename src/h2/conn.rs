@@ -311,6 +311,12 @@ struct Inner {
     /// Bare task handles (`spawn_without_results`), taken exactly once by `close()`.
     read_handle: Option<Py<PyAny>>,
     pump_handle: Option<Py<PyAny>>,
+    /// Client: background request-body writers alive (hyper client.rs: each
+    /// `PipeToSendStream` handed to the executor holds a `conn_drop_ref` clone, and
+    /// the connection task ends only after the last one is dropped). `draining`:
+    /// `close()` has asked for that end (`release_writers`).
+    writers: usize,
+    draining: bool,
 
     streams: HashMap<u32, StreamEntry>,
     /// Streams opened and not yet closed (h2 counts.rs `num_recv_streams` /
@@ -964,6 +970,8 @@ impl H2Streams {
                 inflight_credit: Vec::new(),
                 read_handle: None,
                 pump_handle: None,
+                writers: 0,
+                draining: false,
                 streams: HashMap::new(),
                 num_active: 0,
                 reset_streams: HashMap::new(),
@@ -1080,6 +1088,38 @@ impl H2Streams {
 
     fn take_pump_handle(&self) -> Option<Py<PyAny>> {
         self.lock().pump_handle.take()
+    }
+
+    // ----- background request-body writers (hyper client.rs `conn_drop_ref`) -----
+
+    /// A body writer is about to be spawned: count it (`True`), or refuse (`False`)
+    /// once the connection has failed or `close()` is draining — its stream is
+    /// stopped already, there is nothing left to write. The alive check and the
+    /// increment are one step: a writer that `close()` did not see cannot start after
+    /// `release_writers` reported none.
+    fn writer_start(&self) -> bool {
+        let mut me = self.lock();
+        if me.error.is_some() || me.draining {
+            return false;
+        }
+        me.writers += 1;
+        true
+    }
+
+    /// A body writer finished (its `finally`). `True` when it was the last one and
+    /// `close()` is waiting: the caller sets the drain event.
+    fn writer_end(&self) -> bool {
+        let mut me = self.lock();
+        me.writers -= 1;
+        me.writers == 0 && me.draining
+    }
+
+    /// `close()`: no writer may start from now on; `True` when none is alive (nothing
+    /// to wait for), else the last `writer_end` sets the drain event.
+    fn release_writers(&self) -> bool {
+        let mut me = self.lock();
+        me.draining = true;
+        me.writers == 0
     }
 
     // ===== inbound (h2 proto/connection.rs recv_frame -> streams.rs recv_*) =====
