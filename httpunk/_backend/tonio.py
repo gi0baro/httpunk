@@ -7,8 +7,8 @@ across coroutines — so a future asyncio/trio backend is a drop-in replacement.
 
 import ssl as _ssl
 
-from tonio import colored as _colored
-from tonio._net._tls import _is_eof  # private: the TLS clean-EOF test `TLSStream.receive_some` applies
+from tonio import Waiter as _Waiter, colored as _colored
+from tonio._tonio import get_runtime as _get_runtime  # private: the runtime's µs clock (`_clock`), see `bounded_reader`
 from tonio.colored.net import SocketStream as _SocketStream, open_tcp_stream as _open_tcp_stream
 from tonio.colored.net.tls import TLSStream as _TLSStream, open_tls_over_tcp_stream as _open_tls_over_tcp_stream
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
@@ -100,140 +100,114 @@ class TonioBackend:
         return tls, tls._ssl.selected_alpn_protocol()
 
     def receive_nowait(self, transport, max_bytes=65536):
-        """A synchronous, non-blocking read: whatever bytes are immediately
-        available without suspending, `b""` at EOF, or `None` if nothing is ready
-        right now. The readiness primitive hyper's server drain (`poll_read_body`
-        inside `poll_drain_or_close_read`) relies on. EOF and not-ready are distinct.
+        """A synchronous, non-blocking read: whatever bytes are immediately available
+        without suspending, `b""` at EOF, or `None` if nothing is ready right now. The
+        readiness primitive hyper's server drain (`poll_read_body` inside
+        `poll_drain_or_close_read`) relies on. EOF and not-ready are distinct.
 
-        - **Plain socket**: tonio's sockets are non-blocking under the hood (its own
-          `recv` does exactly this `_sock.recv` inline before ever suspending), so
-          we read the raw socket directly rather than route through the timer-backed
-          `timeout(..., 0)`, which cannot express an instantaneous peek.
-        - **TLS (`TLSStream`)**: the raw socket carries *ciphertext*, so reading it
-          would bypass decryption (and a `TLSStream` has no `.socket` anyway). The
-          non-blocking-plaintext equivalent is the SSLObject's already-decrypted
-          buffer: `pending()` bytes can be `read()` without touching the BIO/socket.
-          tonio's `_SSLProxy` serialises EVERY use of its `SSLObject` — the parked
-          reader's `_read` included — under one `threading.Lock`; the peek takes that
-          same lock (private API, tonio and httpunk share an author) so its
-          pending-then-read is ONE step against a reader decrypting on another thread,
-          never a `read()` of bytes the reader just consumed.
-          (Necessarily conservative — tonio exposes no non-blocking "decrypt more",
-          so unread ciphertext on the socket reads as "nothing ready"; the drain
-          then closes rather than reuses, which matches hyper's cheap-drain-or-close.
-          EOF is never reported for TLS either — it is only knowable by decrypting.)
-        - A peek beside a parked plain-socket reader is safe: both are one `recv`
-          syscall on the same non-blocking socket, the bytes go to exactly one of
-          them, and the loser's `EAGAIN` sends it back to waiting (tonio `recv`)."""
-        if isinstance(transport, _TLSStream):  # peek only already-decrypted plaintext
-            ssl_obj = transport._ssl
-            with ssl_obj._lock:  # tonio `_SSLProxy._lock`: the SSLObject's one lock
-                pending = ssl_obj._inner.pending()
-                return ssl_obj._inner.read(min(max_bytes, pending)) if pending else None
-        try:
-            return transport.socket._sock.recv(max_bytes)  # b"" only at EOF
-        except (BlockingIOError, InterruptedError):
-            return None
+        tonio's own no-wait read on both streams (`receive_some_nowait`: `NotReady` is
+        this seam's `None`). On a plain socket it is one `recv` (EAGAIN clears the
+        readiness bits, as tonio's `recv` does). Over TLS it decrypts what the socket
+        already holds — feeds the ingress BIO without suspending — the way hyper's read
+        over rustls does, so the server's drain finds a small unread body instead of
+        closing; a close_notify already in the socket is `b""`, an abrupt close raises
+        `ResourceBroken` (a `broken_transport_errors` shape, like the plain socket's
+        `ConnectionResetError`). Beside a parked reader: on a plain socket both are one
+        `recv` on the same non-blocking socket and the bytes go to exactly one of them;
+        over TLS the parked reader holds the receive lock, so the peek answers `None`
+        whatever the socket holds — hyper's `require_empty_read` looks at its `read_buf`
+        the same way, and ciphertext not yet decrypted is invisible to it too."""
+        data = transport.receive_some_nowait(max_bytes)
+        return None if data is transport.NotReady else data
 
     def bounded_reader(self, transport):
         """Chosen ONCE per connection: how `transport`'s reads are bounded by a deadline —
         the h1 server's head-read deadline (hyper `header_read_timeout`) riding the read
         itself, so no task is spawned per head and no parked read is ever cancelled.
         Returns `async read(max_bytes, deadline) -> bytes | b"" (EOF) | None (expired)`;
-        `deadline` is an instant on this backend's `monotonic` clock. The transport's kind
-        is fixed for the connection's life, so the dispatch happens here, never per read,
-        and the plain-socket reader is one coroutine over bound methods resolved here —
-        the cost of tonio's own `receive_some`, plus one arm on the (cold) timer path.
+        `deadline` is an instant on this backend's `monotonic` clock (seconds, the seam's
+        unit). The transport's kind is fixed for the connection's life, so the dispatch
+        happens here, never per read, over bound methods resolved here.
+
+        Both readers are tonio's own `wait_readable(timeout)` loop inlined over the
+        stream's no-wait read and its readiness waiter — the same primitives, without the
+        coroutine frame per park and without the seconds -> µs -> seconds round trip: the
+        deadline is converted once per read, and each park compares it with the runtime's
+        µs clock (`_clock`, read off the runtime cached at bind time rather than through
+        `get_runtime()` on every pass; private API — tonio and httpunk share an author).
 
         Bytes first, hyper's order (`poll_read_head`: `parse` -> `poll_read`, and the timer
-        is polled only once that returned Pending): every pass tries the syscall before it
-        looks at the clock, and a wake that finds bytes returns them, whatever the timer did.
+        is polled only once that returned Pending): every pass tries the read before it
+        looks at the clock, so a wake that finds bytes returns them, whatever the timer
+        did. The readiness bits are stale-set after any successful read (nothing but a
+        failed syscall clears them), exactly as tokio's readiness word is when hyper's
+        `poll_read` runs, so both pay one `EAGAIN` probe per head; only on `NotReady`
+        (which cleared the bits) is the remaining time computed. Past the deadline that is
+        the answer at once — hyper's Pending followed by a ready timer poll
+        (`new_header_timeout`) — and no zero-length timer is ever armed. Otherwise the
+        waiter puts the readiness wait and the timer on ONE suspension, and after the wake
+        the readiness question is asked BEFORE the next read: `None` = the bits are set
+        (read now), a waiter = none are, so the timer fired (a stale reader slot, overwritten
+        by the next arm, harmless by tonio's contract). That question is not optional: the
+        socket's `_io_clear_r` is tick-guarded — it clears the bits only if no readiness
+        edge landed since an arm last SAW them set — so a wake followed straight by a read
+        leaves the edge unobserved, the next head's `EAGAIN` clear is ignored, and that head
+        pays a second syscall (measured: 3 reads and 2 arms per request instead of 2 and 1).
+        Every arm is computed from the absolute deadline, so a wake that finds nothing to
+        read re-arms for what is left.
 
-        - **Plain socket**: the syscall comes first — the readiness bits are stale-set after
-          any successful read (nothing but a failed syscall clears them), exactly as tokio's
-          readiness word is when hyper's `poll_read` runs, so both pay one `EAGAIN` probe
-          per head; only on `EAGAIN` (`clear_r`, as tonio's own `recv`) is the remaining time
-          computed. Past the deadline that is the answer at once: hyper's Pending followed
-          by a ready timer poll (`new_header_timeout`) — no zero-length timer is ever
-          armed. Otherwise the socket's own arm (`_io_arm_r(timeout)`) puts the readiness
-          wait and the timer on ONE suspension (a `Waiter` with a timer). Both wakes resume
-          with `None`; the readiness word tells them apart: a readiness wake set bits
-          before waking (`set_readiness` precedes `wake`), a timer wake set none — so a
-          bare `_io_arm_r()` after the wake asks "readable?": `None` = bits set (read now),
-          a waiter = the timer fired. That waiter is never awaited: a stale reader slot,
-          overwritten by the next arm, harmless by tonio's contract. One reader per socket,
-          and `clear_r` runs only on this reader's failed syscall, so nothing consumes the
-          bits in between. Every arm is computed from the absolute deadline, so a spurious
-          readiness wake (`EAGAIN` after a wake) re-arms for the remaining time.
-        - **TLS (`TLSStream`)**: `TLSStream.receive_some` is `_ssl_dance(_read)` with
-          `_recv` feeding the ingress BIO from the raw socket; this is that dance with the
-          raw read bounded (private API — tonio and httpunk share an author; keep in step
-          with `tonio/_colored/_net/_tls.py`).
+        - **Plain socket**: `waiter_readable(µs)` is the socket's own arm: `None` when the
+          bits landed between the probe and the arm (read now), else the waiter; bare, it
+          is the readiness question.
+        - **TLS (`TLSStream`)**: `watch_readable()` holds the receive lock across the arm
+          and the park (as tonio's `wait_readable` does); its waiter is `None` when
+          plaintext is already decoded, the raw socket's arm otherwise, and the lock's own
+          hand-off when a parked reader holds it; `ready()` is the question (plaintext
+          pending, or the socket's bare arm). A "not ready" wake loops back to the clock
+          rather than returning: after a lock hand-off nothing was armed, so it is not a
+          verdict there (that hand-off never happens in httpunk — one reader per connection
+          — but the loop stays exact). `receive_some_nowait` decrypts.
         A transport is one of tonio's two streams — a `TLSStream` or a `SocketStream` —
         and nothing else; anything else fails here, at setup, not on a read."""
+        runtime = _get_runtime()  # one runtime per process, bound once per connection
         if isinstance(transport, _TLSStream):
-            return self._tls_bounded_reader(transport)
-        return self._socket_bounded_reader(transport.socket)
+            return self._tls_bounded_reader(transport, runtime)
+        return self._socket_bounded_reader(transport, runtime)
 
     @staticmethod
-    def _socket_bounded_reader(sock):
-        arm, clear, recv = sock._io_arm_r, sock._io_clear_r, sock._sock.recv
+    def _socket_bounded_reader(stream, runtime):
+        nowait, arm, not_ready = stream.receive_some_nowait, stream.waiter_readable, stream.NotReady
 
         async def read(max_bytes, deadline):
-            while True:
-                try:
-                    return recv(max_bytes)  # bytes first: hyper's `poll_read` before its timer poll
-                except InterruptedError:
-                    continue
-                except BlockingIOError:
-                    clear()  # EAGAIN: the bits were stale (or a spurious wake) — now the timer
-                micros = round((deadline - _now()) * 1_000_000)
-                if micros <= 0:
+            deadline_micros = int(deadline * 1_000_000)  # the seam's seconds -> the runtime clock's µs, once per read
+            while (data := nowait(max_bytes)) is not_ready:  # bytes first; EAGAIN clears the bits
+                remaining = deadline_micros - runtime._clock
+                if remaining <= 0:
                     return None  # nothing readable and the deadline passed: hyper's timer poll is ready
-                waiter = arm(micros)
-                if waiter is None:
-                    continue  # bits landed between the EAGAIN and the arm: read now
-                await waiter
-                if arm() is not None:  # no readiness bits: the timer woke us
-                    return None
+                if (waiter := arm(remaining)) is not None:  # None: bits landed between the probe and the arm
+                    await waiter
+                    if arm() is not None:  # the readiness question: no bits = the timer woke us
+                        return None
+            return data
 
         return read
 
     @staticmethod
-    def _tls_bounded_reader(stream):
-        ssl_obj = stream._ssl
-        raw_read = TonioBackend._socket_bounded_reader(stream.transport.socket)
+    def _tls_bounded_reader(stream, runtime):
+        nowait, watch, not_ready = stream.receive_some_nowait, stream.watch_readable, stream.NotReady
 
         async def read(max_bytes, deadline):
-            stream._check_ready()
-            try:
-                while True:
-                    try:
-                        ret, want_read, to_send = ssl_obj._read(max_bytes)
-                    except (_ssl.SSLError, _ssl.CertificateError) as exc:
-                        stream._set_broken()
-                        raise ResourceBroken from exc
-                    if to_send:
-                        await stream._send(to_send)
-                    elif want_read:
-                        recv_count = stream._recv_count
-                        async with stream._lock_recv:
-                            if recv_count == stream._recv_count:  # nobody fed the BIO meanwhile
-                                data = await raw_read(65536, deadline)
-                                if data is None:
-                                    return None
-                                if not data:
-                                    ssl_obj._ingress_write_eof()
-                                else:
-                                    stream._recv_est_size = max(stream._recv_est_size, len(data))
-                                    ssl_obj._ingress_write(data)
-                                stream._recv_count += 1
-                    if not want_read:
-                        return ret
-            except ResourceBroken as exc:
-                if stream._compat_https and _is_eof(exc.__cause__):
-                    return b""
-                raise
+            deadline_micros = int(deadline * 1_000_000)
+            while (data := nowait(max_bytes)) is not_ready:
+                remaining = deadline_micros - runtime._clock
+                if remaining <= 0:
+                    return None
+                with watch() as watcher:  # the receive lock is held across the park, as tonio's own wait
+                    if (waiter := watcher.waiter(remaining)) is not None:
+                        await waiter
+                        if not watcher.ready():  # the readiness question: nothing readable, back to the clock
+                            continue
+            return data
 
         return read
 
@@ -294,6 +268,12 @@ class TonioBackend:
     spawn_without_results = staticmethod(_colored.spawn.without_results)
 
     select = staticmethod(_colored.select)
+    # `await select_events(*events)`: resume once ANY of the events is set — ONE suspension
+    # of the calling task (tonio's merged waiter), no wrapper tasks, no scope, nothing to
+    # cancel; returns no verdict, the caller reads the events' flags. The race of "pump
+    # done" against "peer gone" in `_send_async_body` (h1 and h2): hyper's
+    # `PipeToSendStream` polling `poll_reset` beside the body future, in one task.
+    select_events = staticmethod(_Waiter.any)
     scope = staticmethod(_colored.scope)
     lock = _Lock
     event = _colored.Event

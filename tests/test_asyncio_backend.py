@@ -247,6 +247,46 @@ async def test_select_cancels_racers_when_itself_cancelled():
 
 
 @pytest.mark.asyncio
+async def test_select_events_resumes_on_either_event_without_a_verdict():
+    # One wait on both events (the `_send_async_body` race): resumes once ANY is set,
+    # at once when one already is, returns nothing — the flags are the answer.
+    backend = AsyncioBackend()
+    a, b = backend.event(), backend.event()
+    a.set()
+    assert await backend.select_events(a, b) is None
+    a, b = backend.event(), backend.event()
+    loop = asyncio.get_running_loop()
+    loop.call_soon(b.set)
+    await backend.select_events(a, b)
+    assert not a.is_set() and b.is_set()
+    b.clear()
+    loop.call_soon(b.set)  # the events are reusable after a clear
+    await backend.select_events(a, b)
+    assert b.is_set()
+
+
+@pytest.mark.asyncio
+async def test_select_events_leaves_no_waiter_behind():
+    # The loser's wait is cancelled and drained: no task is left parked on the event, and
+    # cancelling the wait itself drains both.
+    backend = AsyncioBackend()
+    a, b = backend.event(), backend.event()
+    before = len(asyncio.all_tasks())
+    asyncio.get_running_loop().call_soon(a.set)
+    await backend.select_events(a, b)
+    assert len(asyncio.all_tasks()) == before  # the loser's wait task is gone
+    a, b = backend.event(), backend.event()
+    sel = asyncio.ensure_future(backend.select_events(a, b))
+    for _ in range(3):
+        await asyncio.sleep(0)  # both waits parked
+    sel.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sel
+    await asyncio.sleep(0)
+    assert len(asyncio.all_tasks()) == before
+
+
+@pytest.mark.asyncio
 async def test_scope_spawn_cancel_and_join():
     backend = AsyncioBackend()
     ran = []

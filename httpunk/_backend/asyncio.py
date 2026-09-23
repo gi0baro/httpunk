@@ -445,6 +445,19 @@ class AsyncioBackend:
             await asyncio.gather(*losers, return_exceptions=True)
         return winner.result()
 
+    async def select_events(self, *events):
+        """Resume once ANY of `events` is set (see the tonio twin): one `asyncio.wait`
+        over the events' `wait()` futures, the losers cancelled and drained on the way
+        out — also when this wait is itself cancelled. No verdict: the caller reads the
+        events' flags."""
+        waits = [asyncio.ensure_future(e.wait()) for e in events]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+
     def queue(self):
         """An unbounded queue as `(sender, receiver)`: `sender.send(x)` is sync;
         `await receiver.receive()` yields items in order."""

@@ -191,7 +191,8 @@ async def test_h2_protocol_closes_after_client_goaway():
 
 @pytest.mark.asyncio
 async def test_h1_protocol_graceful_shutdown_releases_idle():
-    # h1 graceful releases the idle head-read (via backend.select) and closes; the
+    # h1 graceful closes the idle connection under its parked head-read (no race, no
+    # cancel: `graceful_shutdown()` shuts the transport down and the read ends); the
     # protocol's wait_closed() resolves once the connection has drained.
     server, host, port, protocols = await _serve(_EchoH1)
     backend = AsyncioBackend()

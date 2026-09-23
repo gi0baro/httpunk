@@ -276,7 +276,10 @@ class Connection(H1Framing, H1ClientState):
             # gets bytes delivered before the request treats them as the violation they
             # are — the watcher through the idle rules, since the exchange is not yet
             # active — so the outcome is the same either way; a plain-socket `recv` is
-            # one syscall. The TLS peek reads only already-decrypted plaintext.)
+            # one syscall. Over TLS the parked watcher holds the receive lock, so the peek
+            # sees nothing while it is parked: bytes still ciphertext in the socket reach
+            # the watcher's read instead — hyper's `read_buf` over rustls holds decrypted
+            # bytes only, and its next `poll_read_head` parses the rest as the response too.)
             transport = self.transport_ref()
             pending = self.backend.receive_nowait(transport, _READ_SIZE) if transport is not None else b""
             if pending:

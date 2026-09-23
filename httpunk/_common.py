@@ -44,16 +44,6 @@ async def read_all(aiter):
     return b"".join([chunk async for chunk in aiter])
 
 
-PUMP_DONE = object()  # sentinel: the async-body pump finished (`event_result`)
-PUMP_ABANDONED = object()  # sentinel: the peer abandoned the exchange first (`event_result`)
-
-
-async def event_result(evt, value):
-    """Await `evt`, then return `value` — a labelled racer for a one-shot `select`."""
-    await evt.wait()
-    return value
-
-
 async def aclose_body(body):
     """Deterministically close an async body once its pump is done with it — tonio
     finalizes nothing, so an async generator left unclosed never runs its cleanup."""

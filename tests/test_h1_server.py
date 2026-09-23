@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 from _client import open_h1
-from _transport import StubSocket
+from _transport import StubStream
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
@@ -70,7 +70,7 @@ async def _drain_all(transport, limit=65536):
     return buf
 
 
-class _StubTransport:
+class _StubTransport(StubStream):  # `StubStream`: the tonio stream surface the bounded reader binds
     """An in-memory transport preloaded with request bytes — drives `Connection`
     directly for cases that don't need a live peer (respond-order, auto-error)."""
 
@@ -78,7 +78,6 @@ class _StubTransport:
         self._data = data
         self.sent = b""
         self.closed = False
-        self.socket = StubSocket(self)  # the tonio seam's socket surface (the bounded reader)
 
     async def receive_some(self, max_bytes=65536):
         return self._recv_now(max_bytes)

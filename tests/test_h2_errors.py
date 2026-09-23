@@ -863,15 +863,16 @@ async def test_close_flushes_queued_frames_even_after_connection_error():
         s.spawn(server())
         async with open_h2(host, port) as conn:
             inner = conn._conn
-            real_set = inner._write_evt.set
-            inner._write_evt.set = lambda: None  # the pump can't wake: the frame stays queued
-            # A peer PING makes the state queue its PONG (same payload) — a queued frame.
-            [ping] = H2Codec("client").receive(H2Codec("server").serialize_ping(b"flushme!"))
-            inner._after(inner.recv_ping(ping))
-            inner._fail(ConnectionClosedError("simulated failure"))
-            # Restore the wake before `close()` runs: its stop signal must reach
-            # the pump, whose drain-then-exit is what flushes the queued frame.
-            inner._write_evt.set = real_set
+            # The pump swaps the pending buffer under the send lock (the ordering
+            # invariant): held here, the pump wakes but cannot take the frame, so it
+            # stays queued across the failure.
+            async with inner._send_lock:
+                # A peer PING makes the state queue its PONG (same payload) — a queued frame.
+                [ping] = H2Codec("client").receive(H2Codec("server").serialize_ping(b"flushme!"))
+                inner._after(inner.recv_ping(ping))
+                inner._fail(ConnectionClosedError("simulated failure"))
+            # Lock released before `close()` runs: its stop signal reaches the pump,
+            # whose drain-then-exit is what flushes the queued frame.
         # `__aexit__` -> `close()` must have written the queued PING before closing.
         while seen[-1:] != ["eof"]:
             await sleep(0)

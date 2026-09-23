@@ -25,7 +25,7 @@ crates/vendor-h2), paths relative to its `src/`.
 import contextlib
 
 from .. import _backend
-from .._common import PUMP_ABANDONED, PUMP_DONE, aclose_body, aiter_body, event_result
+from .._common import aclose_body, aiter_body
 from .._httpunk import (
     H2_FLAG_CAPACITY,
     H2_FLAG_CONN_DONE,
@@ -433,21 +433,22 @@ class H2ConnectionBase(H2Streams):
     async def _send_async_body(self, st, body, trailers):
         """Stream an ASYNC body and fail fast on a peer reset — hyper's `PipeToSendStream`
         (proto/h2/mod.rs), which polls `poll_reset` while it waits for the body's next
-        chunk. ONE pump task per response queues each chunk; this caller waits once for
-        "pump done" or "stream reset". On a reset the pump is CANCELLED (hyper dropping
-        the body future) at the app's own `await` or the flow-control wait — DATA is
-        queued for the write pump, never written by this task, so no write is
-        interrupted. The scope exit does not wait for a CANCELLED child to unwind, so
-        wait for the pump's own `done` (set in its `finally`, after the producer's
-        cleanup ran)."""
+        chunk — in ONE task. ONE pump task per response queues each chunk; this caller
+        waits ONCE, one suspension on both events (`select_events`: no racer tasks, no
+        scope to cancel), for "pump done" or "stream reset", and the flags afterwards
+        are the verdict. On a reset the pump is CANCELLED (hyper dropping the body
+        future) at the app's own `await` or the flow-control wait — DATA is queued for
+        the write pump, never written by this task, so no write is interrupted. The
+        scope exit does not wait for a CANCELLED child to unwind, so wait for the pump's
+        own `done` (set in its `finally`, after the producer's cleanup ran)."""
         backend = self.backend
         done, box = backend.event(), []
         abandoned = False
         async with backend.scope() as scope:
             scope.spawn(self._pump_async_body(st, body, trailers, done, box))
             try:
-                winner = await backend.select(event_result(done, PUMP_DONE), event_result(st.reset_evt, PUMP_ABANDONED))
-                abandoned = winner is PUMP_ABANDONED and not done.is_set()
+                await backend.select_events(done, st.reset_evt)
+                abandoned = not done.is_set()  # the wait ended, the pump did not: the reset did
             finally:
                 if not done.is_set():
                     scope.cancel()  # leave with the pump gone, whatever ended the wait

@@ -15,6 +15,7 @@ from tonio.exceptions import ResourceBroken
 
 from httpunk import H1Connection, H2Connection
 from httpunk._backend.tonio import TonioBackend
+from httpunk.h1 import H1Server
 from httpunk.util import auto, connect
 
 
@@ -186,6 +187,47 @@ async def test_bounded_reader_over_tls(ca):
         finally:
             backend.close_transport(client)
             backend.close_transport(server)
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_h1_server_drains_small_unread_body_over_tls(ca):
+    """hyper's `poll_drain_or_close_read` over rustls: its ONE non-blocking body read
+    decrypts what the socket already holds, so a small unread body is drained and the
+    connection reused. Head and body go as two TLS records in ONE TCP segment: the head
+    read (one record per `SSL_read`) always leaves the body's record undecoded, which a
+    plaintext-only peek would miss (and close); tonio's no-wait read decrypts it. Twin
+    of `test_h1_server::test_server_drains_unread_request_body_before_next`."""
+    listener = (await open_tls_over_tcp_listeners(0, _server_ctx(ca, ("http/1.1",)), host="127.0.0.1"))[0]
+    host, port = listener.transport.socket.getsockname()[:2]
+    backend = TonioBackend()
+
+    async def serve():
+        async with H1Server(await listener.accept()) as server:  # ONE connection is ever accepted
+            async for req in server:
+                await req.respond(200, body=b"ok")  # deliberately does NOT read the request body
+
+    async def _read_response(stream):
+        buf = b""
+        while not buf.endswith(b"\r\n\r\nok"):
+            chunk = await stream.receive_some(65536)
+            assert chunk, "the server closed the connection"
+            buf += chunk
+        return buf
+
+    async with scope() as s:
+        s.spawn(serve())
+        client, _ = await backend.connect_tls(host, port, ssl_context=_client_ctx(ca, ("http/1.1",)))
+        try:
+            head = f"POST /a HTTP/1.1\r\nhost: {host}:{port}\r\ncontent-length: 11\r\n\r\n".encode()
+            _, _, record1 = client._ssl._write(head)  # tonio `_SSLProxy`: one TLS record each
+            _, _, record2 = client._ssl._write(b"unread body")
+            await client.transport.send_all(record1 + record2)  # one segment on the raw socket
+            assert (await _read_response(client)).startswith(b"HTTP/1.1 200")
+            await client.send_all(f"GET /b HTTP/1.1\r\nhost: {host}:{port}\r\n\r\n".encode())  # reused
+            assert (await _read_response(client)).startswith(b"HTTP/1.1 200")
+        finally:
+            backend.close_transport(client)
             s.cancel()
 
 

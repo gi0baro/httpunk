@@ -38,7 +38,7 @@ from collections.abc import AsyncIterator, Awaitable
 from typing import TYPE_CHECKING, Any
 
 from .. import _backend
-from .._common import PUMP_ABANDONED, PUMP_DONE, BaseServer, aclose_body, event_result, read_all
+from .._common import BaseServer, aclose_body, read_all
 from .._httpunk import (
     H1_NEXT_CLOSE,
     H1_NEXT_DRAIN,
@@ -623,25 +623,26 @@ class ServerConnection(H1Framing, H1ServerState):
         connection (so `mid_message_detect_eof`) while the body's next chunk is pending,
         so a parked producer (SSE, long poll) does not hold a dead exchange. Same shape as
         the h2 driver's `_send_async_body`: ONE pump task per response; this caller waits
-        once for "pump done" or "peer closed". On the FIN the pump is CANCELLED (hyper
+        ONCE, one suspension on both events (`select_events`: hyper's `PipeToSendStream`
+        polls `poll_reset` beside the body future in one task — no racer tasks, no scope
+        to cancel; a `select` here measured 5 µs and a 100 ms p99 tail per response), and
+        the flags afterwards are the verdict. On the FIN the pump is CANCELLED (hyper
         drops the body future) at its suspension — the app's `await`, or, h1 having no
         write pump, possibly inside a chunk write: harmless, this connection is closed
         right below and a truncated body is what the client gets regardless (hyper:
         `IncompleteMessage`, io dropped). Also cancelled if this task is cancelled or
         unwinds: neither backend cancels scope children on a body exception, and joining
-        a parked pump would hang. (A per-chunk `select` measured 4-5x slower.)"""
+        a parked pump would hang. (A per-chunk wait measured 4-5x slower.)"""
         await self._arm_watcher(req)  # the FIN is consumable now: make sure a read is parked
         done, box = self.backend.event(), []
         abandoned = False
         async with self.backend.scope() as scope:
             scope.spawn(self._pump_async_body(body, trailers, done, box))
             try:
-                winner = await self.backend.select(
-                    event_result(done, PUMP_DONE), event_result(req._peer_closed_evt, PUMP_ABANDONED)
-                )
+                await self.backend.select_events(done, req._peer_closed_evt)
                 # The event also marks the window's close (`_close_window`), which cannot
                 # precede this response's own completion — the state's flag is the verdict.
-                abandoned = winner is PUMP_ABANDONED and self.peer_closed_flag(req._seq) and not done.is_set()
+                abandoned = not done.is_set() and self.peer_closed_flag(req._seq)
             finally:
                 if not done.is_set():
                     scope.cancel()  # leave with the pump gone, whatever ended the wait

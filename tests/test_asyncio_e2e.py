@@ -522,7 +522,7 @@ async def test_wrap_tls_handshake_failure_closes_the_socket(ca):
     assert len(ends) == 2 and not isinstance(ends[0], bytes)  # the origin's handshake failed, then its read ended
 
 
-# ----- graceful shutdown (teardown + the h1 read-race via backend.select) -----
+# ----- graceful shutdown (teardown + the h1 idle read closed under the parked read) -----
 
 
 @pytest.mark.asyncio
@@ -555,8 +555,9 @@ async def test_h1_graceful_releases_idle_connection():
         assert await resp.read() == b"ok"
         await served.wait()
         assert graceful.count() == 1
-        # The server is now idle, parked in next_request's head-read racing the
-        # shutdown event via backend.select; shutdown must release it and close.
+        # The server is now idle, parked in next_request's head-read; `graceful.watch`'s
+        # trigger task calls `graceful_shutdown()`, which closes the connection under that
+        # parked read (hyper `KA::Idle` -> `state.close()`): the read ends, the loop exits.
         await graceful.shutdown()
         assert graceful.count() == 0
         await conn.__aexit__(None, None, None)

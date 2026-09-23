@@ -7,7 +7,7 @@ server (the replayed preface / request line parses correctly).
 
 import pytest
 from _client import open_h1, open_h2
-from _transport import StubSocket
+from _transport import StubStream
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
@@ -17,7 +17,7 @@ from httpunk.h2.server import H2Server
 from httpunk.util import auto
 
 
-class _ScriptedTransport:
+class _ScriptedTransport(StubStream):  # `StubStream`: the tonio stream surface the bounded reader binds
     """Feeds a fixed byte script through `receive_some` (optionally one small slice
     at a time, to exercise partial-preface reads); records sends; tracks close."""
 
@@ -26,7 +26,6 @@ class _ScriptedTransport:
         self._chunk = chunk_size
         self.sent = bytearray()
         self.closed = False
-        self.socket = StubSocket(self)  # the tonio seam's socket surface (the bounded reader)
 
     async def receive_some(self, max_bytes=65536):
         return self._recv_now(max_bytes)

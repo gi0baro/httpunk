@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from _client import open_h1  # noqa: F401  (kept for symmetry; loopback uses raw connections)
-from _transport import StubSocket
+from _transport import StubStream
 from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
@@ -26,13 +26,12 @@ from httpunk.http import HeaderMap
 from httpunk.util import GracefulShutdown
 
 
-class _IdleTransport:
+class _IdleTransport(StubStream):  # `StubStream`: the tonio stream surface the bounded reader binds
     """A live-but-quiet transport: `receive_some` yields nothing, `close` is a no-op
     record. Used where the primitive must not depend on transport behavior."""
 
     def __init__(self):
         self.closed = False
-        self.socket = StubSocket(self)  # the tonio seam's socket surface (the bounded reader)
 
     async def receive_some(self, max_bytes=65536):
         return b""
