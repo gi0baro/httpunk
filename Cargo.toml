@@ -39,22 +39,19 @@ name = "_httpunk"
 crate-type = ["cdylib"]
 
 [features]
+mimalloc = ["dep:mimalloc"]
 # Never enabled. Exists only so the optional crates.io `h2`/`hyper` deps are
 # referenced (no "unused optional dependency"), keeping them in Cargo.lock for
 # advisory scanning while they stay uncompiled. See the dependency comments.
 _audit = ["dep:h2", "dep:hyper"]
 
 [dependencies]
-pyo3 = { version = "=0.29", features = ["extension-module", "generate-import-lib"] }
-# Used by the PyO3 layer (src/py): `http::HeaderMap` (the HeaderMap wrapper) and
-# `bytes` buffers in the codecs.
 bytes = "1"
 http = "1.1"
-# The vendored crates, as workspace members (own their crate roots → byte-identical
-# to upstream, and fmt/clippy-excludable via `cargo fmt -p _httpunk`).
+mimalloc = { version = "0.1.49", default-features = false, features = ["local_dynamic_tls"], optional = true }
+pyo3 = { version = "=0.29", features = ["extension-module", "generate-import-lib"] }
 vendor-h2 = { path = "crates/vendor-h2" }
 vendor-hyper = { path = "crates/vendor-hyper", features = ["client", "server", "http1"] }
-# Vendored hyper-util proxy matcher (pure sans-IO selection logic; `from_system` off).
 vendor-hyper-util = { path = "crates/vendor-hyper-util" }
 # NOT compiled: the crates.io `h2`/`hyper` — vendored into crates/vendor-*/ (see
 # THIRD-PARTY.md). Optional + gated behind the never-enabled `_audit` feature so
