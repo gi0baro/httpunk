@@ -1096,6 +1096,10 @@ pub const CLIENT_CONSTANTS: [(&str, u8); 5] = [
 ];
 
 struct ClientInner {
+    /// hyper's `Conn`: ONE codec per connection — its read buffer is the connection's
+    /// (`read_buf` persists across messages), the per-message state is the exchange's
+    /// (`reset` at each claim, `try_begin_exchange`).
+    codec: Py<H1Codec>,
     transport: Option<Py<PyAny>>,
     closed: bool,
     upgraded: bool,
@@ -1141,9 +1145,10 @@ impl H1ClientState {
 #[pymethods]
 impl H1ClientState {
     #[new]
-    fn new(transport: Py<PyAny>) -> Self {
+    fn new(codec: Py<H1Codec>, transport: Py<PyAny>) -> Self {
         H1ClientState {
             inner: Mutex::new(ClientInner {
+                codec,
                 transport: Some(transport),
                 closed: false,
                 upgraded: false,
@@ -1160,6 +1165,7 @@ impl H1ClientState {
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Ok(me) = self.inner.try_lock() {
+            visit.call(&me.codec)?;
             if let Some(t) = &me.transport {
                 visit.call(t)?;
             }
@@ -1196,6 +1202,13 @@ impl H1ClientState {
     }
 
     // ----- queries -----
+
+    /// The codec (one per connection, hyper's `Conn`): the driver keeps it for the
+    /// single-owner byte work (head encode / parse, body framing).
+    #[getter]
+    fn codec(&self, py: Python<'_>) -> Py<H1Codec> {
+        self.lock().codec.clone_ref(py)
+    }
 
     fn transport_ref(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.lock().transport.as_ref().map(|t| t.clone_ref(py))
@@ -1251,7 +1264,11 @@ impl H1ClientState {
     // ----- the single in-flight slot (hyper Conn::is_busy) -----
 
     /// Claim the connection for an exchange (`False`: busy — wait on the idle event
-    /// with the waiter idiom and retry).
+    /// with the waiter idiom and retry). The codec starts the next message in the
+    /// same step (its per-message state dropped, its read buffer kept — hyper's
+    /// `Conn` at `poll_msg`); state → codec, the documented lock order, as the
+    /// server's `begin_read`. Safe to share: the previous exchange's writer, the only
+    /// other holder, is torn down before the slot is released on every path.
     fn try_begin_exchange(&self) -> bool {
         let mut me = self.lock();
         if me.busy {
@@ -1260,6 +1277,7 @@ impl H1ClientState {
         me.busy = true;
         me.exchange_active = false;
         me.writer_finished = false;
+        me.codec.get().reset();
         true
     }
 

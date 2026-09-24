@@ -90,11 +90,15 @@ class Connection(H1Framing, H1ClientState):
     """
 
     def __new__(cls, transport, *, authority=None, backend=None):
-        return H1ClientState.__new__(cls, transport)
+        # ONE codec per connection (hyper's `Conn`), held by the state: its read buffer
+        # persists across exchanges, its per-message state is reset at each claim.
+        return H1ClientState.__new__(cls, H1Codec(), transport)
 
     def __init__(self, transport, *, authority=None, backend=None):
         self.backend = _backend.resolve(backend)
         self.authority = authority
+        self._codec = self.codec  # the one codec the state holds (hyper's `Conn`)
+        self._max_buf_size = self._codec.max_buf_size  # the coalescing cap (`_body_plan`)
         # Wakes the slot waiters when an exchange releases the connection (the waiter
         # idiom: try, clear, try again, wait).
         self._idle_evt = self.backend.event()
@@ -289,8 +293,8 @@ class Connection(H1Framing, H1ClientState):
             # never cancelled); the state redirects its completing read to the exchange,
             # whose `_read_head` joins it and takes the bytes as the response's first read.
             self.exchange_started()
-            codec = H1Codec()
-            content_length, chunked, _kind, coalesce = self._body_plan(body, codec.max_buf_size)
+            codec = self._codec  # started on the next message by the claim (`try_begin_exchange`)
+            content_length, chunked, _kind, coalesce = self._body_plan(body, self._max_buf_size)
             # A previous HTTP/1.0 response on this (reused) connection downgrades this
             # request to 1.0 and re-asserts keep-alive (hyper conn.rs L662-702); the codec
             # also allow-lists chunked trailers from the request's own `Trailer` header.

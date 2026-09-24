@@ -18,6 +18,8 @@ from httpunk import (
     HTTPunkError,
     Version,
 )
+from httpunk._backend.asyncio import AsyncioBackend
+from httpunk.h1.client import Connection
 
 
 async def _read_request(stream):
@@ -188,6 +190,22 @@ async def test_keep_alive_two_requests():
     # both requests arrived on the one connection
     assert requests[0][0].startswith(b"GET /a ")
     assert requests[1][0].startswith(b"GET /b ")
+
+
+def test_one_codec_per_connection_reset_at_each_claim():
+    """hyper's `Conn`: ONE codec per connection, held by the state — its per-message
+    state is dropped when an exchange claims the slot (`try_begin_exchange`), its read
+    buffer kept (hyper's `read_buf` persists across messages)."""
+    conn = Connection(object(), backend=AsyncioBackend())
+    codec = conn.codec
+    assert codec is conn._codec and conn.codec is codec  # the same object, for the connection's life
+    codec.serialize_request("GET", "/", HeaderMap({"connection": "close"}))
+    codec.feed(b"HTTP/1.1 ")  # bytes of the next message, already received
+    assert codec.request_connection_close and codec.buffered() == 9
+    assert conn.try_begin_exchange()  # the next exchange's claim starts the next message
+    assert conn.codec is codec
+    assert not codec.request_connection_close  # per-message state dropped...
+    assert codec.buffered() == 9  # ...the read buffer kept
 
 
 @pytest.mark.tonio
