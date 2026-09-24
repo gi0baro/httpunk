@@ -290,7 +290,7 @@ class Connection(H1Framing, H1ClientState):
             # whose `_read_head` joins it and takes the bytes as the response's first read.
             self.exchange_started()
             codec = H1Codec()
-            content_length, chunked = self._body_framing(body)
+            content_length, chunked, _kind, coalesce = self._body_plan(body, codec.max_buf_size)
             # A previous HTTP/1.0 response on this (reused) connection downgrades this
             # request to 1.0 and re-asserts keep-alive (hyper conn.rs L662-702); the codec
             # also allow-lists chunked trailers from the request's own `Trailer` header.
@@ -315,7 +315,7 @@ class Connection(H1Framing, H1ClientState):
             # The `request_unsent` boundary: this spawn is httpunk's analogue of
             # hyper's dispatcher taking the request off the channel (dispatch.rs
             # `poll_msg`). From here on a failure NEVER carries the marker.
-            scope.spawn(self._write_request(codec, head, body, write_error, trailers))
+            scope.spawn(self._write_request(codec, head, body, write_error, trailers, coalesce))
             refused = self.store_writer(scope)
             if refused is not None:
                 # Closed meanwhile (the idle watcher won the race for bytes/EOF that
@@ -382,14 +382,14 @@ class Connection(H1Framing, H1ClientState):
         exc.__cause__ = err
         return exc
 
-    async def _write_request(self, codec, head, body, write_error, trailers=None):
+    async def _write_request(self, codec, head, body, write_error, trailers, coalesce):
         # Write the head then the framed body. A write failure (e.g. the server
         # closed the read side after answering early) must not mask a response
         # that did arrive: record it so `_read_head` can still deliver the head,
         # and only surface it if no response is forthcoming. Cancellation
         # (BaseException) propagates so the scope can unwind cleanly.
         try:
-            await self._send_head_and_body(codec, head, body, trailers)
+            await self._send_head_and_body(codec, head, body, trailers, self.transport_ref(), coalesce)
             self.writer_done()
         except OSError as exc:
             # A TRANSPORT write failure (broken pipe / reset): the peer may have closed

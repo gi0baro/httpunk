@@ -435,6 +435,7 @@ async def test_server_shutdown_wins_over_buffered_pipelined_request():
     await conn.graceful_shutdown()
     assert await conn.next_request() is None  # /b is readable but must NOT be parsed...
     assert transport._buffered  # ...nor read: the bytes are still in the transport
+    await conn.close()  # ends the head-read deadline watchdog (no task left on the loop)
 
 
 class _AsyncioSilentStub(_StubTransport):
@@ -485,6 +486,7 @@ async def test_server_shutdown_closes_idle_connection_under_parked_read_asyncio(
     assert await reader is None
     assert len(transport.sent) == sent  # no response, no error on the wire
     assert conn.closed and not conn.reusable
+    await conn.close()  # ends the head-read deadline watchdog (no task left on the loop)
 
 
 @pytest.mark.tonio
@@ -1977,6 +1979,58 @@ async def test_bounded_reader_on_a_real_socket_times_out_then_keeps_reading():
             s.cancel()
 
 
+@pytest.mark.asyncio
+async def test_server_read_return_and_head_step_are_one_transition_each():
+    """`accept_head` is the read's return (hyper `poll_read_head`: the read that returned
+    is the one parsed): it ends the idle park and, on a connection closed under the read
+    (a shutdown while idle), parses NOTHING — the bytes belong to a request hyper drops.
+    `respond_head` hands back the transport taken under the claim's own lock."""
+    transport = _StubTransport(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n")
+    conn = ServerConnection(transport, backend=AsyncioBackend(), header_read_timeout=None)
+    req = await conn.next_request()
+    code, head, armed, t = conn.respond_head(req._seq, 200, None, asyncio.Event())
+    assert code == 0 and head.startswith(b"HTTP/1.1 200 OK\r\n") and not armed and t is transport
+    assert conn.finish_response(req._seq) == (False, False, None, None)
+    code, obj = conn.begin_read()  # positioned at the next head, the idle park flagged
+    assert obj is transport
+    assert await conn.graceful_shutdown() is None and transport.closed  # closed under the park
+    assert conn.accept_head(b"GET /b HTTP/1.1\r\nhost: x\r\n\r\n") is None  # nothing parsed
+    assert conn.current_seq == req._seq and conn.codec.buffered() == 0
+    assert await conn.next_request() is None
+    await conn.close()
+
+
+@pytest.mark.tonio
+async def test_server_head_read_overdue_is_one_state_step():
+    """The deadline watchdog's transition (`head_read_overdue`, hyper `poll_read_head`'s
+    Sleep beside a Pending `parse`), pinned without a clock: `timeout=0` = "now is the
+    deadline". No head being read (a request in flight): nothing to expire, no remaining.
+    A head read in progress — here a MID-head one, the partial head never completing —
+    expires: closed in the same step, the transport handed back, and the close ends the
+    parked read, which the reader maps to the end of iteration (hyper errors mid-head
+    too). Once closed: the watchdog's exit answer."""
+    transport = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n")
+    conn = ServerConnection(transport, header_read_timeout=30.0)
+    req = await conn.next_request()
+    assert conn.head_read_overdue(0.0) == (False, None, None)  # in flight: no head is being read
+    await req.respond(200)
+    results = []
+
+    async def reader():
+        results.append(await conn.next_request())
+
+    async with scope() as s:
+        s.spawn(reader())
+        await transport.parked.wait()  # the partial head of /b is read; the read for the rest is parked
+        expired, remaining, t = conn.head_read_overdue(0.0)
+        assert expired and remaining is None and t is transport  # closed here, the transport to close
+        assert conn.closed and not conn.reusable
+        conn._close(t)  # what the watchdog does: the close ends the parked mid-head read
+    assert results == [None]  # `next_request` -> None: no response, no error
+    assert conn.head_read_overdue(0.0) == (False, None, None)  # closed: the watchdog exits
+    await conn.close()
+
+
 @pytest.mark.tonio
 async def test_server_header_read_timeout_bounds_the_watcher_hand_off():
     """With the mid-message watcher armed (a push response), the next head read IS the
@@ -2042,11 +2096,13 @@ async def test_immediate_body_coalesces_with_the_head_up_to_the_codecs_buffer_ca
     await req.respond(200, body=body)
     assert len(transport.writes) == 1
     assert transport.writes[0].startswith(b"HTTP/1.1 200 OK\r\n") and transport.writes[0].endswith(body)
+    await conn.close()  # ends the head-read deadline watchdog (no task left on the loop)
 
     transport = _WriteLog(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
     conn = ServerConnection(transport, backend=AsyncioBackend(), max_buf_size=8192)
     req = await conn.next_request()
     await req.respond(200, body=body)
     assert len(transport.writes) == 2  # over the cap: the head first, the body as its own write
+    await conn.close()
     assert transport.writes[0].startswith(b"HTTP/1.1 200 OK\r\n") and transport.writes[0].endswith(b"\r\n\r\n")
     assert transport.writes[1] is body  # and the body is the caller's own object (item 1)

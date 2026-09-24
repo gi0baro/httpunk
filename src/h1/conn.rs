@@ -21,6 +21,7 @@
 //! deterministic `STALE` answer (§3.2 "Request identity").
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -166,6 +167,11 @@ struct Inner {
     shutdown_requested: bool,
     /// True only while parked in the idle between-requests read.
     idle_read_parked: bool,
+    /// hyper conn.rs `h1_header_read_timeout_running` + its `Sleep`'s start: the
+    /// instant of the first poll for the current head (`read_verdict`), cleared once a
+    /// head parses (`accept_head`). `None` = no head is being read. The deadline
+    /// watchdog (`ServerConnection._watch_head_deadline`) reads it in `head_read_overdue`.
+    head_read_since: Option<Instant>,
     watcher: Option<Watcher>,
     current: Current,
     next_seq: u64,
@@ -231,20 +237,26 @@ impl Inner {
         // partial head) — parse before touching the transport; a mid-head read is
         // never interruptible, so no park.
         if self.codec.get().buffered() > 0 {
+            self.head_read_since.get_or_insert_with(Instant::now);
             return (READ_PARSE, None);
         }
         if self.shutdown_requested {
             return (READ_SHUTDOWN, None);
         }
+        // hyper `poll_read_head`: the `header_read_timeout` Sleep starts at the FIRST poll
+        // for a head and is never reset by partial bytes — `get_or_insert_with`: a clock
+        // already running (a `begin_read` retried after a partial head) keeps its instant.
         if let Some(w) = &self.watcher {
             // The parked watcher's read IS the idle read (the hand-off: never a second
             // reader on the transport).
             self.idle_read_parked = true;
+            self.head_read_since.get_or_insert_with(Instant::now);
             return (READ_WATCHER, Some(w.done.clone_ref(py)));
         }
         match &self.transport {
             Some(t) => {
                 self.idle_read_parked = true;
+                self.head_read_since.get_or_insert_with(Instant::now);
                 (READ_TRANSPORT, Some(t.clone_ref(py)))
             }
             None => (READ_EOF, None), // a concurrent close: the connection is over
@@ -421,6 +433,7 @@ impl H1ServerState {
                 keep_alive_enabled: keep_alive,
                 shutdown_requested: false,
                 idle_read_parked: false,
+                head_read_since: None,
                 watcher: None,
                 current: Current::none(),
                 next_seq: 1,
@@ -586,12 +599,11 @@ impl H1ServerState {
         verdict
     }
 
-    /// The idle read (`READ_WATCHER` / `READ_TRANSPORT`) returned: a read that
-    /// completes is no longer interruptible. Right after the read, before the parse —
-    /// a head that keeps arriving over further reads must not be closed under by a
-    /// shutdown. Reports whether a `request_shutdown` closed the connection while the
-    /// read was parked: then whatever the read returned (an error from the closed
-    /// transport, or bytes that landed in the same instant) belongs to a request hyper
+    /// The idle read (`READ_WATCHER` / `READ_TRANSPORT`) ended WITHOUT bytes to parse
+    /// (an error, or EOF; a read that returned bytes ends its park in `accept_head`):
+    /// a read that completes is no longer interruptible. Reports whether the connection
+    /// was closed while the read was parked (`request_shutdown` while idle, the
+    /// head-read deadline): then whatever the read returned belongs to a request hyper
     /// drops too (`disable_keep_alive` on an idle connection: `state.close()`, whatever
     /// the kernel or `read_buf` holds).
     fn unpark_idle_read(&self) -> bool {
@@ -600,18 +612,26 @@ impl H1ServerState {
         me.closed
     }
 
-    /// Feed `data` to the head parser (hyper `Conn::read_head`: parse, remember the
-    /// method for the response, split the body bytes off) and, once a head is
+    /// The read returned `data`: end the idle park and feed the head parser (hyper
+    /// `poll_read_head`: the read that returned is the one parsed — one step), remember
+    /// the method for the response, split the body bytes off, and, once a head is
     /// complete, make it the current request in the same step: its body decoder is
     /// built and fed the bytes read alongside the head. Returns `(head, seq,
-    /// decoder)`, or `None` while the head is incomplete (read more). A parse
-    /// failure raises `H1ParseError` (the codec remembers the automatic status).
+    /// decoder)`, or `None` while the head is incomplete (read more). A connection
+    /// closed under the read (`request_shutdown` while idle, the head-read deadline)
+    /// parses NOTHING — whatever the read returned belongs to a request hyper drops
+    /// too — and answers `None`: the reader's next read finds the transport gone. A
+    /// parse failure raises `H1ParseError` (the codec remembers the automatic status).
     fn accept_head(
         &self,
         py: Python<'_>,
         data: &[u8],
     ) -> PyResult<Option<(Py<PyAny>, u64, Py<H1BodyDecoder>)>> {
         let mut me = self.lock();
+        me.idle_read_parked = false;
+        if me.closed {
+            return Ok(None);
+        }
         // state → codec.
         let Some(head) = me.codec.get().receive_request_head(py, data)? else {
             return Ok(None);
@@ -631,15 +651,42 @@ impl H1ServerState {
             decoder.get().feed_buf(body);
         }
         let complete = decoder.get().is_complete();
+        me.head_read_since = None; // the head parsed: hyper drops the Sleep, `running = false`
         let (seq, old) = me.begin_request(decoder.clone_ref(py), h, complete);
         drop(me);
         drop(old);
         Ok(Some((head, seq, decoder)))
     }
 
-    /// A head parse failed / the head-read deadline hit / the transport broke at
-    /// the request boundary: closed; returns the transport for the automatic error
-    /// response (best effort) and the close.
+    /// The deadline watchdog's one step (hyper conn.rs `poll_read_head`: the
+    /// `header_read_timeout` Sleep polled beside a Pending `parse`). Returns
+    /// `(expired, remaining, transport)`: `expired` = a head has been in the reading
+    /// for `timeout` seconds — the connection is closed HERE, in the same step as the
+    /// verdict (`Error::new_header_timeout` out of the dispatcher, the IO dropped: the
+    /// abortive end), and the transport to close is handed back; the close is what
+    /// ends the parked read, which `unpark_idle_read` then reports. Not expired:
+    /// `remaining` is what is left of the head read in progress, or `None` when no
+    /// head is being read (a request in flight: sleep a full `timeout`). A closed
+    /// connection answers `(false, None, None)`: the watchdog exits.
+    fn head_read_overdue(&self, timeout: f64) -> (bool, Option<f64>, Option<Py<PyAny>>) {
+        let mut me = self.lock();
+        if me.closed {
+            return (false, None, None);
+        }
+        let Some(since) = me.head_read_since else {
+            return (false, None, None);
+        };
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed < timeout {
+            return (false, Some(timeout - elapsed), None);
+        }
+        let transport = me.close_now();
+        (true, None, transport)
+    }
+
+    /// A head parse failed / the transport broke at the request boundary: closed;
+    /// returns the transport for the automatic error response (best effort) and the
+    /// close. (The head-read deadline closes in `head_read_overdue`.)
     fn fail_read(&self) -> Option<Py<PyAny>> {
         self.lock().close_now()
     }
@@ -898,6 +945,10 @@ impl H1ServerState {
     ///
     /// An encoder `User` error (a 1xx status, content-length + transfer-encoding)
     /// raises after the claim, as hyper's `encode_head` fails after `Writing::Init`.
+    ///
+    /// With `REQ_OK` the transport to write the head with comes back too (a
+    /// `transport_ref` taken under the same lock as the claim; `None` = closed, the
+    /// caller fails the response as a write into a closed connection would).
     #[pyo3(signature = (seq, status, headers, done, *, content_length=None, chunked=false, want=false))]
     #[allow(clippy::too_many_arguments)] // hyper's Encode inputs + the arm ask
     fn respond_head(
@@ -910,7 +961,7 @@ impl H1ServerState {
         content_length: Option<u64>,
         chunked: bool,
         want: bool,
-    ) -> PyResult<(u8, Option<Py<PyBytes>>, bool)> {
+    ) -> PyResult<(u8, Option<Py<PyBytes>>, bool, Option<Py<PyAny>>)> {
         let mut me = self.lock();
         let (result, unused) = me.respond_head_locked(
             py,
@@ -922,9 +973,13 @@ impl H1ServerState {
             chunked,
             want,
         );
+        let transport = match &result {
+            Ok((REQ_OK, _, _)) => me.transport.as_ref().map(|t| t.clone_ref(py)),
+            _ => None,
+        };
         drop(me);
         drop(unused); // the event, when the watcher was not armed (or nothing ran)
-        result
+        result.map(|(code, head, armed)| (code, head, armed, transport))
     }
 
     /// The response is fully on the wire (hyper `try_keep_alive` after

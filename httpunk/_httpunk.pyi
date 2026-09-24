@@ -711,15 +711,25 @@ class H1ServerState:
         """The one-poll drain's outcome: `H1_NEXT_CLOSE` + transport, or the read verdict."""
 
     def unpark_idle_read(self) -> bool:
-        """The idle read returned; True = a shutdown closed the connection while it was parked."""
+        """A head read ended without bytes to parse (an error, EOF); True = the connection
+        was closed under it (a graceful shutdown while idle, or the head-read deadline).
+        A read that returned bytes ends its park in `accept_head`."""
+
+    def head_read_overdue(self, timeout: float) -> tuple[bool, float | None, object | None]:
+        """The deadline watchdog's step: `(expired, remaining, transport)`. `expired` = a
+        head has been in the reading for `timeout` seconds: closed here, the transport
+        to close is returned. Else `remaining` = what is left of the head read in
+        progress (None: no head is being read). Closed connection: `(False, None, None)`."""
 
     def accept_head(self, data: bytes) -> tuple[H1RequestHead, int, H1BodyDecoder] | None:
-        """Feed the head parser; once a head is complete it is the current request:
-        `(head, seq, its body decoder — fed the bytes read alongside the head)`; None =
-        read more. Raises `H1ParseError` (the codec remembers the automatic status)."""
+        """The read returned: end its park and feed the head parser (one step); once a
+        head is complete it is the current request: `(head, seq, its body decoder — fed
+        the bytes read alongside the head)`; None = read more — also the answer of a
+        connection closed under the read, which parses nothing. Raises `H1ParseError`
+        (the codec remembers the automatic status)."""
 
     def fail_read(self) -> object | None:
-        """A head parse failure / deadline / broken transport: closed; the transport to close."""
+        """A head parse failure / broken transport at the head: closed; the transport to close."""
 
     def stop_serving(self) -> None: ...
     def mark_closed(self) -> tuple[object | None, object | None, bool]:
@@ -762,10 +772,11 @@ class H1ServerState:
         content_length: int | None = ...,
         chunked: bool = ...,
         want: bool = ...,
-    ) -> tuple[int, bytes | None, bool]:
+    ) -> tuple[int, bytes | None, bool, object | None]:
         """The head step as one transition: claim, verdicts, encode, head-time
-        decisions, arm decision. `(H1_REQ_* code, encoded head, armed)`: `H1_REQ_OK` +
-        head (+ spawn the watcher for `done` if `armed`); `H1_REQ_CONTINUE` = claimed,
+        decisions, arm decision. `(H1_REQ_* code, encoded head, armed, transport)`:
+        `H1_REQ_OK` + head + the transport to write it with, taken under the claim's lock
+        (None = closed) (+ spawn the watcher for `done` if `armed`); `H1_REQ_CONTINUE` = claimed,
         await the request's continue event and call again; `H1_REQ_PEER_CLOSED`;
         `H1_REQ_ALREADY` / `H1_REQ_STALE`. Raises the encoder's `H1UserError`."""
 

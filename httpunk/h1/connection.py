@@ -15,6 +15,7 @@ Cross-reference: hyperium/hyper 1.11.1 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
 from .._common import aiter_body
+from ..exceptions import ConnectionClosedError
 
 
 _READ_SIZE = 65536
@@ -34,34 +35,54 @@ _READ_SIZE = 65536
 # head must never wait on the app's generator (hyper polls the body after the head).
 
 
+# The body's shape (`types.Body`), classified once by `_body_plan`: how it is written.
+BODY_NONE = 0  # no body
+BODY_BYTES = 1  # an immediate `bytes` / `bytearray`
+BODY_SYNC = 2  # a sync iterable of chunks: written inline
+BODY_ASYNC = 3  # an async iterable: pumped in its own task (may park between chunks)
+
+
 class H1Framing:
     """The body-framing + send leaves shared by both roles (hyper's `Conn` write
     half: `encode_head`'s body length, `write_body`/`end_body`). Pure orchestration
     over `self.write` — no state of its own."""
 
     @staticmethod
-    def _body_framing(body):
-        # None / empty bytes -> no body framing (hyper `set_length` None branch,
-        # role.rs L1311-1316); non-empty bytes -> Content-Length; (async) iterable
-        # -> chunked. The request and response framing rules are the same, so this
-        # is shared.
+    def _body_plan(body, max_buf_size):
+        """The body's shape, classified ONCE for the whole write path — `(content_length,
+        chunked, kind, coalesce)`. The framing inputs are hyper's `set_length`: None /
+        empty bytes -> no body (role.rs L1311-1316), non-empty bytes -> Content-Length,
+        an iterable -> chunked; the request and response rules are the same, so this is
+        shared. `kind` is the write path (`BODY_*`: an async iterable must be pumped in
+        its own task, a sync one is written inline) and `coalesce` the head+body write
+        decision: an immediate body up to `max_buf_size` rides the head's write (see the
+        module comment for the rule and its cap). Nothing downstream re-derives any of
+        this from `body`."""
         if body is None:
-            return None, False
+            return None, False, BODY_NONE, True
         if isinstance(body, (bytes, bytearray)):
-            return (len(body), False) if len(body) else (None, False)
-        return None, True
+            n = len(body)
+            return n or None, False, BODY_BYTES, n <= max_buf_size
+        if hasattr(body, "__aiter__"):
+            return None, True, BODY_ASYNC, False
+        return None, True, BODY_SYNC, False
 
-    async def _send_head_and_body(self, codec, head, body, trailers=None):
-        """Write the message head + framed body. A bodyless message or an
-        immediate `bytes` body up to the codec's `max_buf_size` is COALESCED with
-        the head into a single transport write — hyper's `WriteBuf` Flatten strategy
-        (proto/h1/io.rs), see the module comment. Streamed bodies, and immediate ones
-        past the cap, keep the head-first write. The coalesced branch mirrors
-        `_send_body` exactly (aiter_body yields a bytes body as one chunk)."""
-        if body is None or (isinstance(body, (bytes, bytearray)) and len(body) <= codec.max_buf_size):
-            await self.write(codec.serialize_head_and_body(head, body, trailers))
+    async def _send_head_and_body(self, codec, head, body, trailers, transport, coalesce):
+        """Write the message head + framed body. `coalesce` (decided by `_body_plan`: a
+        bodyless message or an immediate body up to the codec's `max_buf_size`) writes
+        head and body as ONE transport write — hyper's `WriteBuf` Flatten strategy
+        (proto/h1/io.rs), see the module comment; the coalesced branch mirrors
+        `_send_body` exactly (aiter_body yields a bytes body as one chunk). Otherwise —
+        a streamed body, or an immediate one past the cap — the head goes first. The
+        head's write goes to `transport`, the one the caller's head step took from the
+        state (`None` = closed by then: the failure a write into it would raise); the
+        body's chunks go through `write`, each fetching the transport anew (F59)."""
+        if transport is None:
+            raise ConnectionClosedError("connection closed")
+        if coalesce:
+            await transport.send_all(codec.serialize_head_and_body(head, body, trailers))
             return
-        await self.write(head)
+        await transport.send_all(head)
         await self._send_body(codec, body, trailers)
 
     async def _send_body(self, codec, body, trailers=None):
