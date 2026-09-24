@@ -206,6 +206,25 @@ class _AsyncioStream(asyncio.Protocol):
         else:
             self._transport.close()
 
+    def readable_now(self):
+        """Bytes (or EOF / an error) can be read NOW without suspending."""
+        return bool(self._buffered or self._eof)
+
+    async def wait_readable_or(self, event):
+        """Park until bytes / EOF / an error land (the read future `receive_some` parks
+        on, resolved by the protocol callbacks) OR `event` is set — first of the two, the
+        loser cancelled and drained. Single-reader contract as `receive_some`."""
+        if self._read_waiter is not None:
+            raise RuntimeError("concurrent receive_some on one stream (single-reader contract)")
+        waiter = self._read_waiter = self._loop.create_future()
+        ev = asyncio.ensure_future(event.wait())
+        try:
+            await asyncio.wait({waiter, ev}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            self._read_waiter = None
+            ev.cancel()
+            await asyncio.gather(ev, return_exceptions=True)
+
     def writable_now(self):
         """The socket can take a write NOW: asyncio's transport buffers every write, so
         this is false only under write backpressure (`pause_writing` until `resume_writing`)."""
@@ -401,6 +420,18 @@ class AsyncioBackend:
         """Chosen once per connection (see the tonio twin): the seam's stream bounds its
         own read (`_AsyncioStream.receive_bounded`: one timer handle on the read future)."""
         return transport.receive_bounded
+
+    def readable_wait(self, transport):
+        """The read-side twin of `writable_wait` (see the tonio twin): `wait(event) ->
+        awaitable | None` — `None` when the stream's buffer holds bytes (or EOF) now, else
+        the read future beside the event."""
+
+        def wait(event):
+            if transport.readable_now():
+                return None
+            return transport.wait_readable_or(event)
+
+        return wait
 
     def writable_wait(self, transport):
         """Chosen once per connection (see the tonio twin): `wait(event) -> awaitable |

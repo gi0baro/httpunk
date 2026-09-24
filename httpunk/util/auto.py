@@ -30,10 +30,9 @@ from ..h2.server import H2Server
 
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from .._backend import BackendLike
-
-
-_CANCELLED = object()  # sentinel: the sniff's read lost the race to the cancel signal
 
 
 class SniffCancelledError(Exception):
@@ -73,10 +72,13 @@ class Builder:
 
     def http1_only(self) -> Builder:
         """Only accept HTTP/1 (no sniff). hyper-util `assert!`s the version was not
-        already forced; a second force raises instead of silently overriding."""
+        already forced; a second force raises instead of silently overriding. The
+        decision is taken HERE, once: `serve_connection` becomes the h1 constructor for
+        this builder's life — no per-connection check of a version fixed at setup."""
         if self._version is not None:
             raise RuntimeError(f"protocol already forced to {self._version!r}")
         self._version = "h1"
+        self.serve_connection = self._serve_h1
         return self
 
     def http2_only(self) -> Builder:
@@ -84,6 +86,7 @@ class Builder:
         if self._version is not None:
             raise RuntimeError(f"protocol already forced to {self._version!r}")
         self._version = "h2"
+        self.serve_connection = self._serve_h2
         return self
 
     def _build_h1(self, transport) -> H1Server:
@@ -92,30 +95,34 @@ class Builder:
     def _build_h2(self, transport) -> H2Server:
         return H2Server(transport, backend=self._backend, **self._h2)
 
+    async def _serve_h1(self, transport: Any, *, cancel: Any = None) -> H1Server:
+        """`serve_connection` once `http1_only()` was called: no sniff, no signal to race."""
+        return self._build_h1(transport)
+
+    async def _serve_h2(self, transport: Any, *, cancel: Any = None) -> H2Server:
+        """`serve_connection` once `http2_only()` was called: no sniff, no signal to race."""
+        return self._build_h2(transport)
+
     async def serve_connection(self, transport: Any, *, cancel: Any = None) -> H2Server | H1Server:
-        """Sniff `transport` (unless a protocol was forced) and return the matching
-        **un-entered** server over the raw transport, its codec seeded with the sniffed
-        bytes (hyper-util `Builder::serve_connection` + `Rewind`, see the module doc).
-        Returned un-entered like `connect` — the caller drives it with
-        `async with server: async for req in server: ...`.
+        """Sniff `transport` and return the matching **un-entered** server over the raw
+        transport, its codec seeded with the sniffed bytes (hyper-util
+        `Builder::serve_connection` + `Rewind`, see the module doc). Returned un-entered
+        like `connect` — the caller drives it with `async with server: async for req in
+        server: ...`. A forced protocol (`http1_only` / `http2_only`) replaces this
+        method with the one constructor; nothing is sniffed then.
 
         `cancel` (an event) makes the peek interruptible (≈ hyper-util
-        `ReadVersion::cancel`): if it fires while we're parked reading a silent client's
-        preface, the sniff aborts with `SniffCancelledError` so a graceful shutdown
-        doesn't linger on that connection. Requires `backend` (for the read-vs-cancel race).
+        `ReadVersion::cancel`): if it fires while the peek is parked on a silent client,
+        the transport is closed and the sniff aborts with `SniffCancelledError`, so a
+        graceful shutdown doesn't linger on that connection. Requires `backend` (the
+        readiness wait beside the signal is the backend's).
         """
-        if self._version == "h2":
-            return self._build_h2(transport)
-        if self._version == "h1":
-            return self._build_h1(transport)
-
         # Peek up to the full preface, stopping early the moment the bytes diverge
         # from it (→ definitely h1) or the peer stops sending (EOF).
+        read = _sniff_reader(transport, self._backend, cancel)
         buf, matched = b"", None
         while len(buf) < len(PREFACE):
-            chunk = await _sniff_read(transport, len(PREFACE) - len(buf), self._backend, cancel)
-            if chunk is _CANCELLED:
-                raise SniffCancelledError
+            chunk = await read(len(PREFACE) - len(buf))
             if not chunk:
                 break  # EOF before a full preface -> treat as h1 (a truncated request)
             buf += chunk
@@ -183,8 +190,8 @@ class Http1Builder:
         False — where the mid-request EOF fails the in-flight response)."""
         return self._set("half_close", val)
 
-    async def serve_connection(self, transport: Any, *, cancel: Any = None) -> H2Server | H1Server:
-        return await self._inner.serve_connection(transport, cancel=cancel)
+    def serve_connection(self, transport: Any, *, cancel: Any = None) -> Awaitable[H2Server | H1Server]:
+        return self._inner.serve_connection(transport, cancel=cancel)
 
 
 class Http2Builder:
@@ -255,8 +262,8 @@ class Http2Builder:
         `max_send_buf_size`, default 400 KB); the sender awaits room like flow-control window."""
         return self._set("max_send_buf_size", max)
 
-    async def serve_connection(self, transport: Any, *, cancel: Any = None) -> H2Server | H1Server:
-        return await self._inner.serve_connection(transport, cancel=cancel)
+    def serve_connection(self, transport: Any, *, cancel: Any = None) -> Awaitable[H2Server | H1Server]:
+        return self._inner.serve_connection(transport, cancel=cancel)
 
 
 async def serve(
@@ -283,29 +290,30 @@ async def serve(
     return await builder.serve_connection(transport, cancel=cancel)
 
 
-async def _sniff_read(transport, n, backend, cancel):
-    """One peek read, interruptible by an optional `cancel` signal (returns the
-    `_CANCELLED` sentinel if it fired). A parked `receive_some` is never cancelled
-    (on tonio that leaves the socket registration armed for a dead task): the
-    signal ends the read by CLOSING the transport — the sanctioned way to end a
-    parked read — and the caller, who closes a cancelled connection anyway, gets
-    the sentinel."""
+def _sniff_reader(transport, backend, cancel):
+    """The peek's read, bound once per sniff: `read(n) -> bytes | b"" (EOF)`. Without
+    a signal it is the transport's own read. With `cancel`, the read never parks
+    beside a task that could close under it: it parks ONCE on readable readiness
+    merged with the signal (`backend.readable_wait`, the shape of the h1 client's
+    exchange), then reads without suspending (`receive_nowait`), asking readiness
+    again first. A signal that wins closes the transport — the sanctioned end of the
+    connection, which the callers rely on (≈ hyper-util `ReadVersion::cancel`) — and
+    raises `SniffCancelledError`."""
     if cancel is None:
-        return await transport.receive_some(n)
+        return transport.receive_some
+
     backend = _backend.resolve(backend)
+    wait_readable = backend.readable_wait(transport)
 
-    async def _closer():
-        await cancel.wait()
-        backend.close_transport(transport)
+    async def read(n):
+        while True:
+            if (wait := wait_readable(cancel)) is not None:
+                await wait
+            if cancel.is_set():
+                backend.close_transport(transport)
+                raise SniffCancelledError
+            chunk = backend.receive_nowait(transport, n)
+            if chunk is not None:
+                return chunk  # bytes, or b"" = EOF
 
-    async with backend.scope() as s:
-        s.spawn(_closer())
-        try:
-            chunk = await transport.receive_some(n)
-        except Exception:
-            chunk = b""  # the close ended the read (EOF on asyncio, an error on tonio)
-        finally:
-            s.cancel()  # the closer parks on an event, never on a read: safe to cancel
-    if cancel.is_set():
-        return _CANCELLED
-    return chunk
+    return read

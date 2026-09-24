@@ -211,6 +211,37 @@ class TonioBackend:
 
         return read
 
+    def readable_wait(self, transport):
+        """The read-side twin of `writable_wait`, chosen ONCE per sniff: `wait(event) ->
+        awaitable | None` — `None` when bytes can be read NOW, else ONE suspension on the
+        socket's readable readiness merged with `event` (the auto server's cancel
+        signal beside its preface peek: no closer task, nothing cancelled). The caller
+        reads without suspending afterwards (`receive_nowait`), asking this again first
+        (the readiness question, for the tick guard).
+
+        - **Plain socket**: `waiter_readable()` is the arm.
+        - **TLS (`TLSStream`)**: `watch_readable()` — plaintext already decoded counts as
+          readable; the receive lock is held across the park and released before the
+          decrypting peek."""
+        if isinstance(transport, _TLSStream):
+            watch = transport.watch_readable
+
+            def wait(event):
+                with watch() as watcher:
+                    if (waiter := watcher.waiter()) is None:
+                        return None
+                    return waiter | event.waiter(None)
+
+            return wait
+        arm = transport.waiter_readable
+
+        def wait(event):
+            if (waiter := arm()) is None:
+                return None
+            return waiter | event.waiter(None)
+
+        return wait
+
     def writable_wait(self, transport):
         """Chosen ONCE per connection (like `bounded_reader`): how the h1 client's
         exchange waits for `transport` to have room for a write, beside an event — the

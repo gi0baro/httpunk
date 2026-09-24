@@ -8,7 +8,7 @@ server (the replayed preface / request line parses correctly).
 import pytest
 from _client import open_h1, open_h2
 from _transport import StubStream
-from tonio.colored import Event, scope, sleep
+from tonio.colored import Event, scope
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk.h1.server import H1Server
@@ -265,6 +265,7 @@ class _SilentTransport(_ScriptedTransport):
     def __init__(self):
         super().__init__(b"")
         self._closed_evt = Event()
+        self.armed = Event()  # the sniff asked for readable: it is parked beside its signal
 
     async def receive_some(self, max_bytes=65536):
         await self._closed_evt.wait()
@@ -274,6 +275,7 @@ class _SilentTransport(_ScriptedTransport):
         return self.closed
 
     def _park(self, timeout):
+        self.armed.set()
         return self._closed_evt.wait(None if timeout is None else timeout / 1_000_000)
 
     def _recv_now(self, max_bytes):
@@ -300,7 +302,21 @@ async def test_sniff_cancel_closes_the_transport_to_end_the_parked_read():
 
     async with scope() as s:
         s.spawn(sniff())
-        await sleep(0)  # let the sniff park on the silent client
+        await transport.armed.wait()  # the sniff is parked on readable | the signal
         cancel.set()
     assert outcome == ["cancelled"]
-    assert transport.closed  # the signal ended the read through the close, not a cancel
+    assert transport.closed  # the signal closed the transport (the callers rely on it), no task cancelled
+
+
+def test_forcing_a_protocol_fixes_serve_connection_at_setup():
+    """`http1_only()` / `http2_only()` take the decision once: `serve_connection` IS the
+    constructor from then on (no per-connection version check, no sniff); an unforced
+    builder keeps the sniffing method."""
+    b = auto.Builder()
+    assert b.serve_connection.__func__ is auto.Builder.serve_connection
+    b.http1_only()
+    assert b.serve_connection.__func__ is auto.Builder._serve_h1
+    assert auto.Builder().http2_only().serve_connection.__func__ is auto.Builder._serve_h2
+    assert auto.Builder().http1().serve_connection.__func__ is auto.Http1Builder.serve_connection
+    with pytest.raises(RuntimeError):
+        b.http2_only()
