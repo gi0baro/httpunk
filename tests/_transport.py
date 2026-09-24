@@ -22,3 +22,6 @@ class StubStream:
         if self._readable():
             return None
         return self._park(timeout)
+
+    def waiter_writable(self, timeout=None):
+        return None  # a stub's writes never block: writable now (`TonioBackend.writable_wait`)

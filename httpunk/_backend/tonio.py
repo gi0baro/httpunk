@@ -211,6 +211,41 @@ class TonioBackend:
 
         return read
 
+    def writable_wait(self, transport):
+        """Chosen ONCE per connection (like `bounded_reader`): how the h1 client's
+        exchange waits for `transport` to have room for a write, beside an event — the
+        write side of hyper's `poll_loop` turn (`poll_flush` Pending, then the task
+        wakes on writable OR readable). Returns `wait(event) -> awaitable | None`:
+        `None` when the socket can take bytes NOW (the readiness bits are set: nothing
+        to wait for), else ONE suspension on the socket's writable readiness merged
+        with `event` (tonio's `Waiter.__or__`: any-mode) — no task, nothing cancelled,
+        no verdict: the caller reads the event's flag. The arm is only a wake: the
+        `send_all` that follows asks the readiness question itself before its syscall
+        (tonio's `send`), so the tick guard is honoured there.
+
+        - **Plain socket**: `waiter_writable()` is the arm, `None` when the bits landed.
+        - **TLS (`TLSStream`)**: `watch_writable()` holds the send lock across the arm
+          and the park (as tonio's `wait_writable`); the lock is released before the
+          writer task runs, so the two never hold it together."""
+        if isinstance(transport, _TLSStream):
+            watch = transport.watch_writable
+
+            def wait(event):
+                with watch() as watcher:
+                    if (waiter := watcher.waiter()) is None:
+                        return None
+                    return waiter | event.waiter(None)
+
+            return wait
+        arm = transport.waiter_writable
+
+        def wait(event):
+            if (waiter := arm()) is None:
+                return None
+            return waiter | event.waiter(None)
+
+        return wait
+
     def close_transport(self, transport):
         """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —
         an error out of the connection (a transport failure, the header-read deadline,
@@ -266,6 +301,11 @@ class TonioBackend:
     # route errors into connection state); an escaped one surfaces at the
     # join in a backend-specific shape and is a driver bug, not API.
     spawn_without_results = staticmethod(_colored.spawn.without_results)
+    # Spawn a task NOW with NO handle at all: nothing to join, nothing to cancel. The
+    # primitive for a task whose completion is its own event (the h1 client's request
+    # writer sets one in its `finally`) and whose only external end is the transport
+    # closing under its parked write. Spawned coroutines must not let exceptions escape.
+    spawn_detached = staticmethod(_colored.spawn.without_tracking)
 
     select = staticmethod(_colored.select)
     # `await select_events(*events)`: resume once ANY of the events is set — ONE suspension

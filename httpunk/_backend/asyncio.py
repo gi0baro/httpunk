@@ -25,6 +25,7 @@ from ..exceptions import fresh_exc as _fresh_exc
 
 
 _READ_HIGH_WATER = 2**16  # 64 KiB — pause reading past this (matches StreamReader's default limit)
+_detached = set()  # strong references to detached tasks until they finish (`spawn_detached`)
 
 
 class _AsyncioStream(asyncio.Protocol):
@@ -204,6 +205,18 @@ class _AsyncioStream(asyncio.Protocol):
             self._transport.abort()
         else:
             self._transport.close()
+
+    def writable_now(self):
+        """The socket can take a write NOW: asyncio's transport buffers every write, so
+        this is false only under write backpressure (`pause_writing` until `resume_writing`)."""
+        return not self._writing_paused
+
+    def drain_future(self):
+        """The future `send_all` parks on under backpressure (created here if none):
+        resolved by `resume_writing` / `connection_lost`."""
+        if self._drain_waiter is None:
+            self._drain_waiter = self._loop.create_future()
+        return self._drain_waiter
 
     def read_nowait(self, max_bytes=65536):
         """Synchronous non-blocking peek: whatever is buffered right now, `b""` once
@@ -388,6 +401,36 @@ class AsyncioBackend:
         """Chosen once per connection (see the tonio twin): the seam's stream bounds its
         own read (`_AsyncioStream.receive_bounded`: one timer handle on the read future)."""
         return transport.receive_bounded
+
+    def writable_wait(self, transport):
+        """Chosen once per connection (see the tonio twin): `wait(event) -> awaitable |
+        None`. asyncio's transport never refuses a write (it buffers), so the socket is
+        writable unless the protocol is under backpressure; then the wait is the drain
+        future beside the event, first of the two, the loser cancelled and drained."""
+
+        async def wait_both(event):
+            drain = transport.drain_future()
+            ev = asyncio.ensure_future(event.wait())
+            try:
+                await asyncio.wait({drain, ev}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                ev.cancel()
+                await asyncio.gather(ev, return_exceptions=True)
+
+        def wait(event):
+            if transport.writable_now():
+                return None
+            return wait_both(event)
+
+        return wait
+
+    def spawn_detached(self, coro):
+        """Spawn a task with no handle (see the tonio twin): the loop holds the only
+        strong reference while it runs (a task parked on a future is reachable from that
+        future's callbacks; `_detached` keeps one until it finishes, as asyncio advises)."""
+        task = asyncio.ensure_future(coro)
+        _detached.add(task)
+        task.add_done_callback(_detached.discard)
 
     def close_transport(self, transport):
         """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —

@@ -155,20 +155,19 @@ class H1ResponseBody:
         except BaseException:
             await self._release(keep_alive=False)  # broken body -> connection unusable
             raise
-        # Chunked trailers (if any) are available once the body is fully decoded.
-        self.trailers = self._decoder.take_trailers()
         await self._finish()
 
     async def _finish(self):
-        """The body is fully decoded. hyper's client validates the read buffer is
-        empty before reusing the connection (`require_empty_read` ->
-        `new_unexpected_message`, conn.rs L463-465): any bytes the server sent
-        past the response body are an HTTP/1 protocol violation (a server may not
-        send anything before the next request). Poison the connection rather than
-        silently dropping them and reusing a corrupted stream (was G35)."""
+        """The body is fully decoded: the chunked trailers (if any) are available, and
+        hyper's client validates the read buffer is empty before reusing the connection
+        (`require_empty_read` -> `new_unexpected_message`, conn.rs L463-465): any bytes
+        the server sent past the response body are an HTTP/1 protocol violation (a
+        server may not send anything before the next request). Poison the connection
+        rather than silently dropping them and reusing a corrupted stream (was G35).
+        Both come from the decoder in one step (`finish`)."""
+        self.trailers, leftover = self._decoder.finish()
         if self._released:
             return
-        leftover = self._decoder.buffered
         if leftover:
             self._driver.poison_unexpected(leftover)
             await self._release(keep_alive=False)

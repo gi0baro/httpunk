@@ -357,6 +357,8 @@ impl H1Codec {
             None if st.buf.len() >= self.max_buf_size => Err(map_hyper_err(too_large_error())),
             Some(head) => {
                 let (kind, content_length) = body_kind(&head.body);
+                let wants_keep_alive =
+                    head.keep_alive && kind != "close" && !st.request_connection_close;
                 let headers = Py::new(py, HeaderMap::from_inner(head.headers))?;
                 let event = Py::new(
                     py,
@@ -369,6 +371,7 @@ impl H1Codec {
                         content_length,
                         is_upgrade: head.wants_upgrade,
                         http10: head.http10,
+                        wants_keep_alive,
                     },
                 )?;
                 Ok(Some(event.into_any()))
@@ -585,6 +588,14 @@ pub struct ResponseHead {
     /// reused connection to HTTP/1.0 (hyper `enforce_version`).
     #[pyo3(get)]
     pub http10: bool,
+    /// hyper `Conn::wants_keep_alive()` once this head is read: the connection may be
+    /// reused after this exchange — the response allows keep-alive (`keep_alive`),
+    /// its body is not close-delimited (conn.rs `read_head`: a `Decoder::Close` body
+    /// disables keep-alive), and the request did not carry `Connection: close`
+    /// (`encode_head` -> `connection_any_close` -> `disable_keep_alive`). The one
+    /// verdict the driver's `release_slot` ANDs with "the request was fully sent".
+    #[pyo3(get)]
+    pub wants_keep_alive: bool,
 }
 
 #[pymethods]
@@ -735,5 +746,18 @@ impl H1BodyDecoder {
             Some(map) => Ok(Some(Py::new(py, HeaderMap::from_inner(map))?)),
             None => Ok(None),
         }
+    }
+
+    /// The body is complete: what a reader needs to finish with it, in ONE step —
+    /// `(trailers, leftover)`: the chunked trailers taken as `take_trailers` does, and
+    /// the bytes buffered past the body as `buffered` reports them (the client's
+    /// `require_empty_read` check before reuse).
+    fn finish(&self, py: Python<'_>) -> PyResult<(Option<Py<HeaderMap>>, usize)> {
+        let mut st = self.inner.lock().unwrap();
+        let trailers = match st.take_trailers() {
+            Some(map) => Some(Py::new(py, HeaderMap::from_inner(map))?),
+            None => None,
+        };
+        Ok((trailers, st.buffered()))
     }
 }

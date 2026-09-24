@@ -1251,6 +1251,23 @@ impl H1ClientState {
         me.closed || me.error.is_some()
     }
 
+    /// The claimed exchange's send-time facts, ONE step (hyper `poll_msg`: the
+    /// connection's state decides whether it takes the request): `(transport,
+    /// watcher_done)` — the transport for the peek and the write, and the armed idle
+    /// watcher's done event (the exchange's "readable" until that read completes).
+    /// `None` transport = dead (failed, closed, or handed off): the caller raises with
+    /// `request_unsent`.
+    fn begin_send(&self, py: Python<'_>) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
+        let me = self.lock();
+        if me.error.is_some() {
+            return (None, None);
+        }
+        (
+            me.transport.as_ref().map(|t| t.clone_ref(py)),
+            me.watcher.as_ref().map(|w| w.done.clone_ref(py)),
+        )
+    }
+
     #[getter]
     fn has_watcher(&self) -> bool {
         self.lock().watcher.is_some()
@@ -1324,6 +1341,22 @@ impl H1ClientState {
     /// returns the transport to close.
     fn close_now(&self) -> Option<Py<PyAny>> {
         self.lock().close_now()
+    }
+
+    /// `release_slot`'s verdict, ONE step (hyper `try_keep_alive`: both halves at
+    /// `KeepAlive`): reuse iff the response allowed keep-alive AND the writer finished
+    /// (the request was fully sent); else closed here. `(reuse, fully_sent, transport)`:
+    /// the transport to close when not reusing. Reading the writer's flag and closing
+    /// under the same lock: a writer finishing in between can no longer make a completed
+    /// upload count as incomplete.
+    fn finish_exchange(&self, resp_keep_alive: bool) -> (bool, bool, Option<Py<PyAny>>) {
+        let mut me = self.lock();
+        let fully_sent = me.writer_finished;
+        if resp_keep_alive && fully_sent {
+            return (true, true, None);
+        }
+        let transport = me.close_now();
+        (false, fully_sent, transport)
     }
 
     /// `close()`: `(transport, watcher done event, writer scope, idle)` — close the
@@ -1480,6 +1513,18 @@ impl H1ClientState {
 
     fn take_watcher_handle(&self) -> Option<Py<PyAny>> {
         self.lock().watcher.as_mut().and_then(|w| w.handle.take())
+    }
+
+    /// The completed watcher's hand-off, ONE step (hyper: the read that completed IS
+    /// the response's first read): `(handle, data, error)`, the slot cleared. The
+    /// caller joins the handle (already done — its done event fired — so no suspension)
+    /// and takes the bytes / raises the error as its own read's outcome.
+    fn take_watcher_handoff(&self) -> (Option<Py<PyAny>>, Option<Py<PyBytes>>, Option<Py<PyAny>>) {
+        let mut me = self.lock();
+        match me.watcher.take() {
+            None => (None, None, None),
+            Some(mut w) => (w.handle.take(), w.data.take(), w.error.take()),
+        }
     }
 
     /// Consume the hand-off `(data, error)` and free the slot.

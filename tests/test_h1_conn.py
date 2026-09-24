@@ -2,6 +2,7 @@
 `H1Codec` + `H1BodyDecoder` over a real transport — content-length / chunked /
 close-delimited bodies, request bodies, keep-alive reuse, and connection-close."""
 
+import asyncio
 import select
 
 import pytest
@@ -10,6 +11,7 @@ from tonio.colored import Event, scope, sleep
 from tonio.colored.net import open_tcp_listeners
 
 from httpunk import (
+    Backend,
     H1BodyError,
     H1IncompleteMessageError,
     H1UnexpectedMessageError,
@@ -19,6 +21,7 @@ from httpunk import (
     Version,
 )
 from httpunk._backend.asyncio import AsyncioBackend
+from httpunk._httpunk import H1_WATCH_HANDOFF
 from httpunk.h1.client import Connection
 
 
@@ -190,6 +193,103 @@ async def test_keep_alive_two_requests():
     # both requests arrived on the one connection
     assert requests[0][0].startswith(b"GET /a ")
     assert requests[1][0].startswith(b"GET /b ")
+
+
+class _ParkedClientStub:
+    """A client transport whose socket is NOT writable (the writable arm parks forever)
+    and whose one parked read (the idle watcher's) completes with EOF when released."""
+
+    class NotReady:
+        pass
+
+    def __init__(self):
+        self.release = Event()
+        self.never = Event()
+        self.armed = Event()  # the exchange asked for writable: it is parked in state A
+        self.sent = b""
+        self.closed = False
+
+    async def receive_some(self, max_bytes=65536):
+        await self.release.wait()
+        return b""
+
+    def receive_some_nowait(self, max_bytes=65536):
+        return self.NotReady  # the send-time peek: nothing buffered
+
+    def waiter_writable(self, timeout=None):
+        self.armed.set()
+        return self.never.waiter(None)  # no room: park
+
+    async def send_all(self, data):
+        self.sent += bytes(data)
+
+    def close(self):
+        self.closed = True
+        self.release.set()
+
+
+@pytest.mark.tonio
+async def test_idle_close_before_the_request_is_written_is_unsent():
+    """hyper's turn: before the request is written the task waits for writable OR
+    readable. A server that closes (or speaks) in that window is judged by the idle
+    rules — nothing was written, so the failure carries `request_unsent` and any body
+    is safe to retry (`TrySendError { message: Some }`), where a write already on the
+    wire would have made it an `IncompleteMessage` without the marker."""
+    stub = _ParkedClientStub()
+    conn = Connection(stub, backend=Backend.tonio)
+    await conn.connect()  # arms the idle watcher: its read is parked on `stub.release`
+    outcome = []
+
+    async def request():
+        try:
+            await conn.send_request("GET", "/", HeaderMap({"host": "x"}), None)
+        except HTTPunkError as exc:
+            outcome.append(exc)
+
+    async with scope() as s:
+        s.spawn(request())
+        await stub.armed.wait()  # the exchange is in state A: parked on writable | the watcher's done
+        assert not stub.sent and conn.busy
+        stub.release.set()  # the server closed idle: the watcher's read completes with EOF
+    (exc,) = outcome
+    assert exc.request_unsent is True
+    assert not stub.sent  # nothing reached the wire
+    assert conn.closed and stub.closed  # hyper: EOF on idle -> close, no error recorded
+    assert conn.error is None
+
+
+def test_finish_exchange_is_one_step():
+    """`release_slot`'s verdict under one lock (hyper `try_keep_alive`: both halves at
+    KeepAlive): reuse only with keep-alive AND a finished writer; otherwise closed in the
+    same step, the transport handed back."""
+    stub = _ParkedClientStub()
+    conn = Connection(stub, backend=AsyncioBackend())
+    assert conn.try_begin_exchange()
+    assert conn.finish_exchange(True) == (False, False, stub)  # the writer never finished: closed
+    assert conn.closed and conn.transport_ref() is None
+
+    stub = _ParkedClientStub()
+    conn = Connection(stub, backend=AsyncioBackend())
+    assert conn.try_begin_exchange()
+    conn.writer_done()
+    assert conn.finish_exchange(True) == (True, True, None)  # reusable: nothing closed
+    assert not conn.closed
+    assert conn.finish_exchange(False) == (False, True, stub)  # the response said close: closed here
+    assert conn.closed and conn.transport_ref() is None
+
+
+def test_watcher_handoff_is_one_step():
+    """The completed watcher's read handed to the exchange in one step: handle, bytes,
+    error, and the slot cleared — `has_watcher` false before the handle is joined."""
+    conn = Connection(_ParkedClientStub(), backend=AsyncioBackend())
+    done = asyncio.Event()
+    assert conn.arm_watcher(done)
+    assert conn.store_watcher_handle("handle") is None
+    conn.exchange_started()
+    assert conn.watcher_completed(b"HTTP/1.1 200 OK\r\n", None) == (H1_WATCH_HANDOFF, None)
+    assert conn.take_watcher_handoff() == ("handle", b"HTTP/1.1 200 OK\r\n", None)
+    assert not conn.has_watcher
+    assert conn.take_watcher_handoff() == (None, None, None)  # nothing armed: nothing to take
 
 
 def test_one_codec_per_connection_reset_at_each_claim():

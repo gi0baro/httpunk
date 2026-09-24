@@ -293,6 +293,9 @@ class H1ResponseHead:
     content_length: int | None
     is_upgrade: bool  # 101 upgrade, or 2xx to CONNECT — the connection becomes a tunnel
     http10: bool
+    # hyper `Conn::wants_keep_alive()` after this head: the response allows keep-alive, its
+    # body is not close-delimited, and the request carried no `Connection: close`.
+    wants_keep_alive: bool
     def __repr__(self) -> str: ...
 
 class H1RequestHead:
@@ -332,6 +335,9 @@ class H1BodyDecoder:
     def is_complete(self) -> bool: ...
     def take_trailers(self) -> HeaderMap | None:
         """The chunked trailers once the body is complete, if any; taken (moved)."""
+
+    def finish(self) -> tuple[HeaderMap | None, int]:
+        """The body is complete, one step: `(trailers taken, bytes buffered past the body)`."""
 
     @property
     def buffered(self) -> int:
@@ -805,6 +811,17 @@ class H1ClientState:
     @property
     def codec(self) -> H1Codec: ...
     def transport_ref(self) -> object | None: ...
+    def begin_send(self) -> tuple[object | None, object | None]:
+        """The claimed exchange's send-time facts, one step: `(transport, watcher done
+        event)`; transport None = dead (the caller raises with `request_unsent`)."""
+
+    def finish_exchange(self, resp_keep_alive: bool) -> tuple[bool, bool, object | None]:
+        """`release_slot`'s verdict, one step: `(reuse, fully_sent, transport to close)` —
+        reuse iff keep-alive and the writer finished; else closed here."""
+
+    def take_watcher_handoff(self) -> tuple[object | None, bytes | None, BaseException | None]:
+        """The completed watcher's hand-off, one step: `(handle to join, data, error)`,
+        the slot cleared."""
     @property
     def closed(self) -> bool: ...
     @property

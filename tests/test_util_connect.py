@@ -12,7 +12,11 @@ from httpunk.util import connect
 
 class _FakeStream:
     """A stand-in connected transport. `connect()` returns the connection
-    un-entered, so no IO ever touches this."""
+    un-entered, so no IO ever touches this. The one piece of the stream surface the
+    h1 client binds at construction (`TonioBackend.writable_wait`): writable now."""
+
+    def waiter_writable(self, timeout=None):
+        return None
 
 
 class _StubBackend(TonioBackend):

@@ -378,3 +378,51 @@ def test_response_head_body_kind_is_shared():
         codec.serialize_request("GET", "/", HeaderMap([("host", "h")]))
         heads.append(codec.receive_head(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"))
     assert heads[0].body_kind == "chunked" and heads[0].body_kind is heads[1].body_kind
+
+
+def test_response_head_wants_keep_alive_is_the_connections_verdict():
+    """hyper `Conn::wants_keep_alive()` once the head is read: the response's own
+    keep-alive AND a body that is not close-delimited (conn.rs `read_head`) AND a request
+    that carried no `Connection: close` (`encode_head` -> `connection_any_close`)."""
+
+    def head(request_headers, raw):
+        codec = H1Codec()
+        codec.serialize_request("GET", "/", HeaderMap(request_headers))
+        return codec.receive_head(raw)
+
+    ok = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+    assert head([("host", "h")], ok).wants_keep_alive is True
+    assert head([("host", "h"), ("connection", "close")], ok).wants_keep_alive is False  # the request said close
+    closing = b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+    assert head([("host", "h")], closing).wants_keep_alive is False  # the response said close
+    delimited = b"HTTP/1.1 200 OK\r\n\r\n"  # no length, no chunked: the body ends with the connection
+    ev = head([("host", "h")], delimited)
+    assert ev.body_kind == "close" and ev.wants_keep_alive is False
+
+
+def test_decoder_finish_is_trailers_and_leftover_in_one_step():
+    """`finish()` after the body: the chunked trailers (taken, as `take_trailers`) and the
+    bytes buffered past the body (as `buffered`), in one step."""
+    from httpunk._httpunk import H1BodyDecoder
+
+    codec = H1Codec()
+    codec.serialize_request("GET", "/", HeaderMap([("host", "h")]))
+    head = codec.receive_head(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+    decoder = H1BodyDecoder(head.body_kind, head.content_length or 0)
+    decoder.feed(b"3\r\nabc\r\n0\r\nx-sum: 1\r\n\r\nSTRAY")  # a trailer block, then bytes past the body
+    assert decoder.decode() == b"abc"
+    assert decoder.decode() is None and decoder.is_complete
+    trailers, leftover = decoder.finish()
+    assert trailers["x-sum"] == b"1" and leftover == 5
+    assert decoder.finish() == (None, 5)  # the trailers were taken; the leftover stays until read
+
+
+def test_decoder_finish_on_a_bodyless_response():
+    from httpunk._httpunk import H1BodyDecoder
+
+    codec = H1Codec()
+    codec.serialize_request("HEAD", "/", HeaderMap([("host", "h")]))
+    head = codec.receive_head(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n")
+    decoder = H1BodyDecoder(head.body_kind, head.content_length or 0)
+    codec.take_body_into(decoder)
+    assert decoder.is_complete and decoder.finish() == (None, 0)
