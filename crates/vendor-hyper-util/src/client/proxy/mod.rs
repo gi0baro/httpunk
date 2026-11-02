@@ -1,5 +1,3 @@
-//! Hand-written module glue (not from upstream): exposes only the vendored
-//! `matcher`. Upstream's `proxy/mod.rs` also wires SOCKS/tunnel connectors, which
-//! are IO and not vendored.
+//! Proxy utilities
 
 pub mod matcher;

@@ -1281,7 +1281,7 @@ impl Decoder {
                 .into_any()
             }
             Kind::GoAway => {
-                let g = frame::GoAway::load(&frame_buf[HEADER_LEN..]).map_err(load_err)?;
+                let g = frame::GoAway::load(head, &frame_buf[HEADER_LEN..]).map_err(load_err)?;
                 Py::new(
                     py,
                     GoAway {

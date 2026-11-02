@@ -1,5 +1,5 @@
-# Vendored hyperium/h2 (frame + hpack + sync proto pieces), byte-identical to
-# upstream — see ../../THIRD-PARTY.md. A workspace member crate so it owns its
+# Vendored hyperium/h2 (frame + hpack + sync proto pieces); scripts/vendor-h2.sh
+# enumerates every modification to upstream. A workspace member crate so it owns its
 # own crate root (upstream `crate::` paths resolve natively, no rewrite) and is
 # excluded from the main crate's fmt/clippy via `cargo fmt -p`.
 [package]
