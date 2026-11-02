@@ -503,7 +503,7 @@ async def test_map_builds_one_pool_per_key_and_closes_all():
 @pytest.mark.tonio
 async def test_map_normalizes_default_port_from_scheme():
     """A URL with no explicit port routes to the SAME pool as its scheme-default port —
-    http://x and http://x:80 are one destination, not two (F52)."""
+    http://x and http://x:80 are one destination, not two."""
     built = []
 
     def make_pool(url):
@@ -539,7 +539,7 @@ class _StubPool:
 @pytest.mark.tonio
 async def test_map_retain_forwards_and_clear_resets():
     """Map.retain forwards to every inner pool; clear() closes them and drops the routing
-    table so the Map rebuilds lazily on the next pool_for (F52)."""
+    table so the Map rebuilds lazily on the next pool_for."""
     pools = []
 
     def make_pool(_url):
@@ -651,7 +651,7 @@ async def test_singleton_retain_evaluates_predicate_outside_the_lock():
 @pytest.mark.tonio
 async def test_cache_checkin_after_aclose_closes_instead_of_parking():
     """A lease that outlives `aclose()` must not resurrect the pool: its connection is
-    closed on return, never parked in a closed cache (U2)."""
+    closed on return, never parked in a closed cache."""
 
     async def connector(_dst):
         return _FakeConn()

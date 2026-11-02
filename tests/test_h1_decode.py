@@ -157,8 +157,8 @@ def test_length_body_truncated_at_eof_is_body_error_unexpected_eof():
 
 
 def test_chunked_body_truncated_at_eof_is_body_error_unexpected_eof():
-    """A chunked body cut before its terminator: EOF inside a chunk (decode.rs L484-491,
-    `IncompleteBody`) or inside the size line (L254, "unexpected EOF during chunk size
+    """A chunked body cut before its terminator: EOF inside a chunk (decode.rs L489-498,
+    `IncompleteBody`) or inside the size line (L258-259, "unexpected EOF during chunk size
     line") are both `UnexpectedEof`."""
     dec = H1BodyDecoder("chunked")
     dec.feed(b"5\r\nhel")

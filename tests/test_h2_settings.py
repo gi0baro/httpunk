@@ -72,7 +72,7 @@ def test_adjust_send_windows_skips_send_closed_streams():
     """A SETTINGS_INITIAL_WINDOW_SIZE change adjusts open streams' send windows but
     SKIPS send-closed ones — matching h2 (its decrease branch guards
     is_send_closed()), which avoids pointlessly adjusting a window we'll never use and a
-    needless inc_window overflow teardown on the increase side (F41)."""
+    needless inc_window overflow teardown on the increase side."""
     conn = _client()
     closed, streaming = Stream(conn.backend), Stream(conn.backend)
     assert conn.try_claim_slot() and conn.try_claim_slot()

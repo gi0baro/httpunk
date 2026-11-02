@@ -33,7 +33,7 @@ class Stream:
         # The peer abandoned the stream (RST_STREAM, or a GOAWAY that dropped it), or the
         # connection died — the SEND side's observation (h2 `poll_reset`); `stop` is set first.
         self.reset_evt = backend.event()
-        # Body chunks `(payload, is_budgeted)` (h2 0.4.19 `DataEvent`), then a terminal
+        # Body chunks `(payload, is_budgeted)` (h2 recv.rs `DataEvent`), then a terminal
         # item: `None` = a clean EOF, an `H2Stopped` = the error the reader must raise.
         self.body_send, self.body_recv = backend.queue()
         self.status = None

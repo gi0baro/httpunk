@@ -9,7 +9,7 @@ public per-connection handle, the Python analogue of hyper's
 `SendRequest` collapsed into one async-context-managed object. Low-level by
 design — no pool, connector, or high-level client.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.19.
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 # hyper's HTTP/2 client profile (hyper `proto/h2/client.rs`): a 2 MB per-stream recv
 # window and a 5 MB connection recv window (vs the 65535 protocol default), 16 KB max
 # frame size, 16 KB max header-list size — the hyper *stack's* tuned profile, not
-# bare-h2's empty-SETTINGS defaults (AUDIT-2026-07-09 F24). The connection window is
+# bare-h2's empty-SETTINGS defaults. The connection window is
 # raised by an initial WINDOW_UPDATE(0) (SETTINGS can't carry it).
 _STREAM_WINDOW = 2 * 1024 * 1024
 _CONN_WINDOW = 5 * 1024 * 1024
@@ -60,8 +60,8 @@ class Connection(H2ConnectionBase):
     ):
         # The Rust state takes the role + the hyper profile; the async members are
         # added in `__init__`. We advertise SETTINGS_ENABLE_PUSH=0 + our window/frame/
-        # header-list profile; the DATA-framing budget resolves at handshake (h2 0.4.19
-        # `client::Builder::data_frame_budget`, None = Auto).
+        # header-list profile; h2 counts.rs:106-115 initializes the DATA budget, then
+        # `set_target_connection_window_size` resolves Auto (None) from the target window.
         return H2Streams.__new__(
             cls,
             "client",
@@ -102,10 +102,12 @@ class Connection(H2ConnectionBase):
         self._slot_evt.set()  # wake open/ready waiters (they re-check the stored condition)
 
     async def connect(self):
-        # h2: client.rs `handshake` (L1220) — over the caller-supplied transport,
+        # h2: client.rs `handshake` (L1250) — over the caller-supplied transport,
         # flush the client preface + our initial SETTINGS, spawn the driver, then
         # wait for the peer's initial SETTINGS before we're ready for requests.
         await self._begin()
+        # DIVERGENCE: client.rs L1381 returns without waiting for peer SETTINGS.
+        # Keep this synchronization so connect/close cannot race the coroutine pump's handshake.
         await self._ready_evt.wait()
         err = self.conn_error()
         if err is not None:
@@ -116,7 +118,7 @@ class Connection(H2ConnectionBase):
     async def _acquire_slot(self):
         """Block until a MAX_CONCURRENT_STREAMS slot is free, then claim it (h2
         counts.rs `inc_num_send_streams` gated by `can_inc_num_send_streams`). A GOAWAY
-        / failure that arrives while parked fails this request PROMPTLY (F20). The
+        / failure that arrives while parked fails this request PROMPTLY. The
         waiter idiom: try, clear, try again, wait."""
         while not self.try_claim_slot():
             self._raise_if_dead()
@@ -129,7 +131,7 @@ class Connection(H2ConnectionBase):
     async def _open_stream(self, method, target, headers, *, end_stream, is_head):
         """Gate on MAX_CONCURRENT_STREAMS, then open the stream — id allocation,
         `send_open`, insert, HPACK encode + queue as ONE locked step (ids must be
-        strictly increasing on the wire). h2 streams.rs `send_request` (L218)."""
+        strictly increasing on the wire). h2 streams.rs `send_request` (L265)."""
         # Reject connection-specific request headers before ANY stream/slot state is
         # touched (h2 send.rs `send_headers` -> `check_headers`): a caller error.
         self.check_send_headers(headers)
@@ -247,7 +249,7 @@ class H2Connection(BaseClientConnection):
         """Wait until the connection can accept a new request — it's alive (not
         failed, no GOAWAY received) and a MAX_CONCURRENT_STREAMS slot is free —
         then return. Raises if the connection has failed or the peer sent GOAWAY.
-        Mirrors h2's `SendRequest::ready` (client.rs L401). Best-effort /
+        Mirrors h2's `SendRequest::ready` (client.rs L406). Best-effort /
         non-reserving: `send_request` re-applies the same backpressure."""
         return self._conn._wait_until_ready()
 
@@ -268,20 +270,20 @@ class H2Connection(BaseClientConnection):
     async def send_request(self, request: Request) -> Response:
         """Send `request` and return its `Response` once the head arrives.
 
-        h2: client.rs `SendRequest::send_request` (L512). Open the stream + send
+        h2: client.rs `SendRequest::send_request` (L517). Open the stream + send
         HEADERS, stream the body, then await the response head.
         """
         # A bodyless request carries END_STREAM on HEADERS (h2 `send_request` with
         # `end_of_stream`), not a trailing empty DATA frame; a statically-empty body is
-        # bodyless too (F39). A HEAD request's response never has a body regardless of
+        # bodyless too. A HEAD request's response never has a body regardless of
         # content-length.
         bodyless = request.body is None or (isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0)
-        # Validate trailers BEFORE opening the stream (h2 0.4.16 #925): they are sent by
+        # Validate trailers BEFORE opening the stream (h2 send.rs:80-104): they are sent by
         # the detached background body writer, whose errors are suppressed — a late
         # reject there would silently leave the stream half-open.
         if request.trailers is not None:
             self._conn.check_send_headers(request.trailers)
-        # Trailers ride a trailing HEADERS frame (END_STREAM) AFTER the body (F45).
+        # Trailers ride a trailing HEADERS frame (END_STREAM) AFTER the body.
         end_stream = bodyless and request.trailers is None
         is_head = H2Codec.method_is_head(request.method)
         stream = await self._conn._open_stream(
@@ -304,5 +306,5 @@ class H2Connection(BaseClientConnection):
             if err is not None:
                 raise fresh_exc(err) from err
             raise ConnectionClosedError("connection closed before response")
-        # h2 stamps every response `Version::HTTP_2` (h2 client.rs L1722).
+        # h2 stamps every response `Version::HTTP_2` (h2 client.rs L1726).
         return Response(stream.status, stream.headers, H2ResponseBody(stream, self._conn), version=Version.HTTP_2)

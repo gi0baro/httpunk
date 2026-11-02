@@ -125,7 +125,7 @@ pub(crate) fn protocol_err_with_debug(reason: Reason, msg: &str, data: &[u8]) ->
 ///   sends GOAWAY and tears down.
 /// - `Io` is a transport error, NOT a protocol violation, so it surfaces as a
 ///   `ConnectionClosedError` (transport-closed) rather than a PROTOCOL_ERROR
-///   GOAWAY (G41). It is still unreachable at the state-machine call sites wired
+///   GOAWAY. It is still unreachable at the state-machine call sites wired
 ///   today (they only return `library_go_away`/stored `Reset`), but a future
 ///   call site that can produce `Io` now maps correctly.
 pub(crate) fn map_proto_err(e: &Error) -> PyErr {

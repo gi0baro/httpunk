@@ -304,7 +304,7 @@ impl HeaderMap {
 /// Register the `http`-crate wrappers on the extension module.
 /// The current `Date` header value (RFC 9110 IMF-fixdate), from hyper's cached
 /// per-second clock — the same bytes the h1 response encoder writes, for the h2
-/// server's `Date` (hyper proto/h2/server.rs L484).
+/// server's `Date` (hyper proto/h2/server.rs L477-481).
 #[pyfunction]
 fn http_date(py: Python<'_>) -> Py<PyBytes> {
     PyBytes::new(py, vendor_hyper::date_header_value().as_bytes()).unbind()
@@ -314,7 +314,7 @@ fn http_date(py: Python<'_>) -> Py<PyBytes> {
 /// — the parser hyper uses for every request target (`src/h1/codec.rs`,
 /// `src/h2/codec.rs`), so the util layer's destination handling agrees with it.
 /// `host` is the host to DIAL: an IPv6 literal without its brackets, as hyper-util's
-/// connector strips them (`client/legacy/connect/http.rs`, `trim_matches`); `port`
+/// `client::strip_ipv6_brackets` does (`client/mod.rs:14-18`); `port`
 /// is the explicit port, else the scheme's default (http/ws 80, https/wss 443); and
 /// `authority` is `Uri::host` (brackets kept) + `:port` — httpunk's `:authority` /
 /// `Host` form. A `None` host or unknown scheme leaves the dependent parts `None`.

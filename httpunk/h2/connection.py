@@ -18,7 +18,7 @@ The client `Connection` (client.py) and the server `ServerConnection`
 what remains role-specific here is async glue only: the client's ready/slot
 events, the server's accept queue.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.19 (see
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20 (see
 crates/vendor-h2), paths relative to its `src/`.
 """
 
@@ -72,7 +72,7 @@ class H2ConnectionBase(H2Streams):
         self.backend = _backend.resolve(backend)
         self._transport = transport
         # Set by the last background request-body writer to finish once `close()` is
-        # draining (client full-duplex send, F6): hyper's connection task ends only
+        # draining (client full-duplex send): hyper's connection task ends only
         # after every `PipeToSendStream` dropped its `conn_drop_ref`. Writers are bare
         # tasks, never cancelled: a stopped stream (peer reset, GOAWAY, the connection
         # failed or closed) is what ends one.
@@ -174,7 +174,7 @@ class H2ConnectionBase(H2Streams):
 
     def _raise_if_dead(self):
         """Raise the stored condition: the peer's GOAWAY first (the retry-relevant
-        one; h2's `recv_eof` never overwrites an existing conn_error, F20), then the
+        one; h2's `recv_eof` never overwrites an existing conn_error), then the
         connection error. Copies per raise."""
         info = self.goaway_info()
         if info is not None:
@@ -230,8 +230,8 @@ class H2ConnectionBase(H2Streams):
     async def close(self):
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never cancel it
         # (a cancellation landing between its take and its flush would lose control
-        # frames). Drain what is enqueued (h2 `codec.shutdown` = flush THEN shutdown,
-        # F23), shut the transport down — `FramedWrite::shutdown` ends in the IO's
+        # frames). Drain what is enqueued (h2 `codec.shutdown` = flush THEN shutdown),
+        # shut the transport down — `FramedWrite::shutdown` ends in the IO's
         # `poll_shutdown` (`close_notify` over TLS), which is also what ends the read
         # pump's parked read — join it, and wake every straggler. On a transport that
         # already died the alert cannot go out and the shutdown is the plain close
@@ -251,7 +251,7 @@ class H2ConnectionBase(H2Streams):
         handle = self.take_read_handle()
         if handle is not None:
             await handle
-        self._fail(None)  # no-op when the pump already failed everyone (F44)
+        self._fail(None)  # no-op when the pump already failed everyone
         if not self.release_writers():
             await self._writers_evt.wait()
 
@@ -308,7 +308,7 @@ class H2ConnectionBase(H2Streams):
                     except H2StreamError as se:
                         # Stream-level violation (`Error::Reset`): RST just that stream and
                         # keep going. A REMOTE-initiated reset is the peer's own RST_STREAM
-                        # surfacing — h2 sends nothing back (F25).
+                        # surfacing — h2 sends nothing back.
                         if server:
                             spare = Stream(self.backend)  # the failing frame may have consumed it
                         if se.args[2] != "remote":
@@ -317,7 +317,7 @@ class H2ConnectionBase(H2Streams):
                                 self._notify_reset(v.handle, v.stop)
                             self._after(v.flags)
                 # After a peer GOAWAY, once every in-flight stream has finished, queue our
-                # acknowledging GOAWAY(NO_ERROR) and stop serving (F23; h2 `go_away_now`).
+                # acknowledging GOAWAY(NO_ERROR) and stop serving (h2 `go_away_now`).
                 flags = self.maybe_goaway_reply()
                 if flags:
                     self._after(flags)
@@ -340,7 +340,7 @@ class H2ConnectionBase(H2Streams):
             self._fail(exc)
 
     def _dispatch(self, frame, spare):
-        # h2: the frame match in proto/connection.rs `recv_frame` (L518). Each arm is
+        # h2: the frame match in proto/connection.rs `recv_frame` (L560). Each arm is
         # one call into the state, then the acts its verdict asks for.
         if isinstance(frame, Headers):
             v = self.recv_headers(frame, spare)
@@ -410,7 +410,7 @@ class H2ConnectionBase(H2Streams):
         resumes after the client's inline attempt queued its head (`_send_body_inline`)."""
         if isinstance(body, bytes):
             # hyper's `Full` body: one poll yields the whole chunk with `is_end_stream()`
-            # set — one DATA carrying END_STREAM (or the trailers carry it, F45).
+            # set — one DATA carrying END_STREAM (or the trailers carry it).
             if trailers is None:
                 await self._send_data(st, body, end_stream=True, offset=offset)
                 return
@@ -430,7 +430,7 @@ class H2ConnectionBase(H2Streams):
                     await self._send_data(st, pending, end_stream=False)
                 pending = bytes(chunk)
         if trailers is not None:
-            # END_STREAM rides the trailing HEADERS frame, not the last DATA (F45).
+            # END_STREAM rides the trailing HEADERS frame, not the last DATA.
             if pending is not _UNSET and pending:
                 await self._send_data(st, pending, end_stream=False)
             self._send_trailers(st, trailers)

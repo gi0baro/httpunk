@@ -70,7 +70,7 @@ cp "$SRC/src/error.rs" "$DST/error.rs"
 #   and `crate::Error` is vendored above, so `ensure_reason` is byte-identical.)
 perl -0pi -e 's/pub fn recv_open\(&mut self, frame: &frame::Headers\) -> Result<bool, Error> \{\n        let mut initial = false;\n        let eos = frame\.is_end_stream\(\);/pub fn recv_open(\&mut self, eos: bool, informational: bool) -> Result<bool, Error> {\n        let mut initial = false;/' "$DST/proto/streams/state.rs"
 perl -0pi -e 's/frame\.is_informational\(\)/informational/g' "$DST/proto/streams/state.rs"
-#   d. strip the trailing inline `#[cfg(test)] mod tests` (added in 0.4.16): it
+#   d. strip the trailing inline `#[cfg(test)] mod tests`: it
 #      drives `recv_open(&frame::Headers)`, the pre-shim signature from (b), so it
 #      can't compile against the shimmed file (same tradeoff as hyper's stripped
 #      decode.rs/date.rs test modules).

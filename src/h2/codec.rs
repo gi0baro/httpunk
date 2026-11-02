@@ -282,12 +282,12 @@ pub struct Data {
     pub data: Py<PyBytes>,
     /// h2 `frame::Data::flow_controlled_len` — payload + padding + the pad-length
     /// byte. Flow control counts padding; `data` (the payload) does not, so the
-    /// driver must account windows on this, not `len(data)` (h2 recv.rs L643).
+    /// driver must account windows on this, not `len(data)` (h2 recv.rs L653).
     #[pyo3(get)]
     pub flow_controlled_len: usize,
     /// The flow-controlled overhead the app never sees: `flow_controlled_len` minus the
     /// payload (the padding + its length byte, 0 when unpadded) — what h2's `recv_data`
-    /// releases back to the windows on the app's behalf (recv.rs L740-750).
+    /// releases back to the windows on the app's behalf (recv.rs L749-759).
     #[pyo3(get)]
     pub padding: usize,
 }
@@ -432,7 +432,7 @@ impl Decoder {
     }
 
     /// Feed inbound bytes; return the complete frames now decodable. A server-role
-    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1427-1441:
+    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1454-1477:
     /// a mismatch is a connection PROTOCOL_ERROR).
     pub(super) fn receive_frames(
         &mut self,
@@ -463,7 +463,7 @@ impl Decoder {
                 | usize::from(self.buf[2]);
             // Enforce SETTINGS_MAX_FRAME_SIZE on the *declared* length before
             // buffering the payload (h2: LengthDelimitedCodec `max_frame_length`
-            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:425). This both rejects
+            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:439-444). This both rejects
             // frames h2 rejects and prevents buffering an over-size payload.
             if payload_len > self.max_recv_frame_size {
                 return Err(protocol_err(
@@ -488,7 +488,7 @@ impl Decoder {
     }
 
     /// Feed bytes of the client connection preface (RFC 9113 §3.4) — h2 server.rs
-    /// L1427-1441: `None` while the bytes so far match but the 24 are not all in yet,
+    /// L1454-1477: `None` while the bytes so far match but the 24 are not all in yet,
     /// `Some(true)` once the whole preface matched (any bytes past it are already in
     /// the frame buffer), `Some(false)` on a mismatch.
     pub(super) fn feed_preface(&mut self, data: &[u8]) -> Option<bool> {
@@ -669,7 +669,7 @@ pub(super) fn build_request_headers(
 }
 
 /// Build a response HEADERS frame. `auto_date`: hyper's h2 server inserts `Date`
-/// when the app didn't set one (proto/h2/server.rs L484
+/// when the app didn't set one (proto/h2/server.rs L483
 /// `entry(DATE).or_insert_with(date::update_and_header_value)`).
 pub(super) fn build_response_headers(
     stream_id: u32,
@@ -693,7 +693,7 @@ pub(super) fn build_response_headers(
 }
 
 /// A trailing HEADERS frame (no pseudo-headers, END_STREAM set) — request/response
-/// trailers sent after the DATA frames (h2 `frame::Headers::trailers`) (F45).
+/// trailers sent after the DATA frames (h2 `frame::Headers::trailers`).
 pub(super) fn build_trailers(stream_id: u32, fields: http::HeaderMap) -> frame::Headers {
     frame::Headers::trailers(frame::StreamId::from(stream_id), fields)
 }

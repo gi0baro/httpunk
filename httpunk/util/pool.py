@@ -204,10 +204,10 @@ class Cache:
             conn = self._idle.pop() if self._idle else None
         if conn is not None:
             return conn
-        # Deliberate simplification vs hyper-util (F50, documented WON'T-FIX): on an
+        # DIVERGENCE: by maintainer choice, Cache has no waiter queue: on an
         # empty pool we connect straight away rather than registering a waiter that
-        # RACES an in-flight connection's return-to-pool (hyper-util `pool::Checkout` +
-        # the `waiters` queue in `put`). A faithful race needs a detached connect that
+        # RACES an in-flight connection's return-to-pool (hyper-util `CacheFuture::Racing`,
+        # cache.rs:277-291, and the waiter reservations in `put`, cache.rs:456-465). A faithful race needs a detached connect that
         # runs to completion and is pooled if it loses (cancelling it mid-handshake
         # would leak a half-open socket), plus Client-level connection-establishment
         # coordination this low-level `Cache` doesn't own. It also barely reduces the
@@ -290,9 +290,9 @@ class _Lease:
         if exc_type is None and not (conn.closed or conn.busy) and self._cache._checkin(conn):
             pass  # clean exit + completed exchange -> idle set
         else:
-            # Deliberate simplification vs hyper-util (F51, documented WON'T-FIX): on ANY
-            # exception during use we close the connection, whereas hyper-util returns it
-            # to the pool when it's still open (`is_open()`). The sync `closed or busy`
+            # DIVERGENCE: by maintainer choice, on ANY exception during use we close
+            # the connection, whereas hyper-util returns it to the pool unless marked
+            # closed (cache.rs:430-443). The sync `closed or busy`
             # check above could now discriminate here too, but closing on error stays
             # the safe, conservative choice; the only cost is not reusing a connection
             # whose exchange happened to complete before the caller raised for an
@@ -303,7 +303,7 @@ class _Lease:
 
 def _default_key(url):
     # Normalize the port from the scheme when absent, so `http://x` and `http://x:80`
-    # route to the SAME per-destination pool rather than two (F52) — the same `Uri`
+    # route to the SAME per-destination pool rather than two — the same `Uri`
     # split `connect()` canonicalizes a connection's destination with.
     scheme, host, port, _authority = uri_parts(url)
     return (scheme, host, port)
@@ -349,8 +349,11 @@ class Map:
     async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Prune stale connections across every per-destination pool — forwards
         `retain(predicate)` to each inner pool (the eviction hook, consistent with
-        `Singleton`/`Cache`) (F52). Empty inner pools are left in place (rebuilt lazily
+        `Singleton`/`Cache`). Empty inner pools are left in place (rebuilt lazily
         anyway); use `clear()` to drop the routing table itself."""
+        # DIVERGENCE: hyper-util map.rs:88-93 `retain(|key, service| ...)` removes whole
+        # destinations from the map; this filters connections inside every destination's
+        # pool and never removes a destination.
         with self._lock:
             pools = list(self._pools.values())
         for pool in pools:
@@ -358,7 +361,7 @@ class Map:
 
     async def clear(self) -> None:
         """Close every per-destination pool and drop the routing table; the `Map`
-        stays usable and rebuilds pools lazily on the next `pool_for` (F52)."""
+        stays usable and rebuilds pools lazily on the next `pool_for`."""
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
         for pool in pools:

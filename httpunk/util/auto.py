@@ -154,7 +154,7 @@ class Http1Builder:
 
     def header_read_timeout(self, seconds: float | None) -> Http1Builder:
         """Max time to read a complete request head before closing (slowloris defence,
-        hyper http1.rs L249). `None` disables it (hyper: `Into<Option<Duration>>`).
+        hyper server/conn/http1.rs L360-373). `None` disables it (hyper: `Into<Option<Duration>>`).
         Default 30s."""
         return self._set("header_read_timeout", seconds)
 
@@ -228,7 +228,9 @@ class Http2Builder:
         return self._set("initial_window_size", sz)
 
     def data_frame_budget(self, budget: int | None) -> Http2Builder:
-        """DATA-framing budget; `None` = h2's Auto (h2 server.rs:1067)."""
+        """DATA-framing budget; `None` = h2's Auto: half the target connection window,
+        at least 25,600 bytes (h2 server.rs:1064-1067). Upstream updates Auto via
+        counts.rs:112-116; httpunk sets the target only at handshake."""
         # DIVERGENCE: h2's data_frame_budget is surfaced by neither hyper nor
         # hyper-util; httpunk keeps this option by the maintainer's choice.
         return self._set("data_frame_budget", budget)

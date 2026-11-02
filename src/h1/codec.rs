@@ -83,9 +83,9 @@ struct State {
     /// `bytes` the driver writes.
     head_buf: Vec<u8>,
     /// The in-flight request carried `Connection: close` (any line): hyper's client
-    /// `encode_head` -> `connection_any_close` -> `disable_keep_alive` (1.11.1).
+    /// `encode_head` -> `connection_any_close` -> `disable_keep_alive` (hyper 1.12.0).
     request_connection_close: bool,
-    /// hyper conn.rs `state.allow_trailer_fields` (L328): the parsed request declared
+    /// hyper conn.rs `state.allow_trailer_fields` (L334): the parsed request declared
     /// `TE: trailers`. True until a request head is parsed, so a client-role codec
     /// (which never parses one) always sends its trailers (`write_trailers` gates on
     /// `T::is_server()`).
@@ -144,7 +144,7 @@ impl H1Codec {
                 "the max_buf_size cannot be smaller than {MINIMUM_MAX_BUFFER_SIZE}"
             )));
         }
-        // hyper client/conn/http1.rs:388-443, server/conn/http1.rs:300-318.
+        // hyper client/conn/http1.rs:388-443, server/conn/http1.rs:293-309.
         let mut parser_config = ParserConfig::default();
         parser_config
             .ignore_invalid_headers_in_requests(ignore_invalid_headers)
@@ -201,7 +201,7 @@ impl H1Codec {
     }
 
     /// The interim response hyper's server writes for `Expect: 100-continue`
-    /// (conn.rs L409).
+    /// (conn.rs L415).
     #[staticmethod]
     fn continue_response(py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, CONTINUE_RESPONSE).unbind()
@@ -307,7 +307,7 @@ impl H1Codec {
     /// Only the fields the message's own `Trailer` header declared are emitted; the
     /// rest are dropped by hyper's `encode_trailers`, and a non-chunked body gets the
     /// bare terminator. On the server, trailers go out only if the request declared
-    /// `TE: trailers` (conn.rs `write_trailers` L740: "trailers not allowed to be
+    /// `TE: trailers` (conn.rs `write_trailers` L757: "trailers not allowed to be
     /// sent"), the body then ending as usual (`end_body`).
     fn serialize_trailers(&self, py: Python<'_>, trailers: &HeaderMap) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
@@ -369,7 +369,7 @@ impl H1Codec {
     /// True when the in-flight body framing carries no body (a bodyless response
     /// to HEAD/204/304, or a zero-length request). The driver skips polling the
     /// caller's body in this case, mirroring hyper's `write_head` `encoder.is_eof()`
-    /// gate (conn.rs) — so a supplied body iterable is never drained (G37). No
+    /// gate (conn.rs) — so a supplied body iterable is never drained. No
     /// encoder in flight also counts as "no body".
     fn body_is_eof(&self) -> bool {
         self.inner
@@ -461,7 +461,7 @@ impl H1Codec {
                 // Remember the method so a response's bodyless-ness (HEAD/204/304)
                 // is computed correctly by `encode_response`.
                 st.req_method = Some(head.method.clone());
-                st.allow_trailer_fields = head.allow_trailers; // conn.rs `read_head` L328
+                st.allow_trailer_fields = head.allow_trailers; // conn.rs `read_head` L334
                 let headers = Py::new(py, HeaderMap::from_inner(head.headers))?;
                 let event = Py::new(
                     py,
@@ -829,7 +829,7 @@ impl H1BodyDecoder {
     }
 
     /// Bytes buffered past the body, without moving them — hyper's
-    /// `!read_buf().is_empty()` (`require_empty_read`, conn.rs L463-465).
+    /// `!read_buf().is_empty()` (`require_empty_read`, conn.rs L465-468).
     #[getter]
     pub(super) fn buffered(&self) -> usize {
         self.inner.lock().unwrap().buffered()

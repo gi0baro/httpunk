@@ -108,7 +108,7 @@ async def test_select_returns_winner_and_cancels_loser():
 async def test_send_all_raises_after_connection_lost():
     # A write to a dead socket must FAIL — asyncio silently discards writes after
     # connection_lost, but tonio (like a raw socket) raises, and drivers detect a
-    # dead peer that way (F32). Surface the real error, or EPIPE on a clean FIN.
+    # dead peer that way. Surface the real error, or EPIPE on a clean FIN.
     s = _AsyncioStream()
     s.connection_made(_FakeTransport())
     s.connection_lost(ConnectionResetError("peer reset"))
@@ -179,7 +179,7 @@ async def test_backend_close_transport_aborts_and_shutdown_transport_closes():
 @pytest.mark.asyncio
 async def test_second_concurrent_receive_some_raises():
     # The single-reader contract: a second receive_some while one is parked must fail
-    # loudly rather than clobber the first's waiter and hang it forever (F55).
+    # loudly rather than clobber the first's waiter and hang it forever.
     s = _AsyncioStream()
     s.connection_made(None)
     first = asyncio.ensure_future(s.receive_some())  # parks: buffer empty, no EOF
@@ -192,7 +192,7 @@ async def test_second_concurrent_receive_some_raises():
 @pytest.mark.asyncio
 async def test_select_prefers_argument_order_when_both_ready():
     # Among racers ready in the same wakeup the winner is the FIRST argument, matching
-    # tonio's spawn-in-order select (asyncio.wait's `done` set is unordered) — F33c.
+    # tonio's spawn-in-order select (asyncio.wait's `done` set is unordered).
     backend = AsyncioBackend()
 
     async def a():
@@ -208,7 +208,7 @@ async def test_select_prefers_argument_order_when_both_ready():
 @pytest.mark.asyncio
 async def test_select_discards_losing_exception():
     # A loser that raises (here, on cancellation) must NOT surface out of select —
-    # only the winner's outcome propagates (F33c). The old drain only caught
+    # only the winner's outcome propagates. The old drain only caught
     # CancelledError, so a loser's other exception leaked.
     backend = AsyncioBackend()
 
@@ -226,7 +226,7 @@ async def test_select_discards_losing_exception():
 
 @pytest.mark.asyncio
 async def test_select_cancels_racers_when_itself_cancelled():
-    # If select is cancelled its racers are cancelled too — no orphans (F33c).
+    # If select is cancelled its racers are cancelled too — no orphans.
     backend = AsyncioBackend()
     cancelled = []
 

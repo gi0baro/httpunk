@@ -76,8 +76,8 @@ async def test_server_post_echo_body():
 @pytest.mark.tonio
 async def test_client_gets_early_response_despite_body_reset():
     """A server that responds before reading the request body resets the stream while
-    the client is still uploading (F3: RST_STREAM(NO_ERROR)). The client must still
-    return the received response — the body-send error must not mask it (F6). The body
+    the client is still uploading (RST_STREAM(NO_ERROR)). The client must still
+    return the received response — the body-send error must not mask it. The body
     exceeds the flow-control window, so the send is guaranteed in-flight (blocked on a
     WINDOW_UPDATE) when the RST lands."""
     listener, host, port = await _listener()
@@ -187,7 +187,7 @@ async def test_server_request_headers():
             assert resp.status == 204
             assert await resp.read() == b""
         s.cancel()
-    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1676)
+    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1674)
 
     assert seen["scheme"] == "http"
     assert seen["authority"] == f"{host}:{port}"
@@ -333,7 +333,7 @@ async def _read_frame(transport, codec, kind):
 async def test_server_rsts_unread_request_body_with_no_error():
     """A server that responds without consuming the request body drops the request:
     while the client is still sending (recv half open), h2 sends RST_STREAM(NO_ERROR)
-    so it stops (the nginx-compat `maybe_cancel` rule). Regression guard for F3 — the
+    so it stops (the nginx-compat `maybe_cancel` rule). The
     unread upload used to pin the connection window with no RST ever sent."""
     listener, host, port = await _listener()
 
@@ -361,7 +361,7 @@ async def test_server_rsts_unread_request_body_with_no_error():
 
 @pytest.mark.tonio
 async def test_server_advertises_hyper_settings_profile():
-    """The server ships hyper's tuned profile (F24), not bare-h2 defaults: its initial
+    """The server ships hyper's tuned profile, not bare-h2 defaults: its initial
     SETTINGS carry MAX_CONCURRENT_STREAMS=200, a 1 MB stream window, 16 KB max frame,
     16 KB max header list, and NO ENABLE_PUSH; plus an initial WINDOW_UPDATE(0) that
     raises the connection recv window from 65535 to 1 MB."""
@@ -392,7 +392,7 @@ async def test_server_advertises_hyper_settings_profile():
 async def test_forgotten_stream_frames_swallowed_after_first_rst():
     """A frame on a forgotten (closed) stream draws ONE RST_STREAM(STREAM_CLOSED); the
     id then enters the reset store, so further frames on it are silently swallowed
-    rather than each drawing another RST (F17 — the reset-amplification defence)."""
+    rather than each drawing another RST (the reset-amplification defence)."""
     listener, host, port = await _listener()
     async with scope() as s:
         s.spawn(_serve_forever(listener))  # 200 (bodyless) per request
@@ -537,7 +537,7 @@ async def test_server_max_local_error_reset_streams_option():
 
 @pytest.mark.tonio
 async def test_server_response_date_header_option():
-    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L484),
+    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L483),
     gated by `auto_date_header`; an app-supplied `Date` is kept."""
     listener, host, port = await _listener()
 
@@ -708,7 +708,7 @@ async def test_server_respond_with_trailers():
 async def test_server_reset_received_after_end_stream_then_respond_fails_with_reason():
     """A RST_STREAM arriving after the request's END_STREAM (a GET the client cancels)
     is observable via `reset_received()` with the peer's reason, and a later `respond()`
-    fails with that same reason — hyper's first `poll_reset` window (server.rs L458)."""
+    fails with that same reason — hyper's first `poll_reset` window (proto/h2/server.rs L456)."""
     listener, host, port = await _listener()
     seen, done = [], Event()
 
@@ -857,7 +857,7 @@ async def test_server_goaway_on_remote_reset_flood():
     """Rapid Reset (CVE-2023-44487): a flood of HEADERS+RST_STREAM on streams the app
     never accepts. Reset pending-accept streams stop counting as concurrent, so
     MAX_CONCURRENT can't gate the flood; h2 caps them separately (20) and tears the
-    connection down with GOAWAY(ENHANCE_YOUR_CALM). Regression guard for F4."""
+    connection down with GOAWAY(ENHANCE_YOUR_CALM)."""
     listener, host, port = await _listener()
 
     async def serve():
@@ -977,7 +977,7 @@ async def test_server_goaway_on_rst_stream_zero():
 
 @pytest.mark.tonio
 async def test_h2_request_trailers_round_trip():
-    """Request trailers (F45): the client sends them as a trailing HEADERS frame
+    """Request trailers: the client sends them as a trailing HEADERS frame
     (END_STREAM) after the DATA frames; the H2Server decodes them into `req.trailers`."""
     listener, host, port = await _listener()
     seen = {}
@@ -1005,7 +1005,7 @@ async def test_h2_request_trailers_round_trip():
 @pytest.mark.tonio
 async def test_h2_connection_specific_trailers_rejected():
     """Trailers are a HEADERS block, so connection-specific fields are rejected
-    (RFC 9113 §8.2.2; h2 0.4.16 #925) — BEFORE the stream is opened, so the
+    (RFC 9113 §8.2.2; h2 send.rs:80-104) — BEFORE the stream is opened, so the
     connection stays fully usable and a subsequent valid trailer still sends."""
     listener, host, port = await _listener()
     seen = {}
@@ -1088,7 +1088,7 @@ async def test_h2_connection_specific_response_headers_rejected():
 @pytest.mark.tonio
 async def test_h2_bodyless_request_with_trailers():
     """A request with trailers but NO body still ends on the trailing HEADERS frame
-    (HEADERS + trailers, no DATA) rather than END_STREAM on the request HEADERS (F45)."""
+    (HEADERS + trailers, no DATA) rather than END_STREAM on the request HEADERS."""
     listener, host, port = await _listener()
     seen = {}
 
@@ -1111,7 +1111,7 @@ async def test_h2_bodyless_request_with_trailers():
     assert seen["trailers"].get("x-done") == b"1"
 
 
-# ===== peer GOAWAY → acknowledging GOAWAY + connection done (F23, server role) =====
+# ===== peer GOAWAY → acknowledging GOAWAY + connection done (server role) =====
 
 
 async def _serve_and_report(listener, done):
@@ -1173,7 +1173,7 @@ async def _assert_goaway_then_eof(transport, codec, done, *, seen=None):
 async def test_server_closes_after_goaway_reply_when_idle(last_id):
     """Peer GOAWAY on an idle connection (one completed request): the server sends its
     acknowledging GOAWAY(NO_ERROR) AND closes the connection / ends the accept loop —
-    h2 `go_away_now` → `should_close_now` → the connection future resolves (F23).
+    h2 `go_away_now` → `should_close_now` → the connection future resolves.
     Previously only the GOAWAY went out and the socket leaked forever."""
     listener, host, port = await _listener()
     done = Event()
@@ -1219,7 +1219,7 @@ async def test_server_closes_after_goaway_reply_no_streams_ever():
 async def test_server_closes_after_goaway_received_mid_request():
     """Peer GOAWAY(last=1) while stream 1 is still in flight, and the peer sends NOTHING
     more. Stream 1 finishing is a local event — h2's `drop_stream_ref` wakes the
-    connection task so the idle check re-runs (streams.rs L1647); httpunk must do the
+    connection task so the idle check re-runs (streams.rs L1673-1675); httpunk must do the
     same from the stream-close path, not only after inbound bytes."""
     listener, host, port = await _listener()
     done = Event()
@@ -1243,30 +1243,37 @@ async def test_server_closes_after_goaway_received_mid_request():
 
 
 @pytest.mark.tonio
-async def test_server_keeps_serving_after_phase1_goaway():
-    """A phase-1 graceful GOAWAY (last_stream_id = 2^31-1) is NOT an idle-close
-    trigger: the connection must stay open and keep serving (h2 `should_close_on_idle`
-    excludes `StreamId::MAX`)."""
+async def test_server_closes_idle_after_phase1_goaway():
+    """A received GOAWAY closes an idle connection whatever its last-stream-id, a
+    phase-1 graceful one (2^31-1) included: h2 stores every received GOAWAY in
+    `inner.error` (proto/connection.rs L596) and, once no stream remains, replies
+    GOAWAY(NO_ERROR) and closes (L327-333). `should_close_on_idle`'s `StreamId::MAX`
+    exclusion concerns only a GOAWAY the server sent itself (go_away.rs L108-114)."""
     listener, host, port = await _listener()
     done = Event()
     async with scope() as s:
         s.spawn(_serve_and_report(listener, done))
         transport, codec = await _raw_handshake(host, port)
         try:
-            await transport.send_all(codec.serialize_go_away(2**31 - 1, H2Reason.NO_ERROR))
-            await transport.send_all(codec.serialize_request_headers(1, "GET", "http://x/", end_stream=True))
-            seen = []
-            while not any(isinstance(f, Headers) for f in seen):
+            # Finish the SETTINGS exchange first: nothing of ours is still in flight
+            # when the server closes, so its close is a FIN, not a reset.
+            server_settings = our_settings_acked = False
+            while not (server_settings and our_settings_acked):
                 data = await transport.receive_some(65536)
-                assert data, "server closed after a phase-1 GOAWAY"
+                assert data
                 for f in codec.receive(data):
                     if isinstance(f, Settings) and not f.ack:
                         await transport.send_all(codec.serialize_settings_ack())
-                    seen.append(f)
-            assert not any(isinstance(f, GoAway) for f in seen)
-            assert not done.is_set()
-            transport.close()
-            await done.wait()  # the server sees our FIN and exits cleanly
+                        server_settings = True
+                    elif isinstance(f, Settings):
+                        our_settings_acked = True
+            await transport.send_all(codec.serialize_go_away(2**31 - 1, H2Reason.NO_ERROR))
+            seen = []
+            while data := await transport.receive_some(65536):
+                seen.extend(codec.receive(data))
+            goaways = [f for f in seen if isinstance(f, GoAway)]
+            assert [(g.last_stream_id, g.error_code) for g in goaways] == [(0, H2Reason.NO_ERROR)]
+            await done.wait()  # the accept loop ended and the server closed the transport
         finally:
             transport.close()
             s.cancel()

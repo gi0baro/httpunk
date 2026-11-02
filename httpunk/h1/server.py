@@ -27,7 +27,7 @@ the accept loop are the caller's job. Usage:
             body = await request.read()
             await request.respond(200, headers={"content-type": "text/plain"}, body=b"hi")
 
-Cross-reference: hyper 1.11.1 `proto/h1/{role,conn,dispatch}.rs` (server path) and
+Cross-reference: hyper 1.12.0 `proto/h1/{role,conn,dispatch}.rs` (server path) and
 `client/conn`/`server/conn`.
 """
 
@@ -67,11 +67,11 @@ if TYPE_CHECKING:
 
 
 _READ_SIZE = 65536
-# The interim response hyper's server auto-sends for `Expect: 100-continue` (conn.rs L409).
+# The interim response hyper's server auto-sends for `Expect: 100-continue` (conn.rs L415).
 _CONTINUE = H1Codec.continue_response()
-_DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L249)
+_DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (http1.rs L253)
 # The error an in-flight response gets once the client closed its side mid-request —
-# hyper's `IncompleteMessage` from `mid_message_detect_eof` (conn.rs L491-508).
+# hyper's `IncompleteMessage` from `mid_message_detect_eof` (conn.rs L493-510).
 _PEER_CLOSED_MSG = "connection closed before message completed: the client closed its side mid-request"
 
 
@@ -94,7 +94,7 @@ def _codec_options(
         "max_headers": max_headers,
         "max_header_size": max_header_size,
         "ignore_invalid_headers": ignore_invalid_headers,
-        # hyper server/conn/http1.rs:300-303: request-side ParserConfig flag.
+        # hyper server/conn/http1.rs:293-296: request-side ParserConfig flag.
         "allow_multiple_spaces_in_request_line_delimiters": allow_multiple_spaces_in_request_line_delimiters,
         "title_case_headers": title_case_headers,
         "date_header": auto_date_header,
@@ -180,7 +180,7 @@ class ServerRequest:
             # The client is waiting for a 1xx before sending the body (RFC 9110
             # §10.1.1). hyper auto-sends 100 Continue when the body is first polled,
             # but ONLY while `Writing::Init` (before any response) and ONLY for versions
-            # > HTTP/1.0 (conn.rs L409-415, L311) — decided in the state, under the same
+            # > HTTP/1.0 (conn.rs L411-421, L317) — decided in the state, under the same
             # lock as `try_respond`; a responder that lost the race awaits our write.
             try:
                 await conn.write(_CONTINUE)
@@ -258,7 +258,7 @@ class ServerRequest:
         head-time negotiation and completion, plus head+small-body write coalescing.
 
         `trailers` are sent after the body as chunked trailers, symmetric with the
-        client's `Request.trailers` (F45): the body is framed chunked regardless of its
+        client's `Request.trailers`: the body is framed chunked regardless of its
         shape and the fields are declared in a `Trailer` header unless one is already
         set — hyper's encoder emits only declared fields (`Encoder::encode_trailers`).
         On HTTP/1.0 (no chunked framing) they are dropped, as hyper does.
@@ -442,7 +442,7 @@ class ServerConnection(H1Framing, H1ServerState):
             )
         )
         # hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive()` on a Busy (not yet
-        # idle) connection = `KA::Disabled` (http1.rs L463, conn.rs L876): the first response
+        # idle) connection = `KA::Disabled` (http1.rs L483-485, conn.rs L903-910): the first response
         # is encoded `Connection: close` and the connection closes after it. `half_close`
         # (hyper `http1::Builder::half_close`, default False) disables the mid-message watcher.
         return H1ServerState.__new__(cls, codec, transport, keep_alive=keep_alive, half_close=half_close)
@@ -476,7 +476,7 @@ class ServerConnection(H1Framing, H1ServerState):
         self._codec = self.codec  # the one codec the state holds (hyper's `Conn`)
         self._max_buf_size = self._codec.max_buf_size  # the coalescing cap (`_body_plan`), fixed for the connection
         # Max time to read a complete request head before closing (slowloris defence),
-        # hyper's `header_read_timeout` (default 30s, http1.rs L249). `None` disables it.
+        # hyper's `header_read_timeout` (default 30s, http1.rs L253). `None` disables it.
         # hyper's is one `Sleep` per head, polled beside the read; neither backend can
         # poll a timer beside a parked read, so ONE task per connection keeps that clock
         # (`_watch_head_deadline`), spawned at the first head read — hyper starts the
@@ -587,12 +587,12 @@ class ServerConnection(H1Framing, H1ServerState):
         cancelled: a parked `receive_some` ends only via data, EOF, or transport close.
 
         - EOF / transport error while `req`'s response is still in flight: the client is
-          gone — hyper `close_read()` + `IncompleteMessage` (conn.rs L501-504). The state
+          gone — hyper `close_read()` + `IncompleteMessage` (conn.rs L503-506). The state
           marks the request peer-closed (its in-flight `respond()` / `send_data` fail,
           `peer_closed()` resolves) and the connection non-reusable.
         - bytes: a pipelined next request. Left in the slot for the next head read
           (hyper's `read_buf`); NOT re-armed — hyper reads once and returns Pending while
-          the buffer is non-empty (L495).
+          the buffer is non-empty (L497).
         - completed after the response: it was the idle read all along; `next_request`
           takes it via `_recv_head_bytes`."""
         transport = self.transport_ref()
@@ -739,12 +739,12 @@ class ServerConnection(H1Framing, H1ServerState):
         of the previous request first so the wire is positioned at the next head.
 
         hyper: the server `Dispatcher::poll_loop` (dispatch.rs L166) →
-        `poll_read_head` (L292) → `Server::parse`; the drain mirrors
-        `poll_drain_or_close_read` (conn.rs L849-865)."""
+        `poll_read_head` (dispatch.rs L301) → `Server::parse`; the drain mirrors
+        `poll_drain_or_close_read` (conn.rs L876-893)."""
         code, obj = self.begin_read()
         if code == H1_NEXT_RAISE:
             # hyper serializes structurally (the dispatcher won't read the next head
-            # until the response is fully written, dispatch.rs L628-633 /
+            # until the response is fully written, dispatch.rs L634-640 /
             # `try_keep_alive`). Surface the out-of-order use — no response, or a
             # push-style body still open — rather than mis-pairing responses.
             raise RuntimeError("respond to the current request (and finish its body) before reading the next")
@@ -758,7 +758,7 @@ class ServerConnection(H1Framing, H1ServerState):
         if code == H1_NEXT_NONE:
             return None
         codec = self._codec
-        # hyper's `header_read_timeout` (slowloris defence, http1.rs L249; default 30s, `None`
+        # hyper's `header_read_timeout` (slowloris defence, http1.rs L253; default 30s, `None`
         # disables it): ONE clock per head, started by `begin_read` — the first poll for it,
         # i.e. from the moment the connection is idle between requests, so it covers the
         # keep-alive wait plus the head's bytes — never reset by partial bytes (conn.rs
@@ -789,7 +789,9 @@ class ServerConnection(H1Framing, H1ServerState):
             # The transport died at the request boundary — an RST, or a TLS
             # close without close_notify (which httpunk's own abortive
             # `close_transport` produces). The wire outcome is identical to
-            # the clean EOF below, so it surfaces as a clean end-of-iteration (F47).
+            # the clean EOF below, so it surfaces as a clean end-of-iteration.
+            # DIVERGENCE: with a partial head buffered, suppress hyper's IO error
+            # (conn.rs L339-359) to preserve next_request's clean-close contract.
             self._close(self.fail_read())
             return None
         if accepted is None:
@@ -804,7 +806,7 @@ class ServerConnection(H1Framing, H1ServerState):
     def _drain_unread_body(self):
         """Discard an unread request body so the next request parses cleanly, but
         only if it's cheap — a 1:1 mirror of hyper `poll_drain_or_close_read`
-        (conn.rs L849-865), which does EXACTLY ONE `poll_read_body` (`let _ =
+        (conn.rs L876-893), which does EXACTLY ONE `poll_read_body` (`let _ =
         self.poll_read_body(cx)`, then close unless the body reached KeepAlive). Pull a
         single frame: decode one from the already-buffered bytes, or — only if the
         buffer held nothing decodable yet (need-more, not end) — do ONE non-blocking
@@ -876,12 +878,11 @@ class ServerConnection(H1Framing, H1ServerState):
                     self.unpark_idle_read()
                     raise
             if not data:
-                # EOF. A clean EOF between requests (nothing buffered) is a normal
-                # client close. hyper additionally distinguishes a MID-head EOF
-                # (`buffered > 0`) as `Parse::Eof`/`IncompleteMessage` (an error), but
-                # the wire outcome is identical either way — the connection just closes
-                # with no response — so we surface both as a clean end-of-iteration
-                # rather than raise (F47, observability-only).
+                # DIVERGENCE: a mid-head EOF returns a clean end-of-iteration instead
+                # of hyper's IncompleteMessage (io.rs:224-227, conn.rs:339-359) to
+                # preserve next_request's clean-close contract. The wire outcome
+                # is identical: close with no response. An EOF between requests
+                # (nothing buffered) is a normal client close in both.
                 self.unpark_idle_read()  # the park ends without a parse
                 return None
             code = None  # a request's bytes have started arriving — don't interrupt now
@@ -914,7 +915,7 @@ class ServerConnection(H1Framing, H1ServerState):
         try:
             # hyper closes reading before `on_error` (conn.rs L339-345), retaining the
             # last parsed version (L301, State::idle L1132-1161): enforce_version
-            # (L702-727) sends HTTP/1.0 without Connection, or HTTP/1.1 + close (F29).
+            # (L701-727) sends HTTP/1.0 without Connection, or HTTP/1.1 + close.
             head = codec.serialize_response(status, None, keep_alive=False, http10=self.peer_http10)
             await transport.send_all(codec.serialize_head_and_body(head))  # one write (coalesced)
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
@@ -1125,7 +1126,7 @@ class H1Server(BaseServer[ServerRequest]):
         `title_case_headers`, `ignore_invalid_headers` (skip malformed request header
         lines instead of rejecting with 400), `allow_multiple_spaces_in_request_line_delimiters`
         (accept multiple spaces between method, target and version; default False,
-        hyper server/conn/http1.rs:300-303), `half_close` (True: a client that shuts
+        hyper server/conn/http1.rs:293-296), `half_close` (True: a client that shuts
         its write side mid-request is NOT treated as gone — the response still completes;
         default False, where that EOF fails the in-flight response and `peer_closed()`)."""
         # DIVERGENCE: preserve_header_case is not supported (maintainer's choice;

@@ -37,7 +37,7 @@ use crate::proto::{BodyLength, MessageHead, RequestLine};
 pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// The interim response hyper's server writes for `Expect: 100-continue` when the
-/// body is first polled (conn.rs L409).
+/// body is first polled (conn.rs L415).
 pub const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 /// hyper `io.rs` `DEFAULT_MAX_BUFFER_SIZE` (L23) / `MINIMUM_MAX_BUFFER_SIZE` (L18):
@@ -46,7 +46,7 @@ pub const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 pub const DEFAULT_MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 pub const MINIMUM_MAX_BUFFER_SIZE: usize = 8192;
 
-/// conn.rs `has_h2_prefix` (L206-209): the read buffer starts with the h2 preface.
+/// conn.rs `has_h2_prefix` (L211-214): the read buffer starts with the h2 preface.
 pub fn has_h2_prefix(read_buf: &[u8]) -> bool {
     read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
 }
@@ -58,7 +58,7 @@ pub fn too_large_error() -> crate::Error {
 }
 
 /// What hyper's server does with a head parse failure — conn.rs `on_parse_error`
-/// (L819-835): a buffer holding the h2 preface becomes `Parse::VersionH2` (no
+/// (L836-853): a buffer holding the h2 preface becomes `Parse::VersionH2` (no
 /// response, the connection just closes); otherwise `Server::on_error` picks the
 /// automatic response status (400 / 414 / 431, role.rs `on_error`), `None` when
 /// hyper answers nothing. Returns the error to raise and that status.
@@ -197,8 +197,8 @@ pub struct ParsedHead {
     /// caller takes over the raw transport (hyper `wants_upgrade` / `Upgraded`).
     pub wants_upgrade: bool,
     /// The response was HTTP/1.0. hyper's client remembers this (`state.version`,
-    /// conn.rs L295) and downgrades subsequent requests on the reused connection
-    /// to HTTP/1.0 (`enforce_version`, conn.rs L682-702).
+    /// conn.rs L301) and downgrades subsequent requests on the reused connection
+    /// to HTTP/1.0 (`enforce_version`, conn.rs L701-709).
     pub http10: bool,
 }
 
@@ -230,7 +230,7 @@ pub struct ParsedRequest {
 
 /// Any `Connection` header line carries a `close` token — hyper `headers::
 /// connection_any_close`, what the client's `encode_head` checks to disable
-/// keep-alive up front (1.11.1) and what `Server::encode` treats as `is_last`.
+/// keep-alive up front (hyper 1.12.0) and what `Server::encode` treats as `is_last`.
 pub fn connection_any_close(headers: &HeaderMap) -> bool {
     crate::headers::connection_any_close(headers)
 }
@@ -327,7 +327,7 @@ fn write_buf(mut buf: impl Buf, dst: &mut [u8]) {
 impl BodyEncoder {
     /// True when the framing carries no body (a `Content-Length: 0` / bodyless
     /// encoder). hyper's `write_head` uses `Encoder::is_eof()` to skip polling the
-    /// body entirely (conn.rs L595-605); the driver does the same so a bodyless
+    /// body entirely (conn.rs L602-611); the driver does the same so a bodyless
     /// response/request never drains the caller's body iterable.
     pub fn is_eof(&self) -> bool {
         self.0.is_eof()
@@ -335,8 +335,8 @@ impl BodyEncoder {
 
     /// The connection must close once this message is written — hyper
     /// `Encoder::is_last`: set by `Server::encode` for `Encode.keep_alive == false`, a
-    /// response `Connection: close`, a 101, or a 2xx to CONNECT (role.rs L392-411,
-    /// L839-843). conn.rs `try_keep_alive` closes on it.
+    /// response `Connection: close`, a 101, or a 2xx to CONNECT (role.rs L404-419,
+    /// L847-850). conn.rs `try_keep_alive` closes on it.
     pub fn is_last(&self) -> bool {
         self.0.is_last()
     }
@@ -428,16 +428,16 @@ pub fn encode_request(
     title_case_headers: bool,
     dst: &mut Vec<u8>,
 ) -> Result<BodyEncoder, crate::Error> {
-    // The request-target is serialized *as given* (hyper role.rs L1200 writes
+    // The request-target is serialized *as given* (hyper role.rs L1232 writes
     // `msg.head.subject.1` via its `Display`, "not enforced or validated" —
-    // client/conn/http1.rs L194-204): a path-and-query `Uri` yields origin-form
+    // client/conn/http1.rs L211-219): a path-and-query `Uri` yields origin-form
     // (`GET /path`), an absolute `Uri` yields absolute-form (`GET http://…`, for
     // proxies), and an authority `Uri` yields authority-form (`CONNECT host:port`).
     // The caller chooses the form via the target they pass; we do not reduce it.
     // `http10` = the peer answered in HTTP/1.0 earlier on this connection (hyper
     // `state.version`): `enforce_version` then re-asserts keep-alive and downgrades
     // the request line. The client's keep-alive is off only when this request itself
-    // says `Connection: close` (conn.rs `encode_head` L625-632).
+    // says `Connection: close` (conn.rs `encode_head` L621-630).
     let mut head = MessageHead {
         version: Version::HTTP_11,
         subject: RequestLine(method, uri),
@@ -467,7 +467,7 @@ pub fn encode_request(
     // across messages): cleared here, written once; on error hyper rewinds it.
     dst.clear();
     // `Client::encode` reads the request's own `Trailer` header to allow-list the
-    // chunked trailer fields the body may emit (role.rs L1420-1431); undeclared
+    // chunked trailer fields the body may emit (role.rs L1440-1453); undeclared
     // fields are dropped by `encode_trailers`, as on the server.
     let encoder = Client::encode(enc, dst)?;
     Ok(BodyEncoder(encoder))
@@ -564,13 +564,13 @@ pub fn parse_request(
 }
 
 /// Encode a response head into `dst` and return the body `BodyEncoder` (server
-/// side; hyper role.rs `Server::encode` L364). `body`: `None` = no body;
+/// side; hyper role.rs `Server::encode` L390). `body`: `None` = no body;
 /// `Some(Some(n))` = `Content-Length: n`; `Some(None)` = `Transfer-Encoding:
 /// chunked`. `req_method` is the method of the request being answered (a response
-/// to HEAD, or 204/304, carries no body — `Server::can_have_content_length` L512
+/// to HEAD, or 204/304, carries no body — `Server::can_have_body` L524-536
 /// uses it). `keep_alive` decides whether `Connection: close` is written.
 /// `http10` sets the response version to HTTP/1.0 (status line + no-chunked
-/// gating — an unknown-length 1.0 body is close-delimited, role.rs L907-910); the
+/// gating — an unknown-length 1.0 body is close-delimited, role.rs L930-934); the
 /// driver derives it from the request. `date_header` writes the `Date` header like
 /// hyper's server (common/date.rs; `http1::Builder::auto_date_header`, default on);
 /// `title_case_headers` is `http1::Builder::title_case_headers`.
@@ -610,14 +610,13 @@ pub fn encode_response(
         title_case_headers,
         date_header,
     };
-    // Refresh the per-thread `Date` cache HERE, not only at request parse. hyper refreshes
-    // it in `Server::parse` (role.rs L506) and `Server::encode` merely copies it (L976),
-    // which is fresh when parse and encode of one exchange run on the same thread. Under
-    // a work-stealing runtime (tonio) the head is parsed on one OS thread and the
-    // response encoded on another whose cache was last refreshed by ITS last parse —
-    // arbitrarily long ago on a quiet server. `update()` is one clock read (the same
-    // cost hyper pays per parse), so pay it per response and never emit a stale Date.
-    // Runtime-forced divergence from upstream; the h2 path (`date_header_value`) does the same.
+    // Refresh the per-thread `Date` cache HERE. hyper refreshes it on each dispatcher
+    // poll (dispatch.rs L148 -> `Server::update_date`, role.rs L518), and `Server::encode`
+    // merely copies it (role.rs L988). Under a work-stealing runtime (tonio), the head
+    // is parsed on one OS thread and the response encoded on another whose cache was
+    // last refreshed by ITS last response — arbitrarily long ago on a quiet server.
+    // `update()` is one clock read, so pay it per response and never emit a stale Date.
+    // DIVERGENCE: refresh per response for work-stealing runtimes; the h2 path does the same.
     if date_header {
         crate::common::date::update();
     }
@@ -633,7 +632,7 @@ pub fn encode_response(
 
 /// The current `Date` header value, from hyper's per-thread once-a-second cache
 /// (common/date.rs `update` + `extend`) — so the h2 server's `Date` (hyper
-/// proto/h2/server.rs L484 `or_insert_with(date::update_and_header_value)`) is the
+/// proto/h2/server.rs L481 `or_insert_with(date::update_and_header_value)`) is the
 /// same bytes the h1 encoder writes.
 pub fn date_header_value() -> HeaderValue {
     // hyper's h2 server path (proto/h2/server.rs `date::update_and_header_value`):
@@ -745,7 +744,7 @@ impl BodyDecoder {
     }
 
     /// Bytes buffered past the body (hyper's `read_buf` non-emptiness check,
-    /// `require_empty_read` conn.rs L463-465) — without moving them out.
+    /// `require_empty_read` conn.rs L465-468) — without moving them out.
     pub fn buffered(&self) -> usize {
         self.read.buf.len()
     }

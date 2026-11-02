@@ -1,4 +1,4 @@
-//! SETTINGS synchronization — the mirror of h2 `proto/settings.rs` (0.4.19).
+//! SETTINGS synchronization — the mirror of h2 `proto/settings.rs` (0.4.20).
 //!
 //! `Settings` tracks the local SETTINGS handshake (h2's `Local` enum: `ToSend` ->
 //! `WaitingAck` -> `Synced`) and whether the peer's initial SETTINGS has landed;
@@ -32,7 +32,7 @@ enum Local {
 pub(super) struct Settings {
     local: SettingsValues,
     state: Local,
-    /// h2 `has_received_remote_initial` (L105-110).
+    /// h2 `mark_remote_initial_settings_as_received` (L105-110).
     has_received_remote_initial: bool,
 }
 
@@ -50,14 +50,14 @@ impl Settings {
         &self.local
     }
 
-    /// Our SETTINGS frame was queued: `ToSend` -> `WaitingAck` (h2 `poll_send` L111-168).
+    /// Our SETTINGS frame was queued: `ToSend` -> `WaitingAck` (h2 `poll_send` L111-175).
     pub(super) fn mark_sent(&mut self) {
         self.state = Local::WaitingAck;
     }
 
     /// The peer ACKed our SETTINGS (h2 `recv_settings` ACK branch, L52-80): our values
     /// now take effect for receiving (the caller applies them). An ACK with nothing
-    /// outstanding is a connection PROTOCOL_ERROR (L57-63: "received unexpected
+    /// outstanding is a connection PROTOCOL_ERROR (L74-78: "received unexpected
     /// settings ack").
     pub(super) fn recv_ack(&mut self) -> PyResult<()> {
         if self.state != Local::WaitingAck {

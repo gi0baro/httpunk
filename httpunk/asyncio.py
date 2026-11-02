@@ -89,7 +89,7 @@ class _ServerProtocol(_AsyncioStream):
         except auto.SniffCancelledError:
             # A graceful shutdown interrupted the preface sniff of a still-silent
             # connection (AutoServerProtocol) — there is nothing to serve, so close
-            # promptly instead of lingering until the host's force-close timeout (F36).
+            # promptly instead of lingering until the host's force-close timeout.
             self.close()
             return
         await self._maybe_apply_graceful()  # a shutdown requested before the server existed
@@ -118,7 +118,7 @@ class _ServerProtocol(_AsyncioStream):
     async def _run_h2_handler(self, request):
         # h2 handlers run concurrently in a join-only scope, which would otherwise
         # SWALLOW a handler exception silently — leaving the client's stream hanging
-        # forever with no response (F34). Reset that one stream so the peer sees a
+        # forever with no response. Reset that one stream so the peer sees a
         # failure; the connection and its other streams keep running (h2 isolates a
         # service error to the stream, hyper `SendResponse` drop). A host that wants to
         # log handler errors should catch them inside its own `handle()`.
@@ -179,14 +179,14 @@ class AutoServerProtocol(_ServerProtocol):
 
     def __init__(self):
         super().__init__()
-        self._sniff_cancel = self._backend.event()  # fires to abort an in-progress sniff (F36)
+        self._sniff_cancel = self._backend.event()  # fires to abort an in-progress sniff
 
     async def _make_server(self):
         return await auto.serve(self, backend=self._backend, cancel=self._sniff_cancel)
 
     async def graceful_shutdown(self) -> None:
         # Interrupt an in-progress preface sniff so a graceful shutdown of a
-        # still-silent client doesn't linger (≈ hyper-util `ReadVersion::cancel`, F36).
+        # still-silent client doesn't linger (≈ hyper-util `ReadVersion::cancel`).
         # Harmless once the server is built (nothing is waiting on the signal).
         self._sniff_cancel.set()
         await super().graceful_shutdown()
@@ -246,7 +246,7 @@ class ServerConnections:
             drained.update(conns)
             # return_exceptions so ONE connection whose graceful_shutdown() raises can't
             # abort the whole shutdown — every other connection must still be drained and
-            # the force-close path below must still run (F54).
+            # the force-close path below must still run.
             await asyncio.gather(*(c.graceful_shutdown() for c in conns), return_exceptions=True)
             waits = [asyncio.ensure_future(c.wait_closed()) for c in conns]
             remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())

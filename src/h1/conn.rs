@@ -341,7 +341,7 @@ impl Inner {
         let wants_keep_alive =
             self.current.request_keep_alive && self.keep_alive_enabled && !self.shutdown_requested;
         // The hand-off decision (hyper `on_upgrade`): a 101 the request asked for, or a
-        // 2xx to CONNECT. A 101 the request did not ask for is not a tunnel (F28) — it
+        // 2xx to CONNECT. A 101 the request did not ask for is not a tunnel — it
         // still ends the connection (`is_last`).
         let is_switch = (status == 101 && self.current.is_upgrade)
             || (self.current.is_connect && (200..300).contains(&status));
@@ -755,7 +755,7 @@ impl H1ServerState {
     // ===== the current request =====
 
     /// `100 Continue`: claimed by the body reader only while `Writing::Init` (no
-    /// response begun) and only for HTTP/1.1+ (hyper conn.rs L409-415, L311), once.
+    /// response begun) and only for HTTP/1.1+ (hyper conn.rs L411-421, L317), once.
     /// Decided under the same lock as `try_respond`, so a head can never overtake it
     /// (the responder awaits the continue's write when told to).
     fn try_send_continue(&self, seq: u64) -> bool {
@@ -864,7 +864,7 @@ impl H1ServerState {
         }
     }
 
-    /// The watcher's read completed (hyper conn.rs L491-508): `data` = its bytes
+    /// The watcher's read completed (hyper conn.rs L493-510): `data` = its bytes
     /// (`b""` = EOF), `None` with `error` = a transport error, both `None` = it found
     /// no transport. An EOF / error while the response is still in flight means the
     /// client is gone: non-reusable, the request `peer_closed` -> returns `True` so
@@ -1480,7 +1480,7 @@ impl H1ClientState {
     }
 
     /// The watcher's read completed: dispatched by state (hyper conn.rs
-    /// L463-489 / L510-520). Returns `(verdict, transport)`: `WATCH_HANDOFF` — an
+    /// L465-490 / L512-521). Returns `(verdict, transport)`: `WATCH_HANDOFF` — an
     /// exchange is active, the bytes/error are its first read; `WATCH_IDLE_EOF` —
     /// closed here, close the returned transport; `WATCH_IDLE_BYTES` — poison
     /// (`new_unexpected_message`); `WATCH_IDLE_ERROR` — fail with the error;

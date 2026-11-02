@@ -15,7 +15,7 @@ pub mod streams;
 
 pub use self::error::{Error, GoAway, Initiator};
 
-/// h2 proto/streams/send.rs L43-48 (0.4.19): which public API called `poll_reset` —
+/// h2 proto/streams/send.rs L43-48 (0.4.20): which public API called `poll_reset` —
 /// the `mode` of `State::ensure_reason`. The file that defines it (`send.rs`) is not
 /// vendored (async orchestration), so the two-variant enum is mirrored here.
 #[derive(Debug)]

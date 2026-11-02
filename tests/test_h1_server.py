@@ -414,7 +414,7 @@ async def test_server_request_exposes_http_version():
 @pytest.mark.tonio
 async def test_server_header_read_timeout_closes_slow_head():
     """A request head that never completes is closed after `header_read_timeout`
-    (slowloris defence, hyper http1.rs L249): no response, just a close (F30)."""
+    (slowloris defence, hyper http1.rs L253): no response, just a close."""
     listener, host, port = await _listener()
 
     async def serve():
@@ -644,7 +644,7 @@ async def test_server_detach_hands_off_open_connection():
 @pytest.mark.tonio
 async def test_server_no_100_continue_for_http10():
     """An HTTP/1.0 request never gets an auto 100-continue, even with `Expect:
-    100-continue` — hyper gates the interim on version > 1.0 (conn.rs L311). F16."""
+    100-continue` — hyper gates the interim on version > 1.0 (conn.rs L317)."""
     listener, host, port = await _listener()
     async with scope() as s:
         s.spawn(_echo_server(listener))
@@ -654,7 +654,7 @@ async def test_server_no_100_continue_for_http10():
                 b"POST /x HTTP/1.0\r\nhost: x\r\ncontent-length: 3\r\nexpect: 100-continue\r\n\r\nabc"
             )
             data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
-            assert b"100 Continue" not in data  # F16: no interim for a 1.0 client
+            assert b"100 Continue" not in data  # no interim for a 1.0 client
             assert data.startswith(b"HTTP/1.0 200")  # the real response still arrives
         finally:
             transport.close()
@@ -665,7 +665,7 @@ async def test_server_no_100_continue_for_http10():
 async def test_server_http10_streamed_body_with_content_length_reuses():
     """A streamed (iterable) HTTP/1.0 response WITH a Content-Length is length-framed,
     not close-delimited, so the connection stays reusable and keeps the keep-alive
-    header (F27) — deciding close-delimited from the body shape alone forced a close."""
+    header — deciding close-delimited from the body shape alone forced a close."""
     listener, host, port = await _listener()
 
     async def serve():
@@ -806,7 +806,7 @@ async def test_server_upgrade_tunnel():
 @pytest.mark.tonio
 async def test_server_bodyless_response_does_not_drain_body():
     """A body handed to a bodyless response (HEAD / 204) is never polled — no bytes
-    on the wire AND the iterable's side effects don't fire (G37, hyper write_head's
+    on the wire AND the iterable's side effects don't fire (hyper write_head's
     encoder.is_eof() gate)."""
     listener, host, port = await _listener()
     fired = []
@@ -861,14 +861,14 @@ async def test_server_auto_error_on_malformed_head():
     req = await conn.next_request()
     assert req is None
     assert stub.sent.startswith(b"HTTP/1.1 400")  # automatic Bad Request
-    assert b"connection: close" in stub.sent.lower()  # F29: enforce_version adds it before closing
+    assert b"connection: close" in stub.sent.lower()  # enforce_version adds it before closing
     assert stub.closed
 
 
 @pytest.mark.tonio
 async def test_server_oversized_head_rejected_with_431():
     """A request head that never completes and grows past hyper's max_buf_size is
-    rejected as `Parse::TooLarge` → auto 431 + close, not buffered without bound (F14)."""
+    rejected as `Parse::TooLarge` → auto 431 + close, not buffered without bound."""
     oversized = b"GET / HTTP/1.1\r\nx: " + b"a" * 500_000  # > _MAX_HEAD_SIZE, no CRLFCRLF
     stub = _StubTransport(oversized)
     conn = ServerConnection(stub)
@@ -1151,7 +1151,7 @@ async def test_server_push_send_reset_truncates_body_and_closes():
 
 @pytest.mark.tonio
 async def test_server_push_http10_without_content_length_is_close_delimited():
-    """HTTP/1.0 + unknown length = close-delimited (hyper role.rs L907-910): raw body
+    """HTTP/1.0 + unknown length = close-delimited (hyper role.rs L930-934): raw body
     bytes, no chunking, and the connection closes after the body."""
     listener, host, port = await _listener()
 
@@ -1304,7 +1304,7 @@ async def test_server_trailers_dropped_without_te_trailers(path):
     ],
 )
 async def test_server_te_trailers_token_forms(te_lines, allowed):
-    """hyper 1.11.1 `headers::te_is_trailers`: the `trailers` token may sit in any `TE` line,
+    """hyper 1.12.0 `headers::te_is_trailers`: the `trailers` token may sit in any `TE` line,
     at any position of its comma list, in any case — earlier hyper only matched a first
     line equal to `trailers`."""
     stub = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n" + te_lines + b"\r\n")
@@ -1560,7 +1560,7 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
 async def test_h2_preface_closes_silently_without_response():
     """An h1 server that receives the HTTP/2 prior-knowledge preface closes silently
     (a version error) instead of writing a 400 — hyper `on_parse_error`/`has_h2_prefix`
-    (conn.rs L809-812) (F49)."""
+    (conn.rs L836-839)."""
     stub = _StubTransport(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
     conn = ServerConnection(stub)
     await conn.start()
@@ -1573,7 +1573,7 @@ async def test_h2_preface_closes_silently_without_response():
 @pytest.mark.tonio
 async def test_body_io_after_close_raises_clean_error():
     """A body read/write after the connection closed (transport nulled) raises a clean
-    ConnectionClosedError, not an AttributeError on `None.receive_some`/`send_all` (F59)."""
+    ConnectionClosedError, not an AttributeError on `None.receive_some`/`send_all`."""
     conn = ServerConnection(_StubTransport(b""))
     await conn.close()  # nulls the transport
     with pytest.raises(ConnectionClosedError):
@@ -1585,7 +1585,7 @@ async def test_body_io_after_close_raises_clean_error():
 @pytest.mark.tonio
 async def test_h1_request_trailers_round_trip():
     """Request trailers are hyper's: `Client::encode` allow-lists the fields the request's
-    own `Trailer` header declares (role.rs L1420-1431) and a chunked (streamed) body
+    own `Trailer` header declares (role.rs L1440-1453) and a chunked (streamed) body
     carries them after the data; the H1Server decodes them into `req.trailers`. A
     known-length `bytes` body is `Content-Length`-framed and drops them, silently."""
     listener, host, port = await _listener()
@@ -1664,7 +1664,7 @@ async def test_abrupt_client_close_ends_iteration_cleanly():
     """A client that tears the connection down abruptly between requests — an
     RST instead of a FIN (SO_LINGER 0; also what an abortive TLS close looks
     like) — must end the server's `async for` cleanly, exactly like the clean
-    EOF (F47: the wire outcome is identical — the connection just ends with no
+    EOF (the wire outcome is identical — the connection just ends with no
     request to serve). The backend's broken-transport error must not escape
     `next_request` and kill the accept loop."""
     import socket as pysock

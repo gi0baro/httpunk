@@ -20,7 +20,7 @@ Requests arrive as they are opened; a caller may `spawn` a handler per request t
 serve them concurrently (h2 multiplexes). `request.respond` sends the response,
 whose body is flow-control-gated on the client's windows.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.19.
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ _REMOTE_RESET_MAX = 20  # h2 proto/mod.rs DEFAULT_REMOTE_RESET_STREAM_MAX (Rapid
 _LOCAL_ERROR_RESET_MAX = 1024  # hyper proto/h2/server.rs DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS
 # hyper's HTTP/2 server profile (hyper `proto/h2/server.rs`): a 1 MB per-stream recv
 # window and 1 MB connection recv window (vs the 65535 default), 16 KB max frame size,
-# 16 KB max header-list size (AUDIT-2026-07-09 F24). The server does NOT advertise
+# 16 KB max header-list size. The server does NOT advertise
 # ENABLE_PUSH (it is the client's setting to gate server push).
 _STREAM_WINDOW = 1024 * 1024
 _CONN_WINDOW = 1024 * 1024
@@ -65,7 +65,7 @@ class ServerRequest:
     path: str | None  # the :path pseudo-header
     target: str | None  # alias of path, symmetric with the client's Request.target
     headers: HeaderMap
-    version: Version  # always HTTP_2 (h2 stamps it on every request, server.rs L1676)
+    version: Version  # always HTTP_2 (h2 stamps it on every request, server.rs L1674)
 
     __slots__ = ("method", "scheme", "authority", "path", "target", "headers", "version", "_stream", "_conn")
 
@@ -279,7 +279,7 @@ class ServerConnection(H2ConnectionBase):
         self._incoming_send, self._incoming_recv = self.backend.queue()
 
     async def start(self):
-        # h2: server.rs `handshake` (L365) — the server's connection preface is just
+        # h2: server.rs `handshake` (L370) — the server's connection preface is just
         # its SETTINGS (RFC 7540 §3.5); no readiness wait (it serves requests as they
         # arrive). The client's 24-byte preface is consumed by the state's `receive`.
         await self._begin()
@@ -307,7 +307,7 @@ class ServerConnection(H2ConnectionBase):
         return req
 
     async def graceful_shutdown(self):
-        # h2 `Connection::graceful_shutdown` (proto/connection.rs L620): a TWO-PHASE,
+        # h2 `Connection::go_away_gracefully` (proto/connection.rs L656): a TWO-PHASE,
         # non-blocking shutdown. PHASE 1 — GOAWAY(2^31-1, NO_ERROR) + a shutdown PING,
         # keep accepting AND serving (a request the client already put on the wire
         # before it saw our GOAWAY is served, not refused). PHASE 2 fires on the PING's
@@ -321,7 +321,7 @@ class ServerConnection(H2ConnectionBase):
         built on the push primitives so the two paths cannot drift."""
         if trailers is not None:
             trailers = self._headermap(trailers)
-            # Validate BEFORE the response HEADERS go out (h2 0.4.16 #925).
+            # Validate BEFORE the response HEADERS go out (h2 send.rs:80-104).
             self.check_send_headers(trailers)
         end_stream = body is None and trailers is None
         await self._send_response_head(st, status, headers, end_stream=end_stream)
@@ -337,7 +337,7 @@ class ServerConnection(H2ConnectionBase):
         # RST_STREAM(NO_ERROR)ed, the nginx-compat rule, and its in-flight window
         # returned, `release_closed_capacity`; `handle` = the reader to notify). A stream
         # the peer reset while the handler was computing surfaces as the stop (hyper's
-        # first `poll_reset` window, proto/h2/server.rs L458).
+        # first `poll_reset` window, proto/h2/server.rs L456).
         v = self.send_response_head(st.id, status, self._headermap(headers), end_stream)
         stop = v.stopped
         if stop is not None:

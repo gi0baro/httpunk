@@ -86,7 +86,7 @@ class _BoomH2(H2ServerProtocol):
 @pytest.mark.asyncio
 async def test_h2_protocol_handler_error_resets_stream_not_connection():
     """An h2 handler that raises resets ITS stream (the client sees an error) instead of
-    the exception vanishing silently and hanging the client (F34); the connection and
+    the exception vanishing silently and hanging the client; the connection and
     its other streams keep running."""
     server, host, port, protocols = await _serve(_BoomH2)
     backend = AsyncioBackend()
@@ -162,7 +162,7 @@ async def test_h2_protocol_graceful_shutdown():
 @pytest.mark.asyncio
 async def test_h2_protocol_closes_after_client_goaway():
     """The CLIENT GOAWAYs an idle connection: the server replies GOAWAY(NO_ERROR) and
-    then CLOSES — its serve task ends and the client reads EOF (F23, server role, on
+    then CLOSES — its serve task ends and the client reads EOF (server role, on
     the asyncio backend). It used to reply and then leak the connection forever:
     the read pump exited without ending the accept loop, so nothing closed."""
     server, host, port, protocols = await _serve(_EchoH2)
@@ -281,7 +281,7 @@ class _FakeProto:
 @pytest.mark.asyncio
 async def test_server_connections_shutdown_survives_one_bad_connection():
     """One connection whose graceful_shutdown() raises must not abort the whole
-    shutdown — every other connection is still drained and shutdown() returns (F54)."""
+    shutdown — every other connection is still drained and shutdown() returns."""
     conns = ServerConnections()
     good, bad = _FakeProto(), _FakeProto(boom=True)
     conns._live.update({good, bad})
@@ -293,7 +293,7 @@ async def test_server_connections_shutdown_survives_one_bad_connection():
 async def test_auto_graceful_cancels_silent_preface_sniff():
     """A graceful shutdown of an AutoServerProtocol whose client connected but sent
     nothing interrupts the parked preface sniff and finishes promptly, instead of
-    lingering until the host's force-close timeout (F36)."""
+    lingering until the host's force-close timeout."""
     server, host, port, protocols = await _serve(_EchoAuto)
     backend = AsyncioBackend()
     async with server:
@@ -303,6 +303,6 @@ async def test_auto_graceful_cancels_silent_preface_sniff():
         proto = protocols[0]
         await proto.graceful_shutdown()  # must cancel the parked sniff
         # With the fix the serve task ends promptly; without it the sniff stays parked
-        # and this wait_for times out (the whole point of F36).
+        # and this wait_for times out.
         await asyncio.wait_for(proto.wait_closed(), timeout=3.0)
         transport.close()

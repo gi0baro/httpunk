@@ -189,7 +189,7 @@ class H1Codec:
 
     @staticmethod
     def continue_response() -> bytes:
-        """`HTTP/1.1 100 Continue\r\n\r\n` — hyper conn.rs L409."""
+        """`HTTP/1.1 100 Continue\r\n\r\n` — hyper conn.rs L415."""
 
     def serialize_request(
         self,
@@ -513,7 +513,7 @@ class H2Codec:
         end_stream: bool = ...,
         auto_date: bool = ...,
     ) -> bytes:
-        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L484)."""
+        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L477-481)."""
 
     def feed_preface(self, data: bytes) -> bool | None:
         """Server side: feed bytes of the client connection preface. None = matches so
@@ -658,8 +658,9 @@ class H2ContentLength:
         """False = a declared length still unsatisfied at END_STREAM."""
 
 class H2DataFrameBudget:
-    """h2 0.4.19 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`)
-    over `DataFrameBudget::resolve`."""
+    """h2 0.4.20 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`,
+    counts.rs:120-147). `Budget` tracks spent overhead (counts.rs:4-36); Auto is resolved
+    via `set_target_connection_window_size` (counts.rs:112-116)."""
 
     def __init__(self, configured: int | None = ..., connection_window: int | None = ...) -> None: ...
     def record(self, payload_len: int) -> int:

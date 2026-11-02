@@ -148,7 +148,7 @@ def test_parse_error_kinds_mirror_hyper_parse_variants():
 
 
 def test_response_1xx_status_is_user_error_unsupported_status_code():
-    """hyper `Server::encode` refuses a 1xx (not 101) response (role.rs L400-405,
+    """hyper `Server::encode` refuses a 1xx (not 101) response (role.rs L411-416,
     `User::UnsupportedStatusCode`) and rewinds `dst`: nothing is encoded."""
     codec = H1Codec()
     codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
@@ -160,7 +160,7 @@ def test_response_1xx_status_is_user_error_unsupported_status_code():
 
 def test_response_content_length_and_transfer_encoding_is_user_error_unexpected_header():
     """Both `content-length` and `transfer-encoding` on a response: hyper `Server::encode`
-    cancels with `User::UnexpectedHeader` (role.rs L803-807) and rewinds `dst`."""
+    cancels with `User::UnexpectedHeader` (role.rs L815-820) and rewinds `dst`."""
     codec = H1Codec()
     codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
     hdrs = HeaderMap([("content-length", "5"), ("transfer-encoding", "chunked")])
@@ -198,7 +198,7 @@ def test_invalid_status_argument_stays_value_error():
 
 
 def test_head_terminated_by_bare_lf_then_crlf_parses():
-    """hyper 1.11.1 `is_complete_fast`: a bare-LF header line ending followed by a CRLF
+    """hyper 1.12.0 `is_complete_fast`: a bare-LF header line ending followed by a CRLF
     blank line ends the head (httparse accepts it), so the partial-read fast path must
     recognise it too instead of waiting for more bytes. Both roles."""
     codec = H1Codec()

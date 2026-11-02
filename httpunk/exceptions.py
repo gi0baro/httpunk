@@ -44,7 +44,7 @@ writer carries `request_unsent = True` on the exception instance (whatever its
 type — `ConnectionClosedError`, or the unexpected-bytes poison error): nothing
 reached the wire, so the request is safe to retry with any body, streamed
 included. The mirror of hyper's `TrySendError { message: Some(request) }`
-give-back (client/conn/http1.rs L247-263; proto/h1/dispatch.rs L711-733). Read
+give-back (client/conn/http1.rs L261-281; proto/h1/dispatch.rs L723-739). Read
 it with `getattr(exc, "request_unsent", False)` — it is absent once the write
 may have begun.
 """
