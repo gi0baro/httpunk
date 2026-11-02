@@ -220,16 +220,28 @@ async def test_server_post_echo_body():
 
 
 @pytest.mark.tonio
-async def test_server_keep_alive_two_requests():
+async def test_keep_alive():
+    # hyper tests/server.rs: keep_alive (v1.12.0).
     listener, host, port = await _listener()
-    seen = []
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            for body in (b"foo bar baz", b"zar quux"):
+                req = await server.accept()
+                await req.respond(200, body=body)
+
     async with scope() as s:
-        s.spawn(_echo_server(listener, seen))
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"GET /a -> "
-            assert await (await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})).read() == b"GET /b -> "
-        s.cancel()
-    assert seen == ["/a", "/b"]  # both served on the one (reused) connection
+        s.spawn(serve())
+        transport = await _raw_client(host, port)
+        try:
+            await transport.send_all(b"GET / HTTP/1.1\r\nHost: example.domain\r\n\r\n")
+            assert (await _read_until(transport, b"foo bar baz")).endswith(b"foo bar baz")
+            await transport.send_all(b"GET /quux HTTP/1.1\r\nHost: example.domain\r\nConnection: close\r\n\r\n")
+            assert (await _read_until(transport, b"zar quux")).endswith(b"zar quux")
+        finally:
+            transport.close()
+            s.cancel()
 
 
 @pytest.mark.tonio
@@ -347,18 +359,25 @@ async def test_server_pipelined_requests():
 
 
 @pytest.mark.tonio
-async def test_server_http10_response_version_and_close():
-    """An HTTP/1.0 request gets an `HTTP/1.0` status line and (no keep-alive) the
-    server closes the connection."""
+async def test_http_10_request_receives_http_10_response():
+    # hyper tests/server.rs: http_10_request_receives_http_10_response (v1.12.0).
     listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            req = await server.accept()
+            await req.respond(200)
+
     async with scope() as s:
-        s.spawn(_echo_server(listener))
+        s.spawn(serve())
         transport = await _raw_client(host, port)
         try:
-            await transport.send_all(b"GET /old HTTP/1.0\r\nhost: x\r\n\r\n")
-            data = await _drain_all(transport)  # 1.0 default-close → server closes after replying
-            assert data.startswith(b"HTTP/1.0 200")
-            assert b"GET /old -> " in data
+            await transport.send_all(b"GET / HTTP/1.0\r\n\r\n")
+            data = await _drain_all(transport)
+            expected = b"HTTP/1.0 200 OK\r\ncontent-length: 0\r\n"
+            assert len(data) >= len(expected)
+            assert data[: len(expected)] == expected
         finally:
             transport.close()
             s.cancel()
@@ -470,14 +489,17 @@ class _AsyncioSilentStub(_StubTransport):
 
 
 @pytest.mark.asyncio
-async def test_server_shutdown_closes_idle_connection_under_parked_read_asyncio():
-    """hyper `disable_keep_alive` while `KA::Idle`: `state.close()` at once. The parked
+async def test_disable_keep_alive_post_request_asyncio():
+    """hyper tests/server.rs: disable_keep_alive_post_request (v1.12.0). hyper
+    `disable_keep_alive` while `KA::Idle`: `state.close()` at once. The parked
     idle read ends by that close (the one way a parked read ends, on every backend),
     and the reader maps it to a clean end: `next_request` -> None, nothing written."""
-    transport = _AsyncioSilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+    transport = _AsyncioSilentStub(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
     conn = ServerConnection(transport, backend=AsyncioBackend())
     req = await conn.next_request()
-    await req.respond(200)
+    await req.respond(200, body=b"hello")
+    assert transport.sent.endswith(b"hello")
+    assert not transport.closed
     sent = len(transport.sent)
     reader = asyncio.ensure_future(conn.next_request())
     await transport.parked.wait()
@@ -490,12 +512,53 @@ async def test_server_shutdown_closes_idle_connection_under_parked_read_asyncio(
 
 
 @pytest.mark.tonio
-async def test_server_shutdown_closes_idle_connection_under_parked_read_tonio():
-    transport = _SilentStub(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+async def test_disable_keep_alive_mid_request():
+    # hyper tests/server.rs: disable_keep_alive_mid_request (v1.12.0).
+    class PartialHead(_StubTransport):
+        def __init__(self):
+            super().__init__(b"GET / HTTP/1.1\r\n")
+            self.parked = Event()
+            self.resume = Event()
+
+        async def receive_some(self, max_bytes=65536):
+            if self._data:
+                return await super().receive_some(max_bytes)
+            self.parked.set()
+            await self.resume.wait()
+            return b"Host: localhost\r\n\r\n"
+
+    transport = PartialHead()
+    conn = ServerConnection(transport)
+
+    async def serve():
+        req = await conn.next_request()
+        await req.respond(200, body=b"hello")
+        assert await conn.next_request() is None
+
+    try:
+        async with scope() as s:
+            s.spawn(serve())
+            await transport.parked.wait()
+            await conn.graceful_shutdown()
+            transport.resume.set()
+        assert transport.sent.startswith(b"HTTP/1.1 200 OK\r\n")
+        assert b"connection: close\r\n" in transport.sent
+        assert transport.closed
+    finally:
+        await conn.close()
+
+
+@pytest.mark.tonio
+async def test_disable_keep_alive_post_request_tonio():
+    # hyper tests/server.rs: disable_keep_alive_post_request (v1.12.0).
+    transport = _SilentStub(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
     conn = ServerConnection(transport)
     req = await conn.next_request()
-    await req.respond(200)
+    await req.respond(200, body=b"hello")
+    assert transport.sent.endswith(b"hello")
+    assert not transport.closed
     results = []
+    sent = transport.sent
 
     async def reader():
         results.append(await conn.next_request())
@@ -506,7 +569,9 @@ async def test_server_shutdown_closes_idle_connection_under_parked_read_tonio():
         await conn.graceful_shutdown()
         assert transport.closed
     assert results == [None]
+    assert transport.sent == sent
     assert conn.closed and not conn.reusable
+    await conn.close()
 
 
 @pytest.mark.tonio
@@ -627,27 +692,35 @@ async def test_server_http10_streamed_body_with_content_length_reuses():
 
 
 @pytest.mark.tonio
-async def test_server_http10_keep_alive_header():
-    """HTTP/1.0 + `Connection: keep-alive` → the response must echo `Connection:
-    keep-alive` (hyper fix_keep_alive) so the 1.0 client keeps the connection."""
+async def test_http_10_keep_alive():
+    # hyper tests/server.rs: http_10_keep_alive (v1.12.0).
     listener, host, port = await _listener()
+
+    async def serve():
+        transport = await listener.accept()
+        async with H1Server(transport) as server:
+            for body in (b"foo bar baz", b"zar quux"):
+                req = await server.accept()
+                await req.respond(200, body=body)
+
     async with scope() as s:
-        s.spawn(_echo_server(listener))
+        s.spawn(serve())
         transport = await _raw_client(host, port)
         try:
-            await transport.send_all(b"GET /a HTTP/1.0\r\nhost: x\r\nconnection: keep-alive\r\n\r\n")
-            data = await _read_until(transport, b"\r\n\r\n")
-            assert data.startswith(b"HTTP/1.0 200")
-            assert b"connection: keep-alive" in data.lower()
+            await transport.send_all(b"GET / HTTP/1.0\r\nHost: example.domain\r\nConnection: keep-alive\r\n\r\n")
+            data = await _read_until(transport, b"foo bar baz")
+            assert data.endswith(b"foo bar baz")
+            assert b"connection: keep-alive\r\n" in data
+            await transport.send_all(b"GET /quux HTTP/1.0\r\nHost: example.domain\r\n\r\n")
+            assert (await _read_until(transport, b"zar quux")).endswith(b"zar quux")
         finally:
             transport.close()
             s.cancel()
 
 
 @pytest.mark.tonio
-async def test_server_response_connection_close():
-    """A response `Connection: close` (on a keep-alive request) closes the
-    connection and appears on the wire."""
+async def test_header_connection_close():
+    # hyper tests/server.rs: header_connection_close (v1.12.0).
     listener, host, port = await _listener()
 
     async def serve():
@@ -655,16 +728,16 @@ async def test_server_response_connection_close():
         async with H1Server(transport) as server:
             async for req in server:
                 await req.read()
-                await req.respond(200, headers={"connection": "close"}, body=b"bye")
+                await req.respond(200, headers={"connection": "close"}, body=b"foo bar baz")
 
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
         try:
-            await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n")
-            data = await _drain_all(transport)  # server closes despite the keep-alive request
-            assert b"connection: close" in data.lower()
-            assert b"bye" in data
+            await transport.send_all(b"GET / HTTP/1.1\r\nHost: example.domain\r\nConnection: keep-alive\r\n\r\n")
+            data = await _drain_all(transport)
+            assert b"connection: close\r\n" in data
+            assert data.endswith(b"foo bar baz")
         finally:
             transport.close()
             s.cancel()
@@ -811,26 +884,28 @@ async def test_server_oversized_head_rejected_with_431():
 
 
 @pytest.mark.tonio
-async def test_server_keep_alive_false_answers_one_request_with_close():
-    """`keep_alive=False` = hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive`
-    on the still-Busy connection (`KA::Disabled`): the first response is `Connection: close`
-    and the connection closes after it; a pipelined second request is never answered."""
+async def test_disable_keep_alive():
+    # hyper tests/server.rs: disable_keep_alive (v1.12.0).
     listener, host, port = await _listener()
 
     async def serve():
         transport = await listener.accept()
         async with H1Server(transport, keep_alive=False) as server:
             async for req in server:
-                await req.respond(200, body=b"ok")
+                await req.respond(200, body=b"foo bar baz")
 
     async with scope() as s:
         s.spawn(serve())
         transport = await _raw_client(host, port)
         try:
-            await transport.send_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\nGET /b HTTP/1.1\r\nhost: x\r\n\r\n")
-            data = await _drain_all(transport)  # the server closes after the first response
+            await transport.send_all(
+                b"GET / HTTP/1.1\r\nHost: example.domain\r\nConnection: keep-alive\r\n\r\n"
+                b"GET /b HTTP/1.1\r\nhost: x\r\n\r\n"
+            )
+            data = await _drain_all(transport)
+            assert data.endswith(b"foo bar baz")
             assert data.count(b"HTTP/1.1 200") == 1
-            assert b"connection: close" in data.lower()
+            assert b"connection: close\r\n" in data
         finally:
             transport.close()
             s.cancel()
@@ -1505,24 +1580,6 @@ async def test_body_io_after_close_raises_clean_error():
         await conn.read_body_more()
     with pytest.raises(ConnectionClosedError):
         await conn.write(b"data")
-
-
-def test_enforce_version_connection_header_replaces_not_appends():
-    """hyper conn.rs `enforce_version` / `fix_keep_alive` (run by the codec before
-    `Server::encode`) use `HeaderMap::insert`: the wire `Connection` header REPLACES a
-    user-set value, never appending a second/contradictory token (F48)."""
-    codec = H1Codec(date_header=False)
-    head = codec.serialize_response(200, HeaderMap([("connection", "keep-alive")]), keep_alive=False)
-    lines = head.lower().split(b"\r\n")
-    assert [line for line in lines if line.startswith(b"connection:")] == [b"connection: close"]
-    assert codec.response_is_last
-
-    codec = H1Codec(date_header=False)
-    head = codec.serialize_response(200, HeaderMap([("connection", "x-foo")]), keep_alive=True, http10=True)
-    lines = head.lower().split(b"\r\n")
-    assert lines[0] == b"http/1.0 200 ok"
-    assert [line for line in lines if line.startswith(b"connection:")] == [b"connection: keep-alive"]
-    assert not codec.response_is_last
 
 
 @pytest.mark.tonio

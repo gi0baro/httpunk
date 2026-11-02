@@ -230,7 +230,7 @@ def test_max_frame_size_setters_reject_out_of_range_values():
 
 
 def test_pseudo_header_strings_are_shared_and_built_once():
-    # BOUNDARY_NOTES rules 6/7: method and scheme are the interned objects of their
+    # Method and scheme are the interned objects of their
     # closed sets; authority and path are built once at decode and handed out by
     # reference on every read.
     client = _httpunk.H2Codec("client")

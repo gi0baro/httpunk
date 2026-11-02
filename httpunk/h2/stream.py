@@ -8,7 +8,7 @@ needs: the events the read pump signals, the body queue it feeds, and three fiel
 written exactly once *before* the event that announces them (`status`/`headers`
 before `headers_evt`, `trailers` before the body's EOF, `stop` before `reset_evt`
 or the body's terminal item). Nothing here is ever read by two tasks without one
-of those events in between (HTTPUNK_RUST_STATE_DESIGN.md §3.1).
+of those events in between.
 """
 
 

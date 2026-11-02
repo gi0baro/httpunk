@@ -167,6 +167,9 @@ class Http1Builder:
         """Max request header count before the head is rejected 431 (hyper default 100)."""
         return self._set("max_headers", val)
 
+    # DIVERGENCE: no max_header_size setter here: hyper-util 0.1.21's auto
+    # Http1Builder exposes only max_headers (server/conn/auto/mod.rs:815) and
+    # max_buf_size (:858), unlike hyper's HTTP/1 builders.
     def max_buf_size(self, max: int) -> Http1Builder:
         """Cap on a still-incomplete request head (431 + close beyond it); >= 8192."""
         return self._set("max_buf_size", max)
@@ -225,8 +228,9 @@ class Http2Builder:
         return self._set("initial_window_size", sz)
 
     def data_frame_budget(self, budget: int | None) -> Http2Builder:
-        """DATA-framing budget; `None` = h2's Auto (h2 0.4.19
-        `server::Builder::data_frame_budget`, not surfaced by hyper-util)."""
+        """DATA-framing budget; `None` = h2's Auto (h2 server.rs:1067)."""
+        # DIVERGENCE: h2's data_frame_budget is surfaced by neither hyper nor
+        # hyper-util; httpunk keeps this option by the maintainer's choice.
         return self._set("data_frame_budget", budget)
 
     def initial_connection_window_size(self, sz: int | None) -> Http2Builder:

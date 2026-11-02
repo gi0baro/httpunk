@@ -21,14 +21,14 @@ use crate::py::{body_kind_str, bytes_filled, method_str};
 use pyo3::sync::PyOnceLock;
 use vendor_hyper::{
     BodyDecode, BodyDecoder, BodyEncoder, BodyTail, CHUNKED_TERMINATOR, CONTINUE_RESPONSE,
-    DEFAULT_MAX_BUFFER_SIZE, FramedChunk, MINIMUM_MAX_BUFFER_SIZE, connection_any_close,
-    encode_request, encode_response, parse_request, parse_response, server_parse_failure,
-    too_large_error,
+    DEFAULT_MAX_BUFFER_SIZE, FramedChunk, MINIMUM_MAX_BUFFER_SIZE, ParserConfig,
+    connection_any_close, encode_request, encode_response, parse_request, parse_response,
+    server_parse_failure, too_large_error,
 };
 
 /// The chunked terminator as ONE `bytes` for the process: hyper's `Encoder::end`
 /// emits the same five bytes for every chunked body, so every `serialize_end` hands
-/// out the same object (BOUNDARY_NOTES.md rule 6).
+/// out the same object.
 static CHUNKED_END: PyOnceLock<Py<PyBytes>> = PyOnceLock::new();
 
 fn chunked_end(py: Python<'_>) -> Py<PyBytes> {
@@ -103,14 +103,19 @@ struct State {
 #[pyclass(module = "httpunk._httpunk", name = "H1Codec", frozen)]
 pub struct H1Codec {
     inner: Mutex<State>,
-    /// Server-role parse/encode options (hyper `server::conn::http1::Builder`):
-    /// `max_headers` (None = hyper's default 100), `ignore_invalid_headers`
-    /// (httparse `ignore_invalid_headers_in_requests`), `title_case_headers`,
-    /// `date_header` (`auto_date_header`), `max_buf_size` (hyper io.rs: the read
+    /// Both roles' parse/encode options (hyper client/conn/http1.rs:348-560,
+    /// server/conn/http1.rs:243-430): `max_headers` (None = hyper's default 100;
+    /// also the trailer count, conn.rs:318-330), `title_case_headers`,
+    /// `date_header` (server `auto_date_header`), `max_buf_size` (hyper io.rs: the read
     /// buffer cap a still-incomplete head may reach before `Parse::TooLarge`; both
     /// roles). Immutable per codec; the driver builds one codec per connection.
     max_headers: Option<usize>,
-    ignore_invalid_headers: bool,
+    /// Head bytes including the start/status line, also the chunked trailer byte
+    /// limit (hyper server/conn/http1.rs:346-358, client/conn/http1.rs:506-518).
+    max_header_size: Option<usize>,
+    /// One config for both roles, as in hyper conn.rs:953; each parser reads its
+    /// own flags (role.rs:176,1057).
+    parser_config: ParserConfig,
     title_case_headers: bool,
     date_header: bool,
     max_buf_size: usize,
@@ -118,11 +123,17 @@ pub struct H1Codec {
 
 #[pymethods]
 impl H1Codec {
+    #[allow(clippy::fn_params_excessive_bools)] // one keyword per hyper builder flag
     #[new]
-    #[pyo3(signature = (*, max_headers=None, ignore_invalid_headers=false, title_case_headers=false, date_header=true, max_buf_size=DEFAULT_MAX_BUFFER_SIZE))]
+    #[pyo3(signature = (*, max_headers=None, max_header_size=None, ignore_invalid_headers=false, allow_multiple_spaces_in_request_line_delimiters=false, allow_spaces_after_header_name_in_responses=false, allow_obsolete_multiline_headers_in_responses=false, ignore_invalid_headers_in_responses=false, title_case_headers=false, date_header=true, max_buf_size=DEFAULT_MAX_BUFFER_SIZE))]
     fn new(
         max_headers: Option<usize>,
+        max_header_size: Option<usize>,
         ignore_invalid_headers: bool,
+        allow_multiple_spaces_in_request_line_delimiters: bool,
+        allow_spaces_after_header_name_in_responses: bool,
+        allow_obsolete_multiline_headers_in_responses: bool,
+        ignore_invalid_headers_in_responses: bool,
         title_case_headers: bool,
         date_header: bool,
         max_buf_size: usize,
@@ -133,6 +144,20 @@ impl H1Codec {
                 "the max_buf_size cannot be smaller than {MINIMUM_MAX_BUFFER_SIZE}"
             )));
         }
+        // hyper client/conn/http1.rs:388-443, server/conn/http1.rs:300-318.
+        let mut parser_config = ParserConfig::default();
+        parser_config
+            .ignore_invalid_headers_in_requests(ignore_invalid_headers)
+            .allow_multiple_spaces_in_request_line_delimiters(
+                allow_multiple_spaces_in_request_line_delimiters,
+            )
+            .allow_spaces_after_header_name_in_responses(
+                allow_spaces_after_header_name_in_responses,
+            )
+            .allow_obsolete_multiline_headers_in_responses(
+                allow_obsolete_multiline_headers_in_responses,
+            )
+            .ignore_invalid_headers_in_responses(ignore_invalid_headers_in_responses);
         Ok(H1Codec {
             inner: Mutex::new(State {
                 buf: BytesMut::new(),
@@ -146,7 +171,8 @@ impl H1Codec {
                 response_close_delimited: false,
             }),
             max_headers,
-            ignore_invalid_headers,
+            max_header_size,
+            parser_config,
             title_case_headers,
             date_header,
             max_buf_size,
@@ -210,8 +236,16 @@ impl H1Codec {
         };
         let connection_close = connection_any_close(&fields);
         let mut st = self.inner.lock().unwrap();
-        let encoder = encode_request(m.clone(), uri, fields, body, http10, &mut st.head_buf)
-            .map_err(map_hyper_err)?;
+        let encoder = encode_request(
+            m.clone(),
+            uri,
+            fields,
+            body,
+            http10,
+            self.title_case_headers,
+            &mut st.head_buf,
+        )
+        .map_err(map_hyper_err)?;
         st.req_method = Some(m);
         st.encoder = Some(encoder);
         st.request_connection_close = connection_close;
@@ -280,7 +314,7 @@ impl H1Codec {
         let allowed = st.allow_trailer_fields;
         let tail = match st.encoder.take() {
             Some(enc) if allowed => enc
-                .end_with_trailers(trailers.snapshot())
+                .end_with_trailers(trailers.snapshot(), self.title_case_headers)
                 .map_err(map_hyper_err)?,
             Some(enc) => enc.end().map_err(map_hyper_err)?,
             None => BodyTail::None,
@@ -309,7 +343,9 @@ impl H1Codec {
             Some(mut enc) => {
                 let framed = body.filter(|b| !b.is_empty()).map(|b| enc.encode(b));
                 let tail = match trailers {
-                    Some(t) if allowed => enc.end_with_trailers(t.snapshot()),
+                    Some(t) if allowed => {
+                        enc.end_with_trailers(t.snapshot(), self.title_case_headers)
+                    }
                     _ => enc.end(),
                 }
                 .map_err(map_hyper_err)?;
@@ -351,10 +387,18 @@ impl H1Codec {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
         let req_method = st.req_method.clone();
-        match parse_response(&mut st.buf, &req_method).map_err(map_hyper_err)? {
-            // hyper io.rs L202-207: a head still incomplete at `max_buf_size` is
-            // `Parse::TooLarge` (the client just fails the connection).
-            None if st.buf.len() >= self.max_buf_size => Err(map_hyper_err(too_large_error())),
+        match self
+            .parse_head(&mut st.buf, |buf| {
+                parse_response(
+                    buf,
+                    &req_method,
+                    &self.parser_config,
+                    self.max_headers,
+                    self.max_header_size,
+                )
+            })
+            .map_err(map_hyper_err)?
+        {
             Some(head) => {
                 let (kind, content_length) = body_kind(&head.body);
                 let wants_keep_alive =
@@ -393,13 +437,14 @@ impl H1Codec {
     ) -> PyResult<Option<Py<PyAny>>> {
         let mut st = self.inner.lock().unwrap();
         st.buf.extend_from_slice(data);
-        let parsed = match parse_request(&mut st.buf, self.max_headers, self.ignore_invalid_headers)
-        {
-            // hyper io.rs L202-207: a head still incomplete at `max_buf_size` is
-            // `Parse::TooLarge` -> `Server::on_error` answers 431.
-            Ok(None) if st.buf.len() >= self.max_buf_size => Err(too_large_error()),
-            other => other,
-        };
+        let parsed = self.parse_head(&mut st.buf, |buf| {
+            parse_request(
+                buf,
+                &self.parser_config,
+                self.max_headers,
+                self.max_header_size,
+            )
+        });
         let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(e) => {
@@ -512,6 +557,17 @@ impl H1Codec {
         self.inner.lock().unwrap().response_close_delimited
     }
 
+    // hyper conn.rs:318-330: both roles source trailer limits from the codec.
+    #[getter]
+    pub(super) fn max_headers(&self) -> Option<usize> {
+        self.max_headers
+    }
+
+    #[getter]
+    pub(super) fn max_header_size(&self) -> Option<usize> {
+        self.max_header_size
+    }
+
     /// hyper's `max_buf_size` (io.rs): the cap on an incomplete head, and the amount
     /// hyper is willing to hold in its write buffer before flushing — the driver's
     /// coalescing cap for an immediate body (`H1Framing._send_head_and_body`).
@@ -550,6 +606,40 @@ impl H1Codec {
 }
 
 impl H1Codec {
+    // hyper io.rs:231-240 bounds reads; owned transport chunks instead require a
+    // bounded parse, keeping the unread suffix without copying it.
+    fn parse_head<T>(
+        &self,
+        buf: &mut BytesMut,
+        mut parse: impl FnMut(&mut BytesMut) -> Result<Option<T>, vendor_hyper::Error>,
+    ) -> Result<Option<T>, vendor_hyper::Error> {
+        let mut parse = |buf: &mut BytesMut| match parse(buf) {
+            // hyper io.rs:204-215: check the remaining, capped length after parsing
+            // (Client::parse may have consumed informational responses).
+            Ok(None)
+                if self.max_header_size.is_some_and(|m| buf.len() >= m)
+                    || buf.len() >= self.max_buf_size =>
+            {
+                Err(too_large_error())
+            }
+            other => other,
+        };
+        loop {
+            if buf.len() <= self.max_buf_size {
+                return parse(buf);
+            }
+            let suffix = buf.split_off(self.max_buf_size);
+            let parsed = parse(buf);
+            buf.unsplit(suffix);
+            match parsed {
+                // A 1xx freed space below both limits: expose the next bounded
+                // portion as hyper's next read would, rather than awaiting more IO.
+                Ok(None) => {}
+                other => return other,
+            }
+        }
+    }
+
     /// `take_body` for a Rust consumer (the server state feeds the decoder itself).
     pub(super) fn take_body_raw(&self) -> BytesMut {
         self.inner.lock().unwrap().buf.split()
@@ -574,7 +664,7 @@ pub struct ResponseHead {
     #[pyo3(get)]
     pub headers: Py<HeaderMap>,
     /// One of "empty" | "length" | "chunked" | "close" — `kind` for Rust readers, the
-    /// shared interned `str` for Python (BOUNDARY_NOTES rules 6/7).
+    /// shared interned `str` for Python.
     pub(super) kind: &'static str,
     #[pyo3(get)]
     pub body_kind: Py<PyString>,
@@ -614,11 +704,11 @@ pub struct RequestHead {
     /// `CONNECT` — the one method the state's tunnel rules switch on (hyper
     /// `Method::CONNECT` checks in `Server::encode` / `read_head`); Rust-side.
     pub(super) is_connect: bool,
-    /// The method: the shared interned `str` for a standard one (rule 6).
+    /// The method: the shared interned `str` for a standard one.
     #[pyo3(get)]
     pub method: Py<PyString>,
     /// The request-target verbatim (origin/absolute/authority form): ONE `str`, built
-    /// at parse and handed out by reference on every read (rule 7).
+    /// at parse and handed out by reference on every read.
     #[pyo3(get)]
     pub target: Py<PyString>,
     #[pyo3(get)]
@@ -699,10 +789,16 @@ impl H1BodyDecoder {
     /// `kind`: "empty" | "length" | "chunked" | "close" (from `H1ResponseHead.body_kind`);
     /// `length` is the Content-Length when `kind == "length"`.
     #[new]
-    #[pyo3(signature = (kind, length=0))]
-    pub(super) fn new(kind: &str, length: u64) -> Self {
+    // hyper conn.rs:318-330: trailer limits are the connection's head limits.
+    #[pyo3(signature = (kind, length=0, *, max_headers=None, max_header_size=None))]
+    pub(super) fn new(
+        kind: &str,
+        length: u64,
+        max_headers: Option<usize>,
+        max_header_size: Option<usize>,
+    ) -> Self {
         H1BodyDecoder {
-            inner: Mutex::new(BodyDecoder::new(kind, length)),
+            inner: Mutex::new(BodyDecoder::new(kind, length, max_headers, max_header_size)),
         }
     }
 

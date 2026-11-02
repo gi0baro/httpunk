@@ -18,6 +18,7 @@ from httpunk._httpunk import (
     H2FrameData as Data,
     H2FrameGoAway as GoAway,
     H2FrameHeaders as Headers,
+    H2FramePing as Ping,
     H2FrameRstStream as RstStream,
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
@@ -210,6 +211,84 @@ async def _raw_handshake(host, port):
     codec = H2Codec("client")
     await transport.send_all(PREFACE + codec.serialize_settings(enable_push=False))
     return transport, codec
+
+
+async def _too_big_headers(end_stream):
+    listener, host, port = await _listener()
+    done = Event()
+    seen = []
+
+    async def serve():
+        try:
+            async with H2Server(
+                await listener.accept(), max_header_list_size=64, max_local_error_reset_streams=0
+            ) as server:
+                async for req in server:
+                    seen.append(req)
+        finally:
+            done.set()
+
+    async with scope() as s:
+        s.spawn(serve())
+        transport, codec = await _raw_handshake(host, port)
+        try:
+            pending = []
+            while not any(isinstance(f, Settings) and not f.ack for f in pending):
+                chunk = await transport.receive_some(65536)
+                assert chunk
+                pending.extend(codec.receive(chunk))
+            settings = next(f for f in pending if isinstance(f, Settings) and not f.ack)
+            assert settings.max_header_list_size == 64
+            await transport.send_all(codec.serialize_settings_ack())
+            await transport.send_all(
+                codec.serialize_request_headers(
+                    1, "GET", "https://example.com/", HeaderMap({"some-header": "some-value"}), end_stream=end_stream
+                )
+                + codec.serialize_ping(b"barrier!")
+            )
+            wire = []
+            while True:
+                for f in pending:
+                    if isinstance(f, (Settings, WindowUpdate)):
+                        continue
+                    if isinstance(f, Ping):
+                        assert f.ack and f.data == b"barrier!"
+                        break
+                    wire.append(f)
+                else:
+                    chunk = await transport.receive_some(65536)
+                    assert chunk
+                    pending = codec.receive(chunk)
+                    continue
+                break
+            assert len(wire) == (1 if end_stream else 2)
+            head = wire[0]
+            assert isinstance(head, Headers)
+            assert head.stream_id == 1 and head.status == 431
+            assert head.end_stream and head.end_headers
+            assert list(head.headers.items()) == []  # No date or other regular fields.
+            assert (head.method, head.scheme, head.authority, head.path) == (None, None, None, None)
+            if not end_stream:
+                assert isinstance(wire[1], RstStream)
+                assert wire[1].stream_id == 1 and wire[1].error_code == H2Reason.PROTOCOL_ERROR
+            transport.close()
+            await done.wait()
+            assert seen == []
+        finally:
+            transport.close()
+            s.cancel()
+
+
+@pytest.mark.tonio
+async def test_too_big_headers_sends_431():
+    # h2 tests/h2-tests/tests/server.rs:1031 too_big_headers_sends_431.
+    await _too_big_headers(end_stream=True)
+
+
+@pytest.mark.tonio
+async def test_too_big_headers_sends_reset_after_431_if_not_eos():
+    # h2 tests/h2-tests/tests/server.rs:1067 too_big_headers_sends_reset_after_431_if_not_eos.
+    await _too_big_headers(end_stream=False)
 
 
 async def _read_goaway(transport, codec):

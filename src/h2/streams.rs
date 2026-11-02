@@ -14,7 +14,7 @@ use vendor_h2::frame::{Reason, Reset, StreamId};
 use vendor_h2::proto::Initiator;
 use vendor_h2::proto::streams::{FlowControl, State};
 
-use super::errors::{H2ProtocolError, map_proto_err, map_reason, map_user_err};
+use super::errors::{map_proto_err, map_reason, map_user_err, protocol_err_with_debug};
 
 pub(super) fn parse_initiator(s: &str) -> PyResult<Initiator> {
     match s {
@@ -330,8 +330,8 @@ impl ContentLength {
         matches!(self, ContentLength::Head)
     }
 
-    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L175-201): a no-op
-    /// for a HEAD response, whose block h2 skips entirely.
+    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L202-205): a no-op
+    /// for a HEAD response, whose length h2 validates but does not store.
     pub(super) fn set(&mut self, value: u64) {
         if !matches!(*self, ContentLength::Head) {
             *self = ContentLength::Remaining(value);
@@ -432,11 +432,12 @@ pub struct H2DataFrameBudget {
 }
 
 pub(super) fn budget_exhausted() -> PyErr {
-    // streams.rs L644-647: `BudgetExhausted` -> connection ENHANCE_YOUR_CALM.
-    H2ProtocolError::new_err((
-        Some(u32::from(Reason::ENHANCE_YOUR_CALM)),
-        "too_many_data_frames".to_string(),
-    ))
+    // h2 proto/streams/streams.rs:659-662: BudgetExhausted -> GOAWAY with data.
+    protocol_err_with_debug(
+        Reason::ENHANCE_YOUR_CALM,
+        "too_many_data_frames",
+        b"too_many_data_frames",
+    )
 }
 
 impl DataFrameCounts {

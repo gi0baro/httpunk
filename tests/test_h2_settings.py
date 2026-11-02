@@ -104,7 +104,7 @@ def test_constructor_validates_ranges():
 
 
 def test_goaway_debug_data_is_the_frames_own_object():
-    # BOUNDARY_NOTES U5: the peer's GOAWAY debug data is stored as the frame's `bytes`
+    # The peer's GOAWAY debug data is stored as the frame's `bytes`
     # and handed back as-is by `goaway_info` — no Rust copy in between.
     conn = _client()
     conn.recv_settings(_settings_frame())  # the peer's SETTINGS come first

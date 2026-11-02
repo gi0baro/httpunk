@@ -30,7 +30,7 @@ _READ_SIZE = 65536
 # lives: hyper's Flatten has none, and `max_buf_size` is hyper's own bound on how
 # much it buffers before flushing — past it the memcpy is worth about the syscall
 # it saves and a huge body would be doubled in memory, so the head goes first and
-# the body follows as its own write. Measured (BENCH_FINDINGS §3): the one-write
+# the body follows as its own write. Measured: the one-write
 # path wins at every size up to 100 KB. Streamed bodies are never coalesced: the
 # head must never wait on the app's generator (hyper polls the body after the head).
 

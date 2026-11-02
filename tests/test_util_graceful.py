@@ -354,7 +354,7 @@ async def test_h1_graceful_releases_idle_connection_and_closes():
         await conn.__aexit__(None, None, None)
 
 
-# ----- two-party transitions (HTTPUNK_RUST_STATE_DESIGN.md §3.4) -----
+# ----- two-party transitions -----
 
 
 @pytest.mark.tonio

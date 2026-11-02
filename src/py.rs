@@ -1,15 +1,13 @@
 //! Helpers over the Python object model that the protocol modules share: the
 //! places httpunk has to reach past pyo3's safe surface, kept together so each
-//! trick is written (and justified) once. See BOUNDARY_NOTES.md for the rules they
-//! implement.
+//! trick is written (and justified) once.
 
 use http::Method;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyString};
 
-/// A `bytes` of exactly `len` bytes whose storage `fill` writes in full
-/// (BOUNDARY_NOTES.md rule 4). A Rust producer that knows its output size writes
+/// A `bytes` of exactly `len` bytes whose storage `fill` writes in full. A Rust producer that knows its output size writes
 /// straight into the object's storage: `PyBytes::new` is this for a contiguous
 /// source (one memcpy); `PyBytes::new_with` is not (it zero-fills the buffer first,
 /// a second pass over the payload); over-allocating and shrinking with
@@ -46,7 +44,7 @@ pub(crate) fn bytes_filled(
     }
 }
 
-// ----- closed vocabularies, interned once (BOUNDARY_NOTES.md rule 6) -----
+// ----- closed vocabularies, interned once -----
 //
 // A `str` for a value from a fixed set is one shared object for the whole process,
 // built on first use and handed out by reference: the standard methods, the schemes,

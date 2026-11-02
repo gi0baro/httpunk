@@ -380,7 +380,7 @@ async def test_backend_bounded_reader_and_timed_event_wait():
 
 @pytest.mark.asyncio
 async def test_received_objects_are_handed_through_without_copying():
-    # BOUNDARY_NOTES S2: a read that covers a whole received object gets that object.
+    # A read that covers a whole received object gets that object.
     s = _AsyncioStream()
     first, second = b"first-segment", b"second"
     s.data_received(first)

@@ -120,8 +120,10 @@ async def test_builder_forwards_h1_and_h2_options_to_whichever_protocol_is_picke
     assert h1._conn.half_close is True
     assert h1._conn._codec_options == {
         "max_headers": 50,
+        "max_header_size": None,  # hyper server/conn/http1.rs:355: unset by default
         "max_buf_size": 16384,
         "ignore_invalid_headers": True,
+        "allow_multiple_spaces_in_request_line_delimiters": False,
         "title_case_headers": True,
         "date_header": False,
     }

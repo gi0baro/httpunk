@@ -879,3 +879,175 @@ async def test_close_flushes_queued_frames_even_after_connection_error():
         s.cancel()
 
     assert any(isinstance(f, Ping) and f.data == b"flushme!" for f in seen), seen
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize(
+    ("values", "valid"),
+    [
+        (("2", "2", "2"), True),
+        (("2", "02", "002"), True),
+        (("2", "3", "2"), False),
+        (("2", "2", "3"), False),
+        (("2", "2", "invalid"), False),
+        (("2", "2", "18446744073709551616"), False),
+    ],
+)
+async def test_validate_multiple_content_length_headers(method, values, valid):
+    # h2 tests/h2-tests/tests/client_request.rs:1467 validate_multiple_content_length_headers.
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    done = Event()
+    resets = []
+
+    async def server():
+        try:
+            stream, codec, frames = await _accept_handshake(listener)
+            sid = await _read_until_request(stream, codec, frames)
+            assert sid == 1
+            await stream.send_all(
+                codec.serialize_response_headers(sid, 200, HeaderMap([("content-length", v) for v in values]))
+            )
+            if valid:
+                await stream.send_all(codec.serialize_data(sid, b"" if method == "HEAD" else b"ok", end_stream=True))
+            while chunk := await stream.receive_some(65536):
+                resets.extend((f.stream_id, f.error_code) for f in codec.receive(chunk) if isinstance(f, RstStream))
+        finally:
+            done.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            if valid:
+                resp = await conn.request(method, "/")
+                assert [bytes(chunk) async for chunk in resp.aiter_bytes()] == [b"" if method == "HEAD" else b"ok"]
+            else:
+                with pytest.raises(StreamResetError) as exc:
+                    await conn.request(method, "/")
+                assert type(exc.value) is StreamResetError
+                assert exc.value.error_code == H2Reason.PROTOCOL_ERROR
+                assert exc.value.stream_id == 1
+        await done.wait()
+        s.cancel()
+
+    assert resets == ([] if valid else [(1, H2Reason.PROTOCOL_ERROR)])
+
+
+@pytest.mark.tonio
+async def test_recv_too_big_headers():
+    # h2 tests/h2-tests/tests/client_request.rs:893 recv_too_big_headers.
+    from httpunk.h2 import client
+
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    done, errors_ready = Event(), Event()
+    requests, resets, errors = [], [], []
+
+    async def server():
+        try:
+            stream, codec, frames = await _accept_handshake(listener)
+            while len(requests) < 2:
+                for f in frames:
+                    if isinstance(f, Settings) and not f.ack:
+                        assert f.max_header_list_size == 40
+                        await stream.send_all(codec.serialize_settings_ack())
+                    elif isinstance(f, Headers):
+                        requests.append(f.stream_id)
+                        assert f.method == "GET" and f.end_stream
+                        assert f.scheme == "https" and f.authority == "http2.akamai.com" and f.path == "/"
+                if len(requests) < 2:
+                    chunk = await stream.receive_some(65536)
+                    assert chunk
+                    frames = codec.receive(chunk)
+            assert requests == [1, 3]
+            await stream.send_all(
+                codec.serialize_response_headers(1, 200, end_stream=True) + codec.serialize_response_headers(3, 200)
+            )
+            while chunk := await stream.receive_some(65536):
+                resets.extend((f.stream_id, f.error_code) for f in codec.receive(chunk) if isinstance(f, RstStream))
+        finally:
+            done.set()
+
+    async def request(conn):
+        with pytest.raises(StreamResetError) as exc:
+            await conn.request("GET", "https://http2.akamai.com/")
+        assert type(exc.value) is StreamResetError
+        assert exc.value.error_code == H2Reason.PROTOCOL_ERROR
+        errors.append(exc.value.stream_id)
+        if len(errors) == 2:
+            errors_ready.set()
+
+    # The public client uses hyper's fixed profile; configure h2's test limit
+    # without adding a production builder option just for this test.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(client, "_MAX_HEADER_LIST_SIZE", 40)
+        async with scope() as s:
+            s.spawn(server())
+            async with open_h2(host, port) as conn:
+                s.spawn(request(conn))
+                s.spawn(request(conn))
+                await errors_ready.wait()
+            await done.wait()
+            s.cancel()
+    assert sorted(errors) == [1, 3]
+    assert resets == [(3, H2Reason.PROTOCOL_ERROR)]
+
+
+@pytest.mark.tonio
+async def test_response_missing_status():
+    # h2 tests/h2-tests/tests/client_request.rs:824 response_missing_status.
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    done = Event()
+    requests = []
+    resets = []
+
+    async def server():
+        try:
+            stream, codec, frames = await _accept_handshake(listener)
+            while True:
+                for f in frames:
+                    if isinstance(f, Settings) and not f.ack:
+                        await stream.send_all(codec.serialize_settings_ack())
+                    elif isinstance(f, RstStream):
+                        resets.append((f.stream_id, f.error_code))
+                    elif isinstance(f, Headers):
+                        requests.append(f.stream_id)
+                        assert f.method == "GET"
+                        assert f.end_stream
+                        if f.stream_id == 1:
+                            # Empty HPACK block: HEADERS with END_HEADERS | END_STREAM.
+                            await stream.send_all(b"\x00\x00\x00\x01\x05\x00\x00\x00\x01")
+                        elif f.stream_id == 3:
+                            await stream.send_all(codec.serialize_response_headers(3, 103))
+                            # Literal without indexing, new name: server: test, no :status.
+                            block = b"\x00\x06server\x04test"
+                            await stream.send_all(len(block).to_bytes(3, "big") + b"\x01\x04\x00\x00\x00\x03" + block)
+                        elif f.stream_id == 5:
+                            assert resets == [(3, H2Reason.PROTOCOL_ERROR)]
+                            await stream.send_all(codec.serialize_response_headers(5, 204, end_stream=True))
+                        else:
+                            pytest.fail(f"unexpected request stream {f.stream_id}")
+                chunk = await stream.receive_some(65536)
+                if not chunk:
+                    break
+                frames = codec.receive(chunk)
+        finally:
+            done.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            for sid in (1, 3):
+                with pytest.raises(StreamResetError) as exc:
+                    await conn.request("GET", "/")
+                assert type(exc.value) is StreamResetError
+                assert exc.value.stream_id == sid
+                assert exc.value.error_code == H2Reason.PROTOCOL_ERROR
+            assert (await conn.request("GET", "/")).status == 204
+        await done.wait()
+        s.cancel()
+
+    assert requests == [1, 3, 5]
+    assert resets == [(3, H2Reason.PROTOCOL_ERROR)]

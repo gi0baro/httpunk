@@ -7,9 +7,9 @@
 //! machinery — transports, pumps, events, queues — and acts on the verdict *after*
 //! the call returns (events are set after the state that announces them is
 //! published; nothing Python-side is ever read by two tasks without an event in
-//! between). See HTTPUNK_RUST_STATE_DESIGN.md.
+//! between).
 //!
-//! Rules this file keeps (design §2): the mutex is taken exactly once per method
+//! Rules this file keeps: the mutex is taken exactly once per method
 //! and never held across a call back into Python; no `Py<T>` is dropped while the
 //! guard is held (handles are returned to the caller); the HPACK encoder and the
 //! pending buffer live inside the state so encode order == wire order by
@@ -36,7 +36,10 @@ use super::codec::{
     self, Data, Decoder, Encoder, GoAway, Headers, Ping, RstStream, Settings as SettingsFrame,
     SettingsValues, WindowUpdate,
 };
-use super::errors::{H2ProtocolError, H2StreamError, map_proto_err, map_reason, map_user_err};
+use super::errors::{
+    H2ProtocolError, H2StreamError, map_proto_err, map_reason, map_user_err,
+    protocol_err_with_debug,
+};
 use super::settings::{PeerSettings, Settings};
 use super::streams::{ContentLength, DataFrameCounts, parse_initiator};
 use crate::errors::ConnectionClosedError;
@@ -296,7 +299,7 @@ enum ConnError {
 struct GoAwayInfo {
     last_stream_id: u32,
     reason: u32,
-    /// The frame's own `bytes`, handed back as-is by `goaway_info` (BOUNDARY_NOTES U5).
+    /// The frame's own `bytes`, handed back as-is by `goaway_info` (no copy).
     debug_data: Py<PyBytes>,
 }
 
@@ -304,7 +307,7 @@ struct Inner {
     role: Role,
     /// The outbound half of the codec (HPACK encoder + the peer's frame-size limit):
     /// under THIS mutex, so encode order == wire order. The inbound half lives in
-    /// `H2Streams::decoder`, its own mutex (design §3.1).
+    /// `H2Streams::decoder`, its own mutex.
     encoder: Encoder,
     /// The pending-send buffer (h2's single frame queue drained by the connection
     /// task). Every frame goes through it; wire order == commit order.
@@ -312,7 +315,7 @@ struct Inner {
     /// The write batch that came back from the pump (`H2WriteBatch::drop`): an empty
     /// buffer with its capacity kept, the next `take_pending` installs it as `pending`.
     /// Two buffers ping-pong — one on its way to the transport, one receiving frames —
-    /// so a batch is neither copied nor allocated in steady state (BOUNDARY_NOTES V2).
+    /// so a batch is neither copied nor allocated in steady state.
     spare: Option<BytesMut>,
     /// `close()` asked the write pump to drain and exit.
     stop: bool,
@@ -1034,18 +1037,48 @@ impl Inner {
         out
     }
 
+    /// h2 streams.rs:555-580: reject without accepting or counting a library reset.
+    fn reject_oversize_request(&mut self, sid: u32) -> PyResult<u8> {
+        let mut response = frame::Headers::new(
+            StreamId::from(sid),
+            frame::Pseudo::response(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+            http::HeaderMap::new(),
+        );
+        response.set_end_stream();
+        let e = self.streams.get_mut(&sid).expect("opened request");
+        // h2 send.rs:140-160: sending the bare 431 closes the send half.
+        e.state.send_open(true).map_err(map_user_err)?;
+        let mut pending = std::mem::take(&mut self.pending);
+        self.encoder.encode_headers(response, &mut pending);
+        self.pending = pending;
+        // h2 send.rs:279-295 + prioritize.rs:861-866: the implicit reset follows
+        // the queued HEADERS, unless already closed. Our encoder drains synchronously,
+        // so commit the scheduled reset's final state and frame in this same step.
+        if !e.state.is_closed() {
+            e.state.set_reset(
+                StreamId::from(sid),
+                Reason::PROTOCOL_ERROR,
+                Initiator::Library,
+            );
+            codec::encode_rst_stream(&mut self.pending, sid, u32::from(Reason::PROTOCOL_ERROR));
+            // h2 recv.rs:1030-1045: only local-error streams enter expiration.
+            self.enqueue_reset_expiration(sid);
+        }
+        Ok(self.close_stream(sid))
+    }
+
     fn apply_content_length(&mut self, sid: u32, f: &Headers) -> PyResult<()> {
-        // h2 recv.rs `recv_headers` (L175-201): record content-length; reject a
-        // non-numeric value or END_STREAM with a non-zero length (except 204/304). A
-        // response to HEAD is fully exempt.
+        // h2 recv.rs:178-219: validate every content-length, even on HEAD and 1xx.
+        // HEAD skips storing the length and the END_STREAM/non-zero check;
+        // 204/304 skip only the latter check.
         let Some(e) = self.streams.get_mut(&sid) else {
             return Ok(());
         };
-        if e.content_length.is_head() {
-            return Ok(());
-        }
         if f.content_length_invalid {
             return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
+        }
+        if e.content_length.is_head() {
+            return Ok(());
         }
         let Some(cl) = f.content_length else {
             return Ok(());
@@ -1154,8 +1187,17 @@ impl H2Streams {
             max_frame_size: Some(max_frame_size),
             max_header_list_size: Some(max_header_list_size),
         };
+        // h2 server.rs:391-397 / client.rs:1344-1350: the handshake sets our receive
+        // frame-size and header-list limits on the codec before reading any peer frame;
+        // the SETTINGS ACK re-applies the same values (proto/settings.rs:58-64).
+        // REGRESSION GUARD: the read pump decodes a whole read before dispatching it, so
+        // limits applied only at the ACK would miss frames that arrive in the same read
+        // as the ACK (timing-dependent; not reproducible deterministically).
+        let mut decoder = Decoder::new(role == Role::Server);
+        decoder.set_max_recv_frame_size(max_frame_size)?;
+        decoder.set_max_header_list_size(max_header_list_size);
         Ok(H2Streams {
-            decoder: Mutex::new(Decoder::new(role == Role::Server)),
+            decoder: Mutex::new(decoder),
             inner: Mutex::new(Inner {
                 role,
                 encoder: Encoder::new(),
@@ -1207,7 +1249,7 @@ impl H2Streams {
         })
     }
 
-    // ===== GC visibility (design §4): the Python objects held here =====
+    // ===== GC visibility: the Python objects held here =====
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         // GC runs only at safe points no Rust method contains, so the lock is free;
@@ -1230,7 +1272,8 @@ impl H2Streams {
     }
 
     fn __clear__(&self) {
-        // Take the fields under the lock, drop them outside it (rule 3).
+        // Take the fields under the lock, drop them outside it (no `Py<T>` is
+        // dropped while the guard is held).
         let taken = {
             let mut me = self.lock();
             let streams = std::mem::take(&mut me.streams);
@@ -1419,10 +1462,18 @@ impl H2Streams {
                         let handle = e.handle.clone_ref(py);
                         me.streams.insert(sid, e);
                         me.num_active += 1;
-                        // Processed (h2 recv.rs L167 `last_processed_id`): only accepted
-                        // streams count toward the GOAWAY last-stream-id.
+                        // h2 recv.rs:167-175: opened streams count toward the GOAWAY
+                        // last-stream-id, including a request rejected as over-size.
                         me.last_processed_id = sid;
                         me.apply_content_length(sid, frame)?; // may raise a stream error
+                        // h2 recv.rs:221-238: after content-length, before delivery.
+                        if frame.is_over_size {
+                            flags |= me.reject_oversize_request(sid)?;
+                            return Ok(RecvHeadersVerdict {
+                                flags: flags | me.wake_flag(before),
+                                ..ignored(sid)
+                            });
+                        }
                         // Queued, not yet pulled by the app (the Rapid-Reset cap, H2-4).
                         me.pending_accept.insert(sid);
                         Ok(RecvHeadersVerdict {
@@ -1448,10 +1499,20 @@ impl H2Streams {
             e.state
                 .recv_open(frame.end_stream, informational)
                 .map_err(|err| map_proto_err(&err))?;
+            // h2 recv.rs:178-219 precedes the informational branch at :257.
+            me.apply_content_length(sid, frame)?;
+            // h2 recv.rs:221-238, streams.rs:578-579: counted library reset,
+            // including an over-size informational response.
+            if frame.is_over_size {
+                return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
+            }
             if informational {
                 return Ok(ignored(sid)); // interim responses are not surfaced (F38)
             }
-            me.apply_content_length(sid, frame)?;
+            // h2 client.rs:1719-1735: every response must carry :status (RFC 9113 §8.3.2).
+            if frame.status.is_none() {
+                return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
+            }
             if frame.end_stream {
                 flags |= me.close_stream(sid); // recv_open already closed the recv half
             }
@@ -1646,7 +1707,12 @@ impl H2Streams {
         // bounds a HEADERS+RST flood -> GOAWAY(ENHANCE_YOUR_CALM).
         if me.role == Role::Server && me.pending_accept.contains(&sid) {
             if me.remote_reset_pending.len() >= me.max_pending_accept_reset {
-                return Err(protocol_err(Reason::ENHANCE_YOUR_CALM, "too_many_resets"));
+                // h2 proto/streams/recv.rs:917-920.
+                return Err(protocol_err_with_debug(
+                    Reason::ENHANCE_YOUR_CALM,
+                    "too_many_resets",
+                    b"too_many_resets",
+                ));
             }
             me.remote_reset_pending.insert(sid);
         }
@@ -1774,13 +1840,14 @@ impl H2Streams {
         self.lock().maybe_goaway_reply()
     }
 
-    /// Queue our GOAWAY(reason) for a protocol violation we detected (h2
-    /// `go_away_now`); the last-stream-id is the role's.
-    fn send_goaway(&self, reason: u32) -> u8 {
+    /// h2 proto/connection.rs:457-460 `go_away_now_data`: the last-stream-id
+    /// is the role's; debug data comes from the library error.
+    #[pyo3(signature = (reason, debug_data=None))]
+    fn send_goaway(&self, reason: u32, debug_data: Option<&[u8]>) -> u8 {
         let mut me = self.lock();
         let before = me.pending.len();
         let last = me.goaway_last_stream_id();
-        codec::encode_go_away(&mut me.pending, last, reason, &[]);
+        codec::encode_go_away(&mut me.pending, last, reason, debug_data.unwrap_or(&[]));
         me.wake_flag(before)
     }
 
@@ -2198,19 +2265,23 @@ impl H2Streams {
     /// Reset a stream after a stream-level protocol violation by the peer, counting
     /// toward the ENHANCE_YOUR_CALM cap (h2 `max_local_error_reset_streams`, the
     /// Rapid-Reset / malformed-flood defence; F17). A stream we've already forgotten
-    /// enters the reset store and draws one RST_STREAM.
+    /// enters the reset store and draws one RST_STREAM, except a refused request
+    /// (h2 proto/streams/recv.rs:129-149, proto/connection.rs:229-236).
     fn reset_on_error(&self, py: Python<'_>, sid: u32, reason: u32) -> PyResult<ResetVerdict> {
         let mut me = self.lock();
         let before = me.pending.len();
-        me.local_error_resets += 1;
+        // h2 proto/streams/counts.rs:167-179, streams.rs:169-178, 1803-1821:
+        // check before incrementing; the reset that trips the cap is not counted.
         if let Some(max) = me.max_local_error_resets
-            && me.local_error_resets > max
+            && me.local_error_resets >= max
         {
-            return Err(protocol_err(
+            return Err(protocol_err_with_debug(
                 Reason::ENHANCE_YOUR_CALM,
                 "too many stream resets",
+                b"too_many_internal_resets",
             ));
         }
+        me.local_error_resets += 1;
         if me.streams.contains_key(&sid) {
             let (handle, stop, flags) = me.reset_stream(py, sid, reason, Initiator::Library);
             let flags = flags | me.wake_flag(before);
@@ -2220,9 +2291,14 @@ impl H2Streams {
                 flags,
             });
         }
-        me.clear_expired_reset_streams();
-        if me.reset_streams.len() < RESET_STREAM_MAX {
-            me.reset_streams.insert(sid, Instant::now());
+        // h2 proto/connection.rs:229-236: refusals are counted and sent without
+        // opening/storing a stream. Later DATA is STREAM_CLOSED (streams.rs:631-641);
+        // later HEADERS fails recv::open's increasing-id check (recv.rs:137-140).
+        if reason != u32::from(Reason::REFUSED_STREAM) {
+            me.clear_expired_reset_streams();
+            if me.reset_streams.len() < RESET_STREAM_MAX {
+                me.reset_streams.insert(sid, Instant::now());
+            }
         }
         codec::encode_rst_stream(&mut me.pending, sid, reason);
         let flags = me.wake_flag(before);

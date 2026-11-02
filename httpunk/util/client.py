@@ -46,7 +46,7 @@ async def connect(
     The connection is returned un-entered so the caller owns its lifetime
     (`async with await connect(...) as conn: ...`): `connect` does the TLS
     handshake, `__aenter__` does the HTTP handshake. Composable — this is the seam
-    a pool / friendly client builds on (§11.6).
+    a pool / friendly client builds on.
     """
     backend = _backend.resolve(backend)
     # The `http` crate's `Uri` (what hyper parses every target with) splits the

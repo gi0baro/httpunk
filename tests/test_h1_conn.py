@@ -309,10 +309,11 @@ def test_one_codec_per_connection_reset_at_each_claim():
 
 
 @pytest.mark.tonio
-async def test_http10_downgrade_reasserts_keep_alive_by_value_replacing_token():
+async def test_http10_downgrade_reasserts_keep_alive_by_value_appending_token():
     """After a peer answers HTTP/1.0, the client downgrades later requests to 1.0 and
-    re-asserts keep-alive by VALUE (not mere header presence), REPLACING a non-keep-alive
-    Connection token rather than leaving the 1.0 request to close — hyper fix_keep_alive (F58)."""
+    re-asserts keep-alive by VALUE (not mere header presence), APPENDING it to a
+    non-keep-alive Connection token that stays on the wire — hyper conn.rs
+    `fix_keep_alive` (L672-697, #4196) (F58)."""
     listener, host, port = await _listener()
     requests, done = [], Event()
     r1 = b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 2\r\n\r\nok"
@@ -323,14 +324,18 @@ async def test_http10_downgrade_reasserts_keep_alive_by_value_replacing_token():
         async with open_h1(host, port) as conn:
             assert await (await conn.request("GET", "/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
             # r2 carries a custom Connection token; the downgrade must still re-assert
-            # keep-alive (the old presence-check left it, so the server would close).
+            # keep-alive (a presence-check would leave it, so the server would close).
             assert await (await conn.request("GET", "/b", headers={"connection": "x-foo"})).read() == b"bye"
         await done.wait()
         s.cancel()
 
-    r2_head = requests[1][0].lower()
-    assert b"connection: keep-alive" in r2_head  # re-asserted by value
-    assert b"x-foo" not in r2_head  # the custom token was replaced, not left / duplicated
+    r2_lines = requests[1][0].lower().split(b"\r\n")
+    assert r2_lines[0] == b"get /b http/1.0"
+    # the caller's token kept, keep-alive appended as a second line
+    assert [line for line in r2_lines if line.startswith(b"connection:")] == [
+        b"connection: x-foo",
+        b"connection: keep-alive",
+    ]
 
 
 @pytest.mark.tonio

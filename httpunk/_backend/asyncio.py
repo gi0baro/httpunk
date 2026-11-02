@@ -38,7 +38,7 @@ class _AsyncioStream(asyncio.Protocol):
         self._transport = None
         # Received `bytes` objects as they came from the socket, in order, plus the
         # unread offset into the first one. A reader that asks for at least a whole
-        # object gets THAT object, no copy (BOUNDARY_NOTES S2); only a read smaller than
+        # object gets THAT object, no copy; only a read smaller than
         # the object at the head copies out its slice. `_buffered` is the unread total
         # (the backpressure watermark).
         self._chunks = _collections.deque()

@@ -10,8 +10,7 @@ under one mutex — the transport, the keep-alive / close / shutdown flags, the
 mid-message watcher slot and the current request's flags (responded, response
 done, body done, peer closed, the head-time decisions). Every decision is one call
 into it returning a verdict; this file holds only the async machinery: the head
-read and its deadline, the body pumps, the watcher task, the events
-(HTTPUNK_RUST_STATE_DESIGN.md §3.2).
+read and its deadline, the body pumps, the watcher task, the events.
 
 HTTP/1 is strictly one request/response at a time (no multiplexing), so — like
 the h1 client — there is no background pump: `next_request` reads a request head
@@ -76,14 +75,27 @@ _DEFAULT_HEADER_READ_TIMEOUT = 30.0  # hyper's `header_read_timeout` default (ht
 _PEER_CLOSED_MSG = "connection closed before message completed: the client closed its side mid-request"
 
 
-def _codec_options(*, max_headers, ignore_invalid_headers, title_case_headers, auto_date_header, max_buf_size):
+def _codec_options(
+    *,
+    max_headers,
+    max_header_size,
+    ignore_invalid_headers,
+    title_case_headers,
+    auto_date_header,
+    max_buf_size,
+    allow_multiple_spaces_in_request_line_delimiters,
+):
     # ONE codec per connection (hyper's `Conn`): its read buffer persists across
     # messages, like hyper's `read_buf`. Options are hyper `http1::Builder`'s:
     # `max_headers` (None = hyper's 100), `ignore_invalid_headers`,
     # `title_case_headers`, `auto_date_header`, `max_buf_size` (validated there, >= 8192).
+    # `max_header_size`: hyper server/conn/http1.rs:346-358 (head + trailer bytes).
     options = {
         "max_headers": max_headers,
+        "max_header_size": max_header_size,
         "ignore_invalid_headers": ignore_invalid_headers,
+        # hyper server/conn/http1.rs:300-303: request-side ParserConfig flag.
+        "allow_multiple_spaces_in_request_line_delimiters": allow_multiple_spaces_in_request_line_delimiters,
         "title_case_headers": title_case_headers,
         "date_header": auto_date_header,
     }
@@ -410,16 +422,20 @@ class ServerConnection(H1Framing, H1ServerState):
         header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT,
         keep_alive=True,
         max_headers=None,
+        max_header_size=None,
         max_buf_size=None,
         auto_date_header=True,
         title_case_headers=False,
         ignore_invalid_headers=False,
+        allow_multiple_spaces_in_request_line_delimiters=False,
         half_close=False,
     ):
         codec = H1Codec(
             **_codec_options(
                 max_headers=max_headers,
+                max_header_size=max_header_size,
                 ignore_invalid_headers=ignore_invalid_headers,
+                allow_multiple_spaces_in_request_line_delimiters=allow_multiple_spaces_in_request_line_delimiters,
                 title_case_headers=title_case_headers,
                 auto_date_header=auto_date_header,
                 max_buf_size=max_buf_size,
@@ -439,16 +455,20 @@ class ServerConnection(H1Framing, H1ServerState):
         header_read_timeout=_DEFAULT_HEADER_READ_TIMEOUT,
         keep_alive=True,
         max_headers=None,
+        max_header_size=None,
         max_buf_size=None,
         auto_date_header=True,
         title_case_headers=False,
         ignore_invalid_headers=False,
+        allow_multiple_spaces_in_request_line_delimiters=False,
         half_close=False,
     ):
         self.backend = _backend.resolve(backend)
         self._codec_options = _codec_options(
             max_headers=max_headers,
+            max_header_size=max_header_size,
             ignore_invalid_headers=ignore_invalid_headers,
+            allow_multiple_spaces_in_request_line_delimiters=allow_multiple_spaces_in_request_line_delimiters,
             title_case_headers=title_case_headers,
             auto_date_header=auto_date_header,
             max_buf_size=max_buf_size,
@@ -467,6 +487,11 @@ class ServerConnection(H1Framing, H1ServerState):
 
     async def start(self):
         pass  # HTTP/1 has no connection preface / handshake
+
+    def abort(self):
+        # hyper server/conn/http1.rs:478: the connection owns the IO;
+        # dropping it does not poll_shutdown. start() itself never suspends.
+        self._close(self.fail_read())
 
     async def close(self):
         # Close the transport FIRST (what ends a parked watcher read), then JOIN the
@@ -863,8 +888,8 @@ class ServerConnection(H1Framing, H1ServerState):
             # The read returned: its park ends and the bytes are parsed in ONE step
             # (`accept_head`); a connection closed under the read parses nothing and
             # the next read finds the transport gone. The codec caps a still-incomplete
-            # head at `max_buf_size` (hyper io.rs L202-207): past it, `Parse::TooLarge`
-            # -> auto 431 + close.
+            # head at `max_header_size` or `max_buf_size` (hyper io.rs:204-215):
+            # `Parse::TooLarge` -> auto 431 + close.
             accepted = self.accept_head(data)
             if accepted is not None:
                 return accepted
@@ -882,14 +907,15 @@ class ServerConnection(H1Framing, H1ServerState):
         return obj.receive_some(_READ_SIZE)
 
     async def _send_error(self, transport, codec, status):
-        """Best-effort automatic error response (bodyless, `Connection: close`),
+        """Best-effort automatic error response (bodyless, no keep-alive),
         then the orderly end — hyper `Server::on_error` + `write_head`, the parse error
         stored on the connection, which then completes (`poll_shutdown`) before
         `take_error` surfaces it."""
         try:
-            # `keep_alive=False`: hyper `close_read()`s before `on_error`, so `enforce_version`
-            # inserts `connection: close` on the automatic response (F29).
-            head = codec.serialize_response(status, None, keep_alive=False)
+            # hyper closes reading before `on_error` (conn.rs L339-345), retaining the
+            # last parsed version (L301, State::idle L1132-1161): enforce_version
+            # (L702-727) sends HTTP/1.0 without Connection, or HTTP/1.1 + close (F29).
+            head = codec.serialize_response(status, None, keep_alive=False, http10=self.peer_http10)
             await transport.send_all(codec.serialize_head_and_body(head))  # one write (coalesced)
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close
             pass
@@ -1081,29 +1107,40 @@ class H1Server(BaseServer[ServerRequest]):
         header_read_timeout: float | None = _DEFAULT_HEADER_READ_TIMEOUT,
         keep_alive: bool = True,
         max_headers: int | None = None,
+        max_header_size: int | None = None,
         max_buf_size: int | None = None,
         auto_date_header: bool = True,
         title_case_headers: bool = False,
         ignore_invalid_headers: bool = False,
+        allow_multiple_spaces_in_request_line_delimiters: bool = False,
         half_close: bool = False,
     ) -> None:
         """Options mirror hyper `server::conn::http1::Builder` (defaults are hyper's):
         `header_read_timeout` (30s; None disables), `keep_alive` (False: answer one
-        request with `Connection: close` and close), `max_headers` (None = 100),
+        request with `Connection: close` and close), `max_headers` (head/trailer count,
+        None = 100), `max_header_size` (head bytes including the start line and chunked
+        trailer bytes; excess head -> 431 + close; None leaves the head bounded by
+        `max_buf_size` and trailers at 16 KB, hyper server/conn/http1.rs:346-358),
         `max_buf_size` (cap on an incomplete head, >= 8192; None = hyper's default), `auto_date_header`,
         `title_case_headers`, `ignore_invalid_headers` (skip malformed request header
-        lines instead of rejecting with 400), `half_close` (True: a client that shuts
+        lines instead of rejecting with 400), `allow_multiple_spaces_in_request_line_delimiters`
+        (accept multiple spaces between method, target and version; default False,
+        hyper server/conn/http1.rs:300-303), `half_close` (True: a client that shuts
         its write side mid-request is NOT treated as gone — the response still completes;
         default False, where that EOF fails the in-flight response and `peer_closed()`)."""
+        # DIVERGENCE: preserve_header_case is not supported (maintainer's choice;
+        # original-case extensions are not offered by httpunk).
         self._conn = ServerConnection(
             transport,
             backend=backend,
             header_read_timeout=header_read_timeout,
             keep_alive=keep_alive,
             max_headers=max_headers,
+            max_header_size=max_header_size,
             max_buf_size=max_buf_size,
             auto_date_header=auto_date_header,
             title_case_headers=title_case_headers,
             ignore_invalid_headers=ignore_invalid_headers,
+            allow_multiple_spaces_in_request_line_delimiters=allow_multiple_spaces_in_request_line_delimiters,
             half_close=half_close,
         )

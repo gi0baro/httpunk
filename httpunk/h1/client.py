@@ -9,7 +9,7 @@ and the `request` wrapper — so a caller can treat h1 and h2 connections identi
 The state — the transport, the single in-flight slot (hyper `Conn::is_busy`), the
 error slot, the idle watcher's hand-off, the in-flight request writer (`_Writer`), the
 peer's version — lives in `H1ClientState` under one mutex; every decision is one call
-into it. This file holds only the async machinery (HTTPUNK_RUST_STATE_DESIGN.md §3.3).
+into it. This file holds only the async machinery.
 
 Cross-reference: hyper `client::conn::http1` (`SendRequest`/`Connection`) +
 `proto/h1/{conn,dispatch,role}.rs` (the Client path).
@@ -110,16 +110,23 @@ class Connection(H1Framing, H1ClientState):
       give-back, client/conn/http1.rs L247-263).
     """
 
-    def __new__(cls, transport, *, authority=None, backend=None):
+    def __new__(
+        cls, transport, *, authority=None, backend=None, max_header_size=None, max_buf_size=None, **codec_options
+    ):
         # ONE codec per connection (hyper's `Conn`), held by the state: its read buffer
         # persists across exchanges, its per-message state is reset at each claim.
-        return H1ClientState.__new__(cls, H1Codec(), transport)
+        # hyper client/conn/http1.rs:388-560: builder options reach the Conn's codec.
+        if max_buf_size is not None:
+            codec_options["max_buf_size"] = max_buf_size
+        return H1ClientState.__new__(cls, H1Codec(max_header_size=max_header_size, **codec_options), transport)
 
-    def __init__(self, transport, *, authority=None, backend=None):
+    def __init__(self, transport, *, authority=None, backend=None, max_header_size=None, **codec_options):
         self.backend = _backend.resolve(backend)
         self.authority = authority
         self._codec = self.codec  # the one codec the state holds (hyper's `Conn`)
         self._max_buf_size = self._codec.max_buf_size  # the coalescing cap (`_body_plan`)
+        self._max_headers = self._codec.max_headers
+        self._max_header_size = self._codec.max_header_size
         # The exchange's writable wait, bound ONCE (the transport's kind is fixed for the
         # connection's life): `backend.writable_wait`.
         self._wait_writable = self.backend.writable_wait(transport)
@@ -397,7 +404,13 @@ class Connection(H1Framing, H1ClientState):
                 self._release()
                 body = H1ResponseBody(self, None, keep_alive=False, upgraded=upgraded)
                 return Response(resp_head.status, resp_head.headers, body, version=_version_of(resp_head))
-            decoder = H1BodyDecoder(resp_head.body_kind, resp_head.content_length or 0)
+            # hyper conn.rs:326-330: the client's trailers use its codec's limits.
+            decoder = H1BodyDecoder(
+                resp_head.body_kind,
+                resp_head.content_length or 0,
+                max_headers=self._max_headers,
+                max_header_size=self._max_header_size,
+            )
             codec.take_body_into(decoder)  # body bytes already read alongside the head: moved, in Rust
             # hyper `wants_keep_alive()` once the head is read (the response allows it,
             # its body is not close-delimited, the request carried no `Connection:
@@ -513,9 +526,9 @@ class Connection(H1Framing, H1ClientState):
                 # (conn.rs `read_head` L245-252) — the HTTP state expected a response.
                 raise H1IncompleteMessageError("connection closed before message completed: no response head")
             head = codec.receive_head(data)
-            # The codec caps a still-incomplete head at hyper's max_buf_size (io.rs
-            # L202-207, enforcement tightened in 1.11.0 #4093): past it the connection
-            # fails with `Parse::TooLarge`.
+            # The codec caps a still-incomplete head at max_header_size and
+            # max_buf_size (hyper io.rs:204-215).
+            # Reaching either cap fails the connection with `Parse::TooLarge`.
             if head is not None:
                 return head
             data = None
@@ -575,6 +588,11 @@ class Connection(H1Framing, H1ClientState):
         finally:
             self._release()
 
+    def abort(self):
+        # hyper client/conn/http1.rs:586-590: dropping the handshake drops its IO.
+        # The same failure verdict as _fail's Io-less close; closing wakes the watcher.
+        self._close(self.fail())
+
     async def close(self):
         # Commit `closed` + take the transport FIRST (one step in the state): the
         # transport close is what ends the idle watcher's parked read (it sees the
@@ -619,8 +637,47 @@ class H1Connection(BaseClientConnection):
     used to rewrite the target. `__aenter__`/`__aexit__`/`request` come from
     `BaseClientConnection` (identical to `H2Connection`)."""
 
-    def __init__(self, transport: Any, *, authority: str | None = None, backend: BackendLike | None = None) -> None:
-        self._conn = Connection(transport, authority=authority, backend=backend)
+    def __init__(
+        self,
+        transport: Any,
+        *,
+        authority: str | None = None,
+        backend: BackendLike | None = None,
+        max_header_size: int | None = None,
+        max_headers: int | None = None,
+        max_buf_size: int | None = None,
+        title_case_headers: bool = False,
+        allow_spaces_after_header_name_in_responses: bool = False,
+        allow_obsolete_multiline_headers_in_responses: bool = False,
+        ignore_invalid_headers_in_responses: bool = False,
+    ) -> None:
+        """Options mirror hyper client/conn/http1.rs:388-560 (defaults are hyper's).
+        `max_header_size` limits response head bytes including the status line and
+        chunked trailer bytes. Excess head bytes raise
+        `H1ParseError("too_large", "message head is too large")`. None leaves the head
+        bounded by `max_buf_size` and trailers at 16 KB. `max_headers` limits head/trailer
+        count (None = 100); `max_buf_size` caps an incomplete head (>= 8192; None =
+        hyper's ~400 KB default). `title_case_headers` writes request header names in
+        title case. `allow_spaces_after_header_name_in_responses` accepts whitespace
+        before colons; `allow_obsolete_multiline_headers_in_responses` replaces obsolete
+        line folding with spaces; `ignore_invalid_headers_in_responses` skips malformed
+        header lines. All three parser relaxations default to False."""
+        # DIVERGENCE: preserve_header_case is not supported (maintainer's choice;
+        # original-case extensions are not offered by httpunk).
+        # DIVERGENCE: http09_responses is not offered (maintainer's choice);
+        # HTTP/0.9 responses remain rejected, hyper's default (client/conn/http1.rs:350).
+        self._conn = Connection(
+            transport,
+            authority=authority,
+            backend=backend,
+            max_header_size=max_header_size,
+            max_headers=max_headers,
+            max_buf_size=max_buf_size,
+            title_case_headers=title_case_headers,
+            allow_spaces_after_header_name_in_responses=allow_spaces_after_header_name_in_responses,
+            allow_obsolete_multiline_headers_in_responses=allow_obsolete_multiline_headers_in_responses,
+            ignore_invalid_headers_in_responses=ignore_invalid_headers_in_responses,
+        )
 
     def ready(self) -> Awaitable[None]:
         """Wait until the connection can accept a request (h1 has no stream slots;

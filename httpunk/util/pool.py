@@ -31,18 +31,29 @@ from typing import Any
 
 from .. import _backend
 from .._httpunk import uri_parts
+from ..exceptions import fresh_exc
 
 
-class Canceled(Exception):  # noqa: N818 - `Canceled` is hyper-util's exact name (singleton.rs)
-    """A `Singleton` waiter's coalesced connection attempt was ditched because the
-    in-flight connect (driven by another caller) failed. Retry by calling again
-    (mirrors hyper-util's singleton `Canceled`)."""
+class Canceled(Exception):  # noqa: N818 - retained public name for a dropped Singleton round
+    """`Singleton.aclose()` dropped this caller's in-flight connection round."""
+
+
+class _Round:
+    # hyper-util client/pool/singleton.rs:203-208,434-442: a batch owns its result.
+    __slots__ = ("ready", "conn", "error", "abandoned")
+
+    def __init__(self, ready):
+        self.ready = ready
+        self.conn = None
+        self.error = None
+        self.abandoned = False
 
 
 class Singleton:
     """Shares a single connection across all callers, coalescing concurrent
     `get()`s onto one connect — the HTTP/2 pattern (one multiplexed connection).
-    Mirrors hyper-util `pool::singleton::Singleton` (State: empty → making → made).
+    Mirrors hyper-util `pool::singleton::Singleton` (singleton.rs:111-137).
+    Connect errors reach every caller; cancelling the driver lets waiters restart.
     """
 
     def __init__(
@@ -55,71 +66,82 @@ class Singleton:
         self._lock = threading.Lock()
         self._state = "empty"  # empty | making | made
         self._conn = None
-        self._ready = None  # event signalling the current making round is done
-        # The making round's id: `aclose()`/`retain()` during a connect bump it, so a
-        # driver whose round was ditched closes the connection it made instead of
-        # installing it (and its waiters get `Canceled`) — an in-flight connect can
-        # never resurrect a closed singleton or leak a second connection.
-        self._round = 0
+        self._rnd = None  # the in-flight round; waiters keep their own reference
 
     async def get(self, dst: Any = None) -> Any:
-        """The shared connection, connecting once. Concurrent callers during the
-        connect wait for it; if that connect fails, the driver raises the real error
-        and the waiters get `Canceled`."""
-        stale = None
-        with self._lock:
-            if self._state == "made":
-                if not self._conn.closed:
-                    return self._conn
-                # The shared connection died (driver failed / GOAWAY). Ditch it and
-                # reconnect — mirroring hyper-util `Singled::poll_ready` resetting a closed
-                # service to Empty (F35); otherwise every `get()` would hand back the
-                # corpse. We become the making-driver below and close the dead one first.
-                stale, self._conn, self._state = self._conn, None, "empty"
-            if self._state == "empty":
-                self._state = "making"
-                self._round += 1
-                self._ready = self._backend.event()
-                ready, driver, rnd = self._ready, True, self._round
-            else:  # making — wait for the driver
-                ready, driver, rnd = self._ready, False, self._round
-
-        if stale is not None:
-            with contextlib.suppress(Exception):
-                await stale.__aexit__(None, None, None)  # close the dead connection
-
-        if driver:
-            try:
-                conn = await self._connector(dst)
-                await conn.__aenter__()  # HTTP handshake — the pool owns the lifetime
-            except BaseException:
-                with self._lock:
-                    if self._round == rnd and self._state == "making":
-                        self._state = "empty"  # ditch the round so the next get() retries
-                ready.set()
-                raise
+        """The shared connection, coalescing concurrent connects. Each caller receives
+        its round's connection or connector error. If the driver is cancelled,
+        waiters retry; if `aclose()` drops their round, they raise `Canceled`."""
+        while True:
+            stale = None
             with self._lock:
-                installed = self._round == rnd and self._state == "making"
-                if installed:
-                    self._conn, self._state = conn, "made"
-            ready.set()
-            if not installed:
-                # `aclose()`/`retain()` ditched this round mid-connect: the singleton is
-                # closed (or reset), so the fresh connection must not be installed.
-                with contextlib.suppress(Exception):
-                    await conn.__aexit__(None, None, None)
-                raise Canceled("the singleton was closed while this call was connecting")
-            return conn
+                if self._state == "made":
+                    if not self._conn.closed:
+                        return self._conn
+                    # hyper-util client/pool/singleton.rs:327-338: a dead cached service
+                    # clears the singleton. Close it before driving the replacement.
+                    stale, self._conn, self._state = self._conn, None, "empty"
+                if self._state == "empty":
+                    # singleton.rs:114-130: exactly one driver per batch.
+                    rnd = self._rnd = _Round(self._backend.event())
+                    self._state, driver = "making", True
+                else:  # making — wait for the driver
+                    rnd, driver = self._rnd, False
 
-        await ready.wait()
-        with self._lock:
-            if self._state == "made":
-                return self._conn
-        raise Canceled("the connection attempt this call was waiting on failed")
+            if driver:
+                try:
+                    if stale is not None:
+                        with contextlib.suppress(Exception):
+                            await stale.__aexit__(None, None, None)
+                    conn = await self._connector(dst)
+                    await conn.__aenter__()  # HTTP handshake — the pool owns the lifetime
+                except BaseException as exc:
+                    # singleton.rs:279-283,426-429 shares the maker's error.
+                    # DIVERGENCE: store/raise fresh_exc copies, not one shared
+                    # instance: Python tracebacks retain frames (httpunk/exceptions.py).
+                    error = fresh_exc(exc) if isinstance(exc, Exception) else None
+                    with self._lock:
+                        if self._rnd is rnd:
+                            self._state, self._rnd = "empty", None
+                            if error is not None:
+                                rnd.error = error
+                            else:
+                                # DIVERGENCE: restart the connect on driver cancellation;
+                                # upstream keeps polling the same future (singleton.rs:376-395).
+                                # DIVERGENCE: takeover follows scheduling order, not the last
+                                # registered waiter; this order is not observable to callers.
+                                rnd.abandoned = True
+                    rnd.ready.set()
+                    # DIVERGENCE: no SingletonError wrapper (singleton.rs:479-497);
+                    # participants raise the connector's own exception type.
+                    raise
+                with self._lock:
+                    installed = self._rnd is rnd
+                    if installed:
+                        self._conn, self._state, self._rnd = conn, "made", None
+                        rnd.conn = conn  # singleton.rs:273-276,434-442: keep this batch's result
+                rnd.ready.set()
+                if not installed:
+                    # `aclose()` ditched this round mid-connect; never resurrect it.
+                    with contextlib.suppress(Exception):
+                        await conn.__aexit__(None, None, None)
+                    raise Canceled("the singleton was closed while this call was connecting")
+                return conn
+
+            await rnd.ready.wait()
+            # singleton.rs:254-261: read this batch's outcome, never a later batch's.
+            if rnd.conn is not None:
+                return rnd.conn
+            if rnd.error is not None:
+                raise fresh_exc(rnd.error) from rnd.error
+            if rnd.abandoned:
+                continue
+            raise Canceled("the singleton was closed while this call was waiting")
 
     async def retain(self, predicate: Callable[[Any], bool]) -> None:
         """Drop (and close) the shared connection if `predicate(conn)` is False —
         the eviction hook for a dead/stale connection. No-op while empty/making.
+        As in hyper-util singleton.rs:71-78, retain never drops a round in flight.
         The predicate (foreign code) runs OUTSIDE the lock; the eviction is then a
         compare-and-swap on the same connection."""
         with self._lock:
@@ -129,7 +151,6 @@ class Singleton:
         with self._lock:
             if self._conn is conn:
                 self._conn, self._state = None, "empty"
-                self._round += 1  # a concurrent connect round, if any, is ditched too
             else:
                 conn = None
         if conn is not None:
@@ -141,11 +162,15 @@ class Singleton:
             return self._state == "empty"
 
     async def aclose(self) -> None:
-        """Close the shared connection and reset to empty. A connect in flight is
-        ditched: its driver closes what it made and raises `Canceled`."""
+        """Close the shared connection and reset to empty. Waiters of an in-flight
+        round raise `Canceled`; its driver closes what it made instead of installing it."""
+        # DIVERGENCE: upstream has no close (singleton.rs:62); Canceled remains only
+        # for this httpunk lifecycle operation dropping a round mid-connect.
         with self._lock:
             conn, self._conn, self._state = self._conn, None, "empty"
-            self._round += 1
+            rnd, self._rnd = self._rnd, None
+        if rnd is not None:
+            rnd.ready.set()
         if conn is not None:
             await conn.__aexit__(None, None, None)
 

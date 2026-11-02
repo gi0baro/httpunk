@@ -11,7 +11,7 @@ check-and-act and returns a verdict. This file holds only the async machinery
 — the transport, the read pump, the write pump, the body pumps and their
 `select` races, the events — and acts on verdicts *after* each call returns:
 the state is published inside the call, the event that announces it is set
-after. No attribute here is shared mutable state (HTTPUNK_RUST_STATE_DESIGN.md).
+after. No attribute here is shared mutable state.
 
 The client `Connection` (client.py) and the server `ServerConnection`
 (server.py) subclass this; the role lives in Rust (`H2Streams(role=...)`), and
@@ -104,7 +104,7 @@ class H2ConnectionBase(H2Streams):
     # ----- verdict acts -----
 
     def _after(self, flags):
-        """Perform what a verdict's flags ask for — infallible, sync (design §4)."""
+        """Perform what a verdict's flags ask for — infallible, sync."""
         if flags & H2_FLAG_WAKE:
             self._write_evt.set()
         if flags & H2_FLAG_SLOT_FREED:
@@ -219,6 +219,14 @@ class H2ConnectionBase(H2Streams):
         for handle in self.credit_written():
             handle.window_evt.set()
 
+    def abort(self):
+        # h2 client.rs:1335-1343, server.rs:1500-1519: dropping a failed or
+        # cancelled handshake drops its IO, without flushing or TLS close_notify.
+        self.backend.close_transport(self._transport)
+        self._fail(None)  # preserve a failure already recorded by the read pump
+        self.stop_pump()
+        self._write_evt.set()
+
     async def close(self):
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never cancel it
         # (a cancellation landing between its take and its flush would lose control
@@ -253,7 +261,7 @@ class H2ConnectionBase(H2Streams):
         """Flush the pending-send buffer to the transport. Each wake takes EVERYTHING
         accumulated since the last flush and writes it as one send (control frames
         coalesce, h2 `poll_complete`) — the buffer itself, exported through a
-        memoryview, never a copy (BOUNDARY_NOTES V2). The clear precedes the take: an append landing
+        memoryview, never a copy. The clear precedes the take: an append landing
         after the take sets the event after our clear, so its wake survives. A write
         failure fails the whole connection (h2: a connection-task write error is fatal)."""
         while True:
@@ -287,7 +295,7 @@ class H2ConnectionBase(H2Streams):
 
     async def _read_pump(self):
         server = self.is_server
-        spare = Stream(self.backend) if server else None  # the next request's handle (§3.1)
+        spare = Stream(self.backend) if server else None  # the next request's handle
         try:
             while True:
                 data = await self._transport.receive_some(_READ_SIZE)
@@ -319,7 +327,8 @@ class H2ConnectionBase(H2Streams):
             # A protocol/flow violation we detected: notify the peer with GOAWAY, then
             # tear down (h2 `go_away_now`). Best-effort: the connection is going down.
             reason = exc.args[0] if exc.args and isinstance(exc.args[0], int) else int(H2Reason.PROTOCOL_ERROR)
-            self._after(self.send_goaway(reason))
+            # h2 proto/connection.rs:482-483, 537-558: forward library debug data.
+            self._after(self.send_goaway(reason, getattr(exc, "_debug_data", None)))
             with contextlib.suppress(Exception):
                 await self._flush()
             self._fail(exc)
@@ -499,8 +508,7 @@ class H2ConnectionBase(H2Streams):
 
     async def _send_data(self, st, data, end_stream, offset=0):
         """`_try_send_data` until the body is queued, awaiting "no window now" on
-        `window_evt` with the fixed waiter idiom: try, clear, try again, wait
-        (design §4)."""
+        `window_evt` with the fixed waiter idiom: try, clear, try again, wait."""
         while True:
             offset = self._try_send_data(st, data, offset, end_stream)
             if offset is None:
