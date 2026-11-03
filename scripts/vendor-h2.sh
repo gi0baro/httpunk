@@ -9,8 +9,9 @@
 #   H2_VERSION=0.4.20 scripts/vendor-h2.sh
 #
 # The copy is kept byte-identical to upstream so `git diff` between two vendored
-# versions shows only genuine upstream changes. Modifications: drop hpack/test/, one documented state.rs shim, and a
-# uniform pub(crate)->pub widening (see steps below).
+# versions shows only genuine upstream changes. Modifications: drop hpack/test/,
+# two documented state.rs edits (the recv_open shim and stripping its test
+# module), and a uniform pub(crate)->pub widening (see steps below).
 set -euo pipefail
 
 H2_VERSION="${H2_VERSION:-0.4.20}"

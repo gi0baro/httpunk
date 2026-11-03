@@ -936,8 +936,6 @@ async def test_validate_multiple_content_length_headers(method, values, valid):
 @pytest.mark.tonio
 async def test_recv_too_big_headers():
     # h2 tests/h2-tests/tests/client_request.rs:893 recv_too_big_headers.
-    from httpunk.h2 import client
-
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     done, errors_ready = Event(), Event()
@@ -977,18 +975,14 @@ async def test_recv_too_big_headers():
         if len(errors) == 2:
             errors_ready.set()
 
-    # The public client uses hyper's fixed profile; configure h2's test limit
-    # without adding a production builder option just for this test.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(client, "_MAX_HEADER_LIST_SIZE", 40)
-        async with scope() as s:
-            s.spawn(server())
-            async with open_h2(host, port) as conn:
-                s.spawn(request(conn))
-                s.spawn(request(conn))
-                await errors_ready.wait()
-            await done.wait()
-            s.cancel()
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port, max_header_list_size=40) as conn:
+            s.spawn(request(conn))
+            s.spawn(request(conn))
+            await errors_ready.wait()
+        await done.wait()
+        s.cancel()
     assert sorted(errors) == [1, 3]
     assert resets == [(3, H2Reason.PROTOCOL_ERROR)]
 

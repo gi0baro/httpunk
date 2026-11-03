@@ -994,7 +994,7 @@ class H2Streams:
         *,
         initial_window_size: int,
         connection_window: int,
-        max_frame_size: int,
+        max_frame_size: int | None,
         max_header_list_size: int,
         max_send_buf_size: int,
         max_concurrent_streams: int | None = ...,
@@ -1003,8 +1003,13 @@ class H2Streams:
         data_frame_budget: int | None = ...,
         auto_date_header: bool = ...,
         enable_push: bool | None = ...,
+        header_table_size: int | None = ...,
+        max_concurrent_reset_streams: int | None = ...,
+        reset_stream_duration: float | None = ...,
     ) -> None:
-        """`role`: "client" | "server". Validates the RFC ranges at construction."""
+        """`role`: "client" | "server". Validates the RFC ranges at construction.
+        `header_table_size`: None = not advertised; applied on SETTINGS ACK.
+        Reset retention defaults to 50 streams / 1 second; duration is in seconds."""
 
     @property
     def is_server(self) -> bool: ...

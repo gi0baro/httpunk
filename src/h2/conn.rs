@@ -342,8 +342,10 @@ struct Inner {
     /// "no streams" test of the GOAWAY reply.
     num_active: usize,
     /// Ids we locally reset, kept briefly so late frames are swallowed (h2
-    /// `reset_stream_duration`); bounded to RESET_STREAM_MAX, aged out lazily.
+    /// `reset_stream_duration`); bounded by `reset_stream_max`, aged out lazily.
     reset_streams: HashMap<u32, Instant>,
+    reset_stream_max: usize,
+    reset_stream_duration: Duration,
 
     /// The peer's values (settings.rs `PeerSettings`) and our SETTINGS handshake
     /// (settings.rs `Settings`, the mirror of h2 `proto/settings.rs`).
@@ -474,7 +476,7 @@ impl Inner {
     /// `None` = not there (an expired entry is dropped).
     fn in_reset_store(&mut self, sid: u32) -> bool {
         if let Some(at) = self.reset_streams.get(&sid) {
-            if at.elapsed() <= RESET_STREAM_SECS {
+            if at.elapsed() <= self.reset_stream_duration {
                 return true;
             }
             self.reset_streams.remove(&sid);
@@ -671,12 +673,12 @@ impl Inner {
 
     fn clear_expired_reset_streams(&mut self) {
         self.reset_streams
-            .retain(|_, at| at.elapsed() <= RESET_STREAM_SECS);
+            .retain(|_, at| at.elapsed() <= self.reset_stream_duration);
     }
 
     fn enqueue_reset_expiration(&mut self, sid: u32) {
         self.clear_expired_reset_streams();
-        if self.reset_streams.len() >= RESET_STREAM_MAX {
+        if self.reset_streams.len() >= self.reset_stream_max {
             return; // over the cap: h2 drops it (transitions immediately) rather than retain
         }
         self.reset_streams.insert(sid, Instant::now());
@@ -1119,18 +1121,20 @@ impl H2Streams {
 impl H2Streams {
     /// `role`: "client" | "server". The window / frame / header-list profile is the
     /// role's (hyper's, passed by the Python subclass); `max_concurrent_streams` is
-    /// the server's advertised limit; `enable_push` is the client's SETTINGS_ENABLE_PUSH.
+    /// the advertised peer-initiated limit; `enable_push` is the client's SETTINGS_ENABLE_PUSH.
     #[new]
     #[pyo3(signature = (role, *, initial_window_size, connection_window, max_frame_size,
                         max_header_list_size, max_send_buf_size, max_concurrent_streams=None,
                         max_pending_accept_reset_streams=20, max_local_error_reset_streams=Some(1024),
-                        data_frame_budget=None, auto_date_header=true, enable_push=None))]
+                        data_frame_budget=None, auto_date_header=true, enable_push=None,
+                        header_table_size=None, max_concurrent_reset_streams=None,
+                        reset_stream_duration=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         role: &str,
         initial_window_size: u32,
         connection_window: u32,
-        max_frame_size: u32,
+        max_frame_size: Option<u32>,
         max_header_list_size: u32,
         max_send_buf_size: usize,
         max_concurrent_streams: Option<u32>,
@@ -1139,6 +1143,9 @@ impl H2Streams {
         data_frame_budget: Option<usize>,
         auto_date_header: bool,
         enable_push: Option<bool>,
+        header_table_size: Option<u32>,
+        max_concurrent_reset_streams: Option<usize>,
+        reset_stream_duration: Option<f64>,
     ) -> PyResult<Self> {
         let role = match role {
             "client" => Role::Client,
@@ -1151,7 +1158,18 @@ impl H2Streams {
         };
         // Fail at construction, not at the first SETTINGS write (h2 frame/settings.rs
         // asserts the RFC ranges).
-        codec::check_max_frame_size(max_frame_size)?;
+        if let Some(max) = max_frame_size {
+            codec::check_max_frame_size(max)?;
+        }
+        // h2 client.rs:1001 accepts a nonnegative Duration; Python durations are seconds.
+        let reset_stream_duration = reset_stream_duration
+            .map(|seconds| {
+                Duration::try_from_secs_f64(seconds).map_err(|_| {
+                    PyValueError::new_err("reset_stream_duration must be finite and nonnegative")
+                })
+            })
+            .transpose()?
+            .unwrap_or(RESET_STREAM_SECS);
         if initial_window_size > codec::MAX_WINDOW_SIZE
             || connection_window > codec::MAX_WINDOW_SIZE
         {
@@ -1178,15 +1196,12 @@ impl H2Streams {
         // *smaller* window still waits for the ACK (RFC 7540 §6.9.2).
         let recv_init = initial_window_size.max(DEFAULT_INITIAL_WINDOW_SIZE);
         let local = SettingsValues {
-            header_table_size: None,
+            // h2 proto/settings.rs:66-68: apply the HPACK limit only on the peer's ACK.
+            header_table_size,
             enable_push,
-            max_concurrent_streams: if role == Role::Server {
-                max_concurrent_streams
-            } else {
-                None
-            },
+            max_concurrent_streams,
             initial_window_size: Some(initial_window_size),
-            max_frame_size: Some(max_frame_size),
+            max_frame_size,
             max_header_list_size: Some(max_header_list_size),
         };
         // h2 server.rs:391-397 / client.rs:1344-1350: the handshake sets our receive
@@ -1196,7 +1211,9 @@ impl H2Streams {
         // limits applied only at the ACK would miss frames that arrive in the same read
         // as the ACK (timing-dependent; not reproducible deterministically).
         let mut decoder = Decoder::new(role == Role::Server);
-        decoder.set_max_recv_frame_size(max_frame_size)?;
+        if let Some(max) = max_frame_size {
+            decoder.set_max_recv_frame_size(max)?;
+        }
         decoder.set_max_header_list_size(max_header_list_size);
         Ok(H2Streams {
             decoder: Mutex::new(decoder),
@@ -1215,6 +1232,9 @@ impl H2Streams {
                 streams: HashMap::new(),
                 num_active: 0,
                 reset_streams: HashMap::new(),
+                // h2 client.rs:663-664, 955, 1001: unset options retain h2's defaults.
+                reset_stream_max: max_concurrent_reset_streams.unwrap_or(RESET_STREAM_MAX),
+                reset_stream_duration,
                 peer: PeerSettings::new(),
                 settings: Settings::new(local),
                 recv_init,
@@ -2298,7 +2318,7 @@ impl H2Streams {
         // later HEADERS fails recv::open's increasing-id check (recv.rs:137-140).
         if reason != u32::from(Reason::REFUSED_STREAM) {
             me.clear_expired_reset_streams();
-            if me.reset_streams.len() < RESET_STREAM_MAX {
+            if me.reset_streams.len() < me.reset_stream_max {
                 me.reset_streams.insert(sid, Instant::now());
             }
         }

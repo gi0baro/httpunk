@@ -42,6 +42,8 @@ _CONN_WINDOW = 5 * 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
 _MAX_SEND_BUF_SIZE = 1024 * 1024  # hyper proto/h2/client.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
+_LOCAL_ERROR_RESET_MAX = 1024  # hyper proto/h2/client.rs:98
+_REMOTE_RESET_MAX = 20  # h2 proto/mod.rs:34
 
 
 class Connection(H2ConnectionBase):
@@ -57,6 +59,15 @@ class Connection(H2ConnectionBase):
         initial_window_size=None,
         data_frame_budget=None,
         max_send_buf_size=None,
+        header_table_size=None,
+        initial_connection_window_size=None,
+        max_concurrent_streams=None,
+        max_frame_size=_MAX_FRAME_SIZE,
+        max_header_list_size=_MAX_HEADER_LIST_SIZE,
+        max_local_error_reset_streams=_LOCAL_ERROR_RESET_MAX,
+        max_pending_accept_reset_streams=None,
+        max_concurrent_reset_streams=None,
+        reset_stream_duration=None,
     ):
         # The Rust state takes the role + the hyper profile; the async members are
         # added in `__init__`. We advertise SETTINGS_ENABLE_PUSH=0 + our window/frame/
@@ -66,9 +77,21 @@ class Connection(H2ConnectionBase):
             cls,
             "client",
             initial_window_size=initial_window_size if initial_window_size is not None else _STREAM_WINDOW,
-            connection_window=_CONN_WINDOW,
-            max_frame_size=_MAX_FRAME_SIZE,
-            max_header_list_size=_MAX_HEADER_LIST_SIZE,
+            # hyper proto/h2/client.rs:83-135: always set the windows/header-list limit;
+            # advertise the optional SETTINGS only when configured.
+            connection_window=(
+                initial_connection_window_size if initial_connection_window_size is not None else _CONN_WINDOW
+            ),
+            max_frame_size=max_frame_size,
+            max_header_list_size=max_header_list_size,
+            header_table_size=header_table_size,
+            max_concurrent_streams=max_concurrent_streams,
+            max_local_error_reset_streams=max_local_error_reset_streams,
+            max_pending_accept_reset_streams=(
+                max_pending_accept_reset_streams if max_pending_accept_reset_streams is not None else _REMOTE_RESET_MAX
+            ),
+            max_concurrent_reset_streams=max_concurrent_reset_streams,
+            reset_stream_duration=reset_stream_duration,
             # hyper `client::conn::http2::Builder::max_send_buf_size` (1 MB).
             max_send_buf_size=max_send_buf_size if max_send_buf_size is not None else _MAX_SEND_BUF_SIZE,
             data_frame_budget=data_frame_budget,
@@ -208,6 +231,11 @@ class Connection(H2ConnectionBase):
                 self._writers_evt.set()
 
 
+# DIVERGENCE: hyper client/conn/http2.rs:365 offers initial_max_send_streams, but
+# connect() waits for peer SETTINGS (see Connection.connect), so an assumed initial
+# concurrency limit is never observable and is not offered.
+# DIVERGENCE: initial_window_size keeps its public API name; hyper's corresponding
+# option is initial_stream_window_size (client/conn/http2.rs:334).
 class H2Connection(BaseClientConnection):
     """An HTTP/2 client connection over a caller-supplied, already-connected
     `transport` (BYO transport, like hyper's `client::conn::http2::handshake(io)`;
@@ -231,10 +259,31 @@ class H2Connection(BaseClientConnection):
         initial_window_size: int | None = None,
         data_frame_budget: int | None = None,
         max_send_buf_size: int | None = None,
+        header_table_size: int | None = None,
+        initial_connection_window_size: int | None = None,
+        max_concurrent_streams: int | None = None,
+        max_frame_size: int | None = _MAX_FRAME_SIZE,
+        max_header_list_size: int = _MAX_HEADER_LIST_SIZE,
+        max_local_error_reset_streams: int | None = _LOCAL_ERROR_RESET_MAX,
+        max_pending_accept_reset_streams: int | None = None,
+        max_concurrent_reset_streams: int | None = None,
+        reset_stream_duration: float | None = None,
     ) -> None:
-        """`max_send_buf_size` (hyper `client::conn::http2::Builder::max_send_buf_size`,
-        default 1 MB): per-stream cap on request DATA queued for the connection's writer;
-        the body sender awaits room as it awaits flow-control window."""
+        """Options mirror hyper client/conn/http2.rs:334-555 (defaults from
+        proto/h2/client.rs:83-104). `initial_window_size` (2 MB) and
+        `initial_connection_window_size` (5 MB) accept None for the hyper default;
+        both must be at most 2**31 - 1. `header_table_size` and
+        `max_concurrent_streams` default to None (not advertised); the latter limits
+        peer-initiated streams, not requests sent by this client.
+        `max_frame_size` defaults to 16 KB (range 16,384..16,777,215); None omits
+        the setting. `max_header_list_size` defaults to 16 KB.
+        `max_local_error_reset_streams` defaults to 1024; None disables the limit.
+        `max_pending_accept_reset_streams`, `max_concurrent_reset_streams`, and
+        `reset_stream_duration` default to None for h2's defaults (20, 50, and 1 s).
+        `reset_stream_duration` is a finite, nonnegative number of seconds.
+        `max_send_buf_size` (1 MB) caps per-stream request DATA queued for the
+        connection's writer; the body sender awaits room as it awaits flow-control
+        window. `data_frame_budget` is h2's own option (None = Auto)."""
         self._conn = Connection(
             transport,
             authority=authority,
@@ -243,6 +292,15 @@ class H2Connection(BaseClientConnection):
             initial_window_size=initial_window_size,
             data_frame_budget=data_frame_budget,
             max_send_buf_size=max_send_buf_size,
+            header_table_size=header_table_size,
+            initial_connection_window_size=initial_connection_window_size,
+            max_concurrent_streams=max_concurrent_streams,
+            max_frame_size=max_frame_size,
+            max_header_list_size=max_header_list_size,
+            max_local_error_reset_streams=max_local_error_reset_streams,
+            max_pending_accept_reset_streams=max_pending_accept_reset_streams,
+            max_concurrent_reset_streams=max_concurrent_reset_streams,
+            reset_stream_duration=reset_stream_duration,
         )
 
     def ready(self) -> Awaitable[None]:

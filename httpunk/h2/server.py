@@ -224,6 +224,7 @@ class ServerConnection(H2ConnectionBase):
         max_local_error_reset_streams=_LOCAL_ERROR_RESET_MAX,
         auto_date_header=True,
         max_send_buf_size=None,
+        header_table_size=None,
     ):
         # Our advertised windows / frame / header-list profile, defaulting to hyper's
         # (proto/h2/server.rs L36-40). `None` = hyper's default (its builders take
@@ -241,6 +242,8 @@ class ServerConnection(H2ConnectionBase):
             # hyper `http2::Builder::max_send_buf_size` (proto/h2/server.rs DEFAULT_MAX_SEND_BUF_SIZE, 400 KB).
             max_send_buf_size=max_send_buf_size if max_send_buf_size is not None else _MAX_SEND_BUF_SIZE,
             max_concurrent_streams=max_concurrent_streams,
+            # hyper server/conn/http2.rs:270; proto/h2/server.rs:72: None = not advertised.
+            header_table_size=header_table_size,
             # hyper `max_pending_accept_reset_streams`: None = h2's default (20).
             max_pending_accept_reset_streams=(
                 max_pending_accept_reset_streams if max_pending_accept_reset_streams is not None else _REMOTE_RESET_MAX
@@ -350,6 +353,8 @@ class ServerConnection(H2ConnectionBase):
             self._notify_reset(v.handle, v.reader_stop)
 
 
+# DIVERGENCE: initial_window_size keeps its public API name; hyper's corresponding
+# option is initial_stream_window_size (server/conn/http2.rs:157).
 class H2Server(BaseServer[ServerRequest]):
     """An HTTP/2 server connection over a caller-supplied, already-accepted
     `transport` (BYO transport, like hyper's `server::conn::http2`; accepting the
@@ -386,6 +391,7 @@ class H2Server(BaseServer[ServerRequest]):
         max_local_error_reset_streams: int | None = _LOCAL_ERROR_RESET_MAX,
         auto_date_header: bool = True,
         max_send_buf_size: int | None = None,
+        header_table_size: int | None = None,
     ) -> None:
         """Options mirror hyper `server::conn::http2::Builder` (defaults are hyper's; `None`
         = default unless noted): `max_concurrent_streams` (200), `initial_window_size`
@@ -394,7 +400,8 @@ class H2Server(BaseServer[ServerRequest]):
         `max_pending_accept_reset_streams` (h2's 20), `max_local_error_reset_streams`
         (1024; None = NO limit), `auto_date_header`, `max_send_buf_size` (400 KB: per-stream
         cap on response DATA queued for the connection's writer — the sender awaits room,
-        as it awaits flow-control window); plus h2's own `data_frame_budget` (None = Auto)."""
+        as it awaits flow-control window); `header_table_size` (None = not advertised;
+        hyper server/conn/http2.rs:270); plus h2's own `data_frame_budget` (None = Auto)."""
         self._conn = ServerConnection(
             transport,
             backend=backend,
@@ -408,4 +415,5 @@ class H2Server(BaseServer[ServerRequest]):
             max_local_error_reset_streams=max_local_error_reset_streams,
             auto_date_header=auto_date_header,
             max_send_buf_size=max_send_buf_size,
+            header_table_size=header_table_size,
         )
