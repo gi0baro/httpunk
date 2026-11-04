@@ -11,14 +11,14 @@ check-and-act and returns a verdict. This file holds only the async machinery
 — the transport, the read pump, the write pump, the body pumps and their
 `select` races, the events — and acts on verdicts *after* each call returns:
 the state is published inside the call, the event that announces it is set
-after. No attribute here is shared mutable state (HTTPUNK_RUST_STATE_DESIGN.md).
+after. No attribute here is shared mutable state.
 
 The client `Connection` (client.py) and the server `ServerConnection`
 (server.py) subclass this; the role lives in Rust (`H2Streams(role=...)`), and
 what remains role-specific here is async glue only: the client's ready/slot
 events, the server's accept queue.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.19 (see
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20 (see
 crates/vendor-h2), paths relative to its `src/`.
 """
 
@@ -72,7 +72,7 @@ class H2ConnectionBase(H2Streams):
         self.backend = _backend.resolve(backend)
         self._transport = transport
         # Set by the last background request-body writer to finish once `close()` is
-        # draining (client full-duplex send, F6): hyper's connection task ends only
+        # draining (client full-duplex send): hyper's connection task ends only
         # after every `PipeToSendStream` dropped its `conn_drop_ref`. Writers are bare
         # tasks, never cancelled: a stopped stream (peer reset, GOAWAY, the connection
         # failed or closed) is what ends one.
@@ -104,7 +104,7 @@ class H2ConnectionBase(H2Streams):
     # ----- verdict acts -----
 
     def _after(self, flags):
-        """Perform what a verdict's flags ask for — infallible, sync (design §4)."""
+        """Perform what a verdict's flags ask for — infallible, sync."""
         if flags & H2_FLAG_WAKE:
             self._write_evt.set()
         if flags & H2_FLAG_SLOT_FREED:
@@ -174,7 +174,7 @@ class H2ConnectionBase(H2Streams):
 
     def _raise_if_dead(self):
         """Raise the stored condition: the peer's GOAWAY first (the retry-relevant
-        one; h2's `recv_eof` never overwrites an existing conn_error, F20), then the
+        one; h2's `recv_eof` never overwrites an existing conn_error), then the
         connection error. Copies per raise."""
         info = self.goaway_info()
         if info is not None:
@@ -219,11 +219,19 @@ class H2ConnectionBase(H2Streams):
         for handle in self.credit_written():
             handle.window_evt.set()
 
+    def abort(self):
+        # h2 client.rs:1335-1343, server.rs:1500-1519: dropping a failed or
+        # cancelled handshake drops its IO, without flushing or TLS close_notify.
+        self.backend.close_transport(self._transport)
+        self._fail(None)  # preserve a failure already recorded by the read pump
+        self.stop_pump()
+        self._write_evt.set()
+
     async def close(self):
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never cancel it
         # (a cancellation landing between its take and its flush would lose control
-        # frames). Drain what is enqueued (h2 `codec.shutdown` = flush THEN shutdown,
-        # F23), shut the transport down — `FramedWrite::shutdown` ends in the IO's
+        # frames). Drain what is enqueued (h2 `codec.shutdown` = flush THEN shutdown),
+        # shut the transport down — `FramedWrite::shutdown` ends in the IO's
         # `poll_shutdown` (`close_notify` over TLS), which is also what ends the read
         # pump's parked read — join it, and wake every straggler. On a transport that
         # already died the alert cannot go out and the shutdown is the plain close
@@ -243,7 +251,7 @@ class H2ConnectionBase(H2Streams):
         handle = self.take_read_handle()
         if handle is not None:
             await handle
-        self._fail(None)  # no-op when the pump already failed everyone (F44)
+        self._fail(None)  # no-op when the pump already failed everyone
         if not self.release_writers():
             await self._writers_evt.wait()
 
@@ -253,7 +261,7 @@ class H2ConnectionBase(H2Streams):
         """Flush the pending-send buffer to the transport. Each wake takes EVERYTHING
         accumulated since the last flush and writes it as one send (control frames
         coalesce, h2 `poll_complete`) — the buffer itself, exported through a
-        memoryview, never a copy (BOUNDARY_NOTES V2). The clear precedes the take: an append landing
+        memoryview, never a copy. The clear precedes the take: an append landing
         after the take sets the event after our clear, so its wake survives. A write
         failure fails the whole connection (h2: a connection-task write error is fatal)."""
         while True:
@@ -287,7 +295,7 @@ class H2ConnectionBase(H2Streams):
 
     async def _read_pump(self):
         server = self.is_server
-        spare = Stream(self.backend) if server else None  # the next request's handle (§3.1)
+        spare = Stream(self.backend) if server else None  # the next request's handle
         try:
             while True:
                 data = await self._transport.receive_some(_READ_SIZE)
@@ -300,7 +308,7 @@ class H2ConnectionBase(H2Streams):
                     except H2StreamError as se:
                         # Stream-level violation (`Error::Reset`): RST just that stream and
                         # keep going. A REMOTE-initiated reset is the peer's own RST_STREAM
-                        # surfacing — h2 sends nothing back (F25).
+                        # surfacing — h2 sends nothing back.
                         if server:
                             spare = Stream(self.backend)  # the failing frame may have consumed it
                         if se.args[2] != "remote":
@@ -309,7 +317,7 @@ class H2ConnectionBase(H2Streams):
                                 self._notify_reset(v.handle, v.stop)
                             self._after(v.flags)
                 # After a peer GOAWAY, once every in-flight stream has finished, queue our
-                # acknowledging GOAWAY(NO_ERROR) and stop serving (F23; h2 `go_away_now`).
+                # acknowledging GOAWAY(NO_ERROR) and stop serving (h2 `go_away_now`).
                 flags = self.maybe_goaway_reply()
                 if flags:
                     self._after(flags)
@@ -319,7 +327,8 @@ class H2ConnectionBase(H2Streams):
             # A protocol/flow violation we detected: notify the peer with GOAWAY, then
             # tear down (h2 `go_away_now`). Best-effort: the connection is going down.
             reason = exc.args[0] if exc.args and isinstance(exc.args[0], int) else int(H2Reason.PROTOCOL_ERROR)
-            self._after(self.send_goaway(reason))
+            # h2 proto/connection.rs:482-483, 537-558: forward library debug data.
+            self._after(self.send_goaway(reason, getattr(exc, "_debug_data", None)))
             with contextlib.suppress(Exception):
                 await self._flush()
             self._fail(exc)
@@ -331,7 +340,7 @@ class H2ConnectionBase(H2Streams):
             self._fail(exc)
 
     def _dispatch(self, frame, spare):
-        # h2: the frame match in proto/connection.rs `recv_frame` (L518). Each arm is
+        # h2: the frame match in proto/connection.rs `recv_frame` (L560). Each arm is
         # one call into the state, then the acts its verdict asks for.
         if isinstance(frame, Headers):
             v = self.recv_headers(frame, spare)
@@ -401,7 +410,7 @@ class H2ConnectionBase(H2Streams):
         resumes after the client's inline attempt queued its head (`_send_body_inline`)."""
         if isinstance(body, bytes):
             # hyper's `Full` body: one poll yields the whole chunk with `is_end_stream()`
-            # set — one DATA carrying END_STREAM (or the trailers carry it, F45).
+            # set — one DATA carrying END_STREAM (or the trailers carry it).
             if trailers is None:
                 await self._send_data(st, body, end_stream=True, offset=offset)
                 return
@@ -421,7 +430,7 @@ class H2ConnectionBase(H2Streams):
                     await self._send_data(st, pending, end_stream=False)
                 pending = bytes(chunk)
         if trailers is not None:
-            # END_STREAM rides the trailing HEADERS frame, not the last DATA (F45).
+            # END_STREAM rides the trailing HEADERS frame, not the last DATA.
             if pending is not _UNSET and pending:
                 await self._send_data(st, pending, end_stream=False)
             self._send_trailers(st, trailers)
@@ -499,8 +508,7 @@ class H2ConnectionBase(H2Streams):
 
     async def _send_data(self, st, data, end_stream, offset=0):
         """`_try_send_data` until the body is queued, awaiting "no window now" on
-        `window_evt` with the fixed waiter idiom: try, clear, try again, wait
-        (design §4)."""
+        `window_evt` with the fixed waiter idiom: try, clear, try again, wait."""
         while True:
             offset = self._try_send_data(st, data, offset, end_stream)
             if offset is None:

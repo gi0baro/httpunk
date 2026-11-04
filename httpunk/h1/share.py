@@ -6,7 +6,7 @@ pulling more transport bytes from the driver as needed. When the body is fully
 read (or `aclose`d), it releases the connection's single in-flight slot — freeing
 it for the next request on a keep-alive connection, or closing the connection
 otherwise. Adapts the read side of hyper's `proto/h1/conn.rs` (`Reading::Body` ->
-`KeepAlive` on a fully-read body, `conn.rs` L370-400) + `IncomingBody`; `aclose`
+`KeepAlive` on a fully-read body, `conn.rs` L376-406) + `IncomingBody`; `aclose`
 on a partially-read body maps to hyper marking the connection non-reusable (there
 is no per-request reset in h1 — the connection itself is closed).
 
@@ -160,10 +160,10 @@ class H1ResponseBody:
     async def _finish(self):
         """The body is fully decoded: the chunked trailers (if any) are available, and
         hyper's client validates the read buffer is empty before reusing the connection
-        (`require_empty_read` -> `new_unexpected_message`, conn.rs L463-465): any bytes
+        (`require_empty_read` -> `new_unexpected_message`, conn.rs L465-468): any bytes
         the server sent past the response body are an HTTP/1 protocol violation (a
         server may not send anything before the next request). Poison the connection
-        rather than silently dropping them and reusing a corrupted stream (was G35).
+        rather than silently dropping them and reusing a corrupted stream.
         Both come from the decoder in one step (`finish`)."""
         self.trailers, leftover = self._decoder.finish()
         if self._released:

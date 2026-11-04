@@ -329,8 +329,8 @@ async def test_reset_wakes_flow_blocked_sender():
 async def test_reset_does_not_double_release_connection_window():
     """When a stream is reset, its in-flight recv data is returned to the CONNECTION
     window (`release_closed_capacity`). If the app then consumes the still-buffered
-    bytes, `release_capacity` must NOT credit the connection window a second time
-    (F22). Socket-free: a small amount stays below the WINDOW_UPDATE threshold, so the
+    bytes, `release_capacity` must NOT credit the connection window a second time.
+    Socket-free: a small amount stays below the WINDOW_UPDATE threshold, so the
     effect is visible directly on the connection recv window."""
     conn, st, data = _recv_streaming_connection()
     before = conn.conn_recv_available
@@ -379,7 +379,7 @@ def _deliver(conn, frame):
 
 @pytest.mark.tonio
 async def test_small_data_frame_flood_exhausts_budget():
-    """h2 0.4.16 #935: flow control bounds payload bytes, not frame count — a
+    """h2 counts.rs:120-138: flow control bounds payload bytes, not frame count — a
     peer fragmenting into tiny unconsumed frames must exhaust the DATA-framing
     budget and die with a connection ENHANCE_YOUR_CALM."""
     conn, st, data = _recv_streaming_connection()
@@ -413,7 +413,7 @@ async def test_consumed_small_frames_return_budget():
 async def test_empty_nonfinal_data_dropped_and_capped():
     """An empty non-final DATA frame has no effect on the HTTP message: it is
     never delivered to the app, does NOT touch the byte budget, and counts
-    against its own per-connection lifetime cap instead (h2 0.4.19 counts.rs
+    against its own per-connection lifetime cap instead (h2 counts.rs
     `num_recv_empty_data_frames` — a flood dies with ENHANCE_YOUR_CALM)."""
     conn, st, data = _recv_streaming_connection()
     _deliver(conn, data(b""))  # dropped
@@ -433,7 +433,7 @@ async def test_empty_nonfinal_data_dropped_and_capped():
 async def test_empty_data_frame_flood_dies_at_cap():
     """The empty-frame lifetime cap: MAX_RECV_EMPTY_DATA_FRAMES empties pass,
     the next one is a connection ENHANCE_YOUR_CALM — and the byte budget is
-    still untouched (h2 0.4.19 counts.rs L97-113)."""
+    still untouched (h2 counts.rs L120-128)."""
     conn, st, data = _recv_streaming_connection()
     for _ in range(_MAX_RECV_EMPTY_DATA_FRAMES):
         _deliver(conn, data(b""))
@@ -447,7 +447,7 @@ async def test_empty_data_frame_flood_dies_at_cap():
 async def test_final_data_frame_never_budgeted():
     """A final (END_STREAM) DATA frame is exempt from the framing budget — a
     stream receives at most one, so it can't create unbounded overhead (h2
-    0.4.19 streams.rs L640-649). It is delivered tagged unbudgeted so the
+    streams.rs L655-662). It is delivered tagged unbudgeted so the
     reader doesn't release a charge that was never made."""
     conn, st, data = _recv_streaming_connection()
     _deliver(conn, data(b"x", end=True))  # tiny AND final -> no charge
@@ -459,10 +459,10 @@ async def test_final_data_frame_never_budgeted():
 @pytest.mark.tonio
 async def test_reset_releases_buffered_frames_budget():
     """Resetting a stream with buffered-but-unread small frames returns their
-    charge to the connection budget (h2 0.4.19: `clear_recv_buffer` /
+    charge to the connection budget (h2 recv.rs:957-970: `clear_recv_buffer` /
     `release_closed_capacity` release each budgeted frame) — without this, a
     long-lived connection leaks budget on every abandoned body. A release
-    racing the teardown must not double-credit (the F22-style clamp)."""
+    racing the teardown must not double-credit (clamped to the outstanding charge)."""
     conn, st, data = _recv_streaming_connection()
     for _ in range(50):  # 50 unconsumed tiny frames
         _deliver(conn, data(b"x"))
@@ -479,11 +479,11 @@ async def test_reset_releases_buffered_frames_budget():
 async def test_aclose_after_eos_reclaims_window_and_budget():
     """Abandoning a FULLY-RECEIVED body with unread buffered chunks returns both
     the connection recv window and the framing-budget charge: upstream's drop
-    path guards only the Drop-reset on eos (`maybe_cancel`, streams.rs L1686) —
+    path guards only the Drop-reset on eos (`maybe_cancel`, streams.rs L1700) —
     `release_closed_capacity` + `clear_recv_buffer` run UNCONDITIONALLY once no
-    handle can read the data (streams.rs L1670-1676, recv.rs L502-522). aclose
+    handle can read the data (streams.rs L1682-1687, recv.rs L500-520). aclose
     is this driver's deterministic drop hook. A straggling reader release after
-    the reclaim credits nothing (F22)."""
+    the reclaim credits nothing."""
     conn, st, data = _recv_streaming_connection()
     for _ in range(50):  # 50 unread tiny frames...
         _deliver(conn, data(b"x"))
@@ -508,9 +508,9 @@ async def test_aclose_after_eos_reclaims_window_and_budget():
 
 @pytest.mark.tonio
 async def test_data_frame_budget_resolve():
-    """The budget resolves like h2 0.4.19 `DataFrameBudget::resolve`: a
-    configured value as-is; Auto = half the connection recv window, floored at
-    DEFAULT_DATA_FRAME_BUDGET."""
+    """h2 counts.rs:106-115 initializes the budget, then
+    `set_target_connection_window_size` resolves Auto from the target window:
+    half the window, floored at DEFAULT_DATA_FRAME_BUDGET; configured stays as-is."""
     conn = Connection(None)  # client Auto: _CONN_WINDOW (5 MB) / 2
     assert conn.data_frame_budget_available == 5 * 1024 * 1024 // 2
     conn = Connection(None, data_frame_budget=123)  # configured wins, unscaled

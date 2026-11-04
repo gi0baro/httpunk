@@ -1,7 +1,6 @@
-"""The h2 write batch crosses to the transport without a copy (BOUNDARY_NOTES.md
-§2.4 V2): `take_pending` hands out the pending buffer itself, read-only, through a
-memoryview; releasing it returns the buffer to the state. Driven at the state
-level, no I/O, no backend."""
+"""The h2 write batch crosses to the transport without a copy: `take_pending`
+hands out the pending buffer itself, read-only, through a memoryview; releasing it
+returns the buffer to the state. Driven at the state level, no I/O, no backend."""
 
 import pytest
 

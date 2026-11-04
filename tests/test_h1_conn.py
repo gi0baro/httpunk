@@ -309,10 +309,11 @@ def test_one_codec_per_connection_reset_at_each_claim():
 
 
 @pytest.mark.tonio
-async def test_http10_downgrade_reasserts_keep_alive_by_value_replacing_token():
+async def test_http10_downgrade_reasserts_keep_alive_by_value_appending_token():
     """After a peer answers HTTP/1.0, the client downgrades later requests to 1.0 and
-    re-asserts keep-alive by VALUE (not mere header presence), REPLACING a non-keep-alive
-    Connection token rather than leaving the 1.0 request to close — hyper fix_keep_alive (F58)."""
+    re-asserts keep-alive by VALUE (not mere header presence), APPENDING it to a
+    non-keep-alive Connection token that stays on the wire — hyper conn.rs
+    `fix_keep_alive` (L672-697, #4196)."""
     listener, host, port = await _listener()
     requests, done = [], Event()
     r1 = b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 2\r\n\r\nok"
@@ -323,14 +324,18 @@ async def test_http10_downgrade_reasserts_keep_alive_by_value_replacing_token():
         async with open_h1(host, port) as conn:
             assert await (await conn.request("GET", "/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
             # r2 carries a custom Connection token; the downgrade must still re-assert
-            # keep-alive (the old presence-check left it, so the server would close).
+            # keep-alive (a presence-check would leave it, so the server would close).
             assert await (await conn.request("GET", "/b", headers={"connection": "x-foo"})).read() == b"bye"
         await done.wait()
         s.cancel()
 
-    r2_head = requests[1][0].lower()
-    assert b"connection: keep-alive" in r2_head  # re-asserted by value
-    assert b"x-foo" not in r2_head  # the custom token was replaced, not left / duplicated
+    r2_lines = requests[1][0].lower().split(b"\r\n")
+    assert r2_lines[0] == b"get /b http/1.0"
+    # the caller's token kept, keep-alive appended as a second line
+    assert [line for line in r2_lines if line.startswith(b"connection:")] == [
+        b"connection: x-foo",
+        b"connection: keep-alive",
+    ]
 
 
 @pytest.mark.tonio
@@ -415,7 +420,7 @@ async def test_early_response_during_upload():
 async def test_early_response_does_not_truncate_upload():
     """A keep-alive server answers before reading the body but keeps draining it: the
     client must finish writing the request body — hyper's poll_loop does NOT truncate
-    the upload at head-arrival (dispatch.rs L172-211), it keeps writing (F11). The
+    the upload at head-arrival (dispatch.rs L172-211), it keeps writing. The
     response body is withheld until the whole request has been drained, so the client
     cannot release the slot (and cancel the writer) until the upload has completed;
     the old behavior cancelled the writer at head-arrival, so the server's drain would
@@ -611,7 +616,7 @@ async def test_http10_keepalive_peer_downgrades_next_request():
     """After a peer answers in HTTP/1.0 (opting into keep-alive), the client
     downgrades subsequent requests on the reused connection to HTTP/1.0 and
     re-asserts Connection: keep-alive — hyper's enforce_version / fix_keep_alive
-    (conn.rs L662-702). The first request (peer unknown) stays HTTP/1.1 (G33)."""
+    (conn.rs L672-709). The first request (peer unknown) stays HTTP/1.1."""
     listener, host, port = await _listener()
     requests, done = [], Event()
     r10 = b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok"
@@ -635,8 +640,8 @@ async def test_http10_keepalive_peer_downgrades_next_request():
 async def test_unexpected_bytes_past_body_poison_connection():
     """A server that sends bytes past the response body violates HTTP/1 (it may
     not speak before the next request). The client must fail the connection —
-    hyper `require_empty_read` -> `new_unexpected_message` (conn.rs L463-465) —
-    rather than silently drop the extra bytes and reuse a corrupted stream (G35).
+    hyper `require_empty_read` -> `new_unexpected_message` (conn.rs L465-468) —
+    rather than silently drop the extra bytes and reuse a corrupted stream.
     The response itself is still delivered intact."""
     listener, host, port = await _listener()
     done = Event()
@@ -671,7 +676,7 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
     consumes them as they arrive; bytes it hasn't been scheduled to see yet are caught
     by the pre-write `receive_nowait` check, which (like hyper's single poll loop)
     runs ahead of the write EVEN under scheduler starvation — already-delivered bytes
-    are never misparsed as the next request's response (F31, problem b)."""
+    are never misparsed as the next request's response."""
     listener, host, port = await _listener()
     r1_read, junk_sent = Event(), Event()
 
@@ -713,10 +718,10 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
 async def test_idle_fin_closes_connection_promptly():
     """A peer FIN on a PARKED keep-alive connection is observed by the idle watcher
     with NO send: `closed` flips promptly, no error is recorded (hyper's clean idle
-    close — "found EOF on idle connection, closing", conn.rs L471-481), the transport
+    close — "found EOF on idle connection, closing", conn.rs L472-484), the transport
     is really closed (no CLOSE_WAIT parking — the task drops its io, dispatch.rs
     L152-160), and the next send_request raises `ConnectionClosedError` carrying
-    `request_unsent` (hyper's TrySendError give-back, client/conn/http1.rs L247-263)."""
+    `request_unsent` (hyper's TrySendError give-back, client/conn/http1.rs L261-281)."""
     listener, host, port = await _listener()
     r1_read = Event()
 
@@ -749,9 +754,9 @@ async def test_idle_fin_closes_connection_promptly():
 async def test_idle_stray_bytes_poison_promptly():
     """Bytes arriving on a PARKED connection are consumed by the idle watcher when
     they ARRIVE (no send needed): the connection is poisoned AND closed immediately
-    (hyper `new_unexpected_message`, conn.rs L484-489 — the errored task drops its
+    (hyper `new_unexpected_message`, conn.rs L486-490 — the errored task drops its
     io), and the next send_request raises the recorded error with `request_unsent`
-    set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L711-733)."""
+    set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L723-739)."""
     listener, host, port = await _listener()
     r1_read = Event()
 
@@ -806,7 +811,7 @@ async def test_unsent_marker_absent_once_write_begins():
 async def test_body_iterable_error_fails_promptly():
     """A request body iterable that raises mid-upload fails send_request PROMPTLY with
     that error, instead of the error being swallowed / hanging on the response head
-    until the server times out (F12)."""
+    until the server times out."""
     listener, host, port = await _listener()
 
     class _BoomError(Exception):
@@ -837,8 +842,8 @@ async def test_body_iterable_error_fails_promptly():
 
 @pytest.mark.tonio
 async def test_server_close_before_response_head_is_incomplete_message():
-    """EOF while the response head is expected: hyper `read_head` maps `Parse::Eof` on a
-    mid-message read to `IncompleteMessage` (conn.rs L245-252) — a sibling of the io
+    """EOF while the response head is expected: hyper reports `IncompleteMessage` from
+    parsing (io.rs L224-227, conn.rs L339-367) — a sibling of the io
     error kind, so `H1IncompleteMessageError`, not `ConnectionClosedError`."""
     listener, host, port = await _listener()
 
@@ -882,7 +887,7 @@ async def test_response_body_truncated_by_server_close_is_body_error():
 @pytest.mark.tonio
 async def test_request_body_short_of_content_length_is_user_error():
     """A streamed request body that ends short of its explicit `content-length`: the
-    encoder's `NotEof` -> `User::BodyWriteAborted`. The writer fails promptly (F12) and
+    encoder's `NotEof` -> `User::BodyWriteAborted`. The writer fails promptly and
     `request()` raises the `H1UserError`; the connection is poisoned."""
     listener, host, port = await _listener()
     done = Event()
@@ -919,7 +924,7 @@ async def test_request_body_short_of_content_length_is_user_error():
 )
 async def test_request_connection_close_is_never_reused(connection_headers):
     """A request carrying `Connection: close` is not reused even when the server ignores it
-    and answers keep-alive: hyper 1.11.1 `encode_head` -> `connection_any_close` ->
+    and answers keep-alive: hyper 1.12.0 `encode_head` -> `connection_any_close` ->
     `disable_keep_alive` up front (previously reuse was derived from the response alone).
     The connection closes once the response is consumed."""
     listener, host, port = await _listener()

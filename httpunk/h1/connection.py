@@ -11,7 +11,7 @@ like h2). Only the transport-ownership + body-framing/send + teardown leaves are
 genuinely shared, and they live here. All byte work is the Rust sans-IO core
 (`H1Codec` head parse/encode + body encode, `H1BodyDecoder` body decode).
 
-Cross-reference: hyperium/hyper 1.11.1 `src/proto/h1/{conn,dispatch,role}.rs`.
+Cross-reference: hyperium/hyper 1.12.0 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
 from .._common import aiter_body
@@ -30,7 +30,7 @@ _READ_SIZE = 65536
 # lives: hyper's Flatten has none, and `max_buf_size` is hyper's own bound on how
 # much it buffers before flushing — past it the memcpy is worth about the syscall
 # it saves and a huge body would be doubled in memory, so the head goes first and
-# the body follows as its own write. Measured (BENCH_FINDINGS §3): the one-write
+# the body follows as its own write. Measured: the one-write
 # path wins at every size up to 100 KB. Streamed bodies are never coalesced: the
 # head must never wait on the app's generator (hyper polls the body after the head).
 
@@ -51,7 +51,7 @@ class H1Framing:
     def _body_plan(body, max_buf_size):
         """The body's shape, classified ONCE for the whole write path — `(content_length,
         chunked, kind, coalesce)`. The framing inputs are hyper's `set_length`: None /
-        empty bytes -> no body (role.rs L1311-1316), non-empty bytes -> Content-Length,
+        empty bytes -> no body (role.rs L1343-1349), non-empty bytes -> Content-Length,
         an iterable -> chunked; the request and response rules are the same, so this is
         shared. `kind` is the write path (`BODY_*`: an async iterable must be pumped in
         its own task, a sync one is written inline) and `coalesce` the head+body write
@@ -76,7 +76,7 @@ class H1Framing:
         a streamed body, or an immediate one past the cap — the head goes first. The
         head's write goes to `transport`, the one the caller's head step took from the
         state (`None` = closed by then: the failure a write into it would raise); the
-        body's chunks go through `write`, each fetching the transport anew (F59)."""
+        body's chunks go through `write`, each fetching the transport anew."""
         if transport is None:
             raise ConnectionClosedError("connection closed")
         if coalesce:
@@ -91,11 +91,11 @@ class H1Framing:
         # `codec.body_is_eof()` for a HEAD/204/304 response, or a `body is None`
         # length/close framing — writes no body: hyper never polls the body when the
         # encoder is eof (conn.rs write_head), so the iterable is skipped and its side
-        # effects don't fire (G37). `trailers` (a HeaderMap, chunked bodies only)
-        # terminate the body with a trailer block instead of a bare `0\r\n\r\n` (F45);
+        # effects don't fire. `trailers` (a HeaderMap, chunked bodies only)
+        # terminate the body with a trailer block instead of a bare `0\r\n\r\n`;
         # a request with trailers is always chunked, so it is never `body_is_eof`.
         # All writes go through `write`, which raises a clean ConnectionClosedError once the
-        # state gave the transport away (F59) — a body pump orphaned by an abandoned
+        # state gave the transport away — a body pump orphaned by an abandoned
         # exchange wakes into that, not into an AttributeError on `None.send_all`.
         # `serialize_end` is always CALLED (it is what raises on a body short of its
         # Content-Length) but only WRITTEN when it has bytes: the chunked terminator.

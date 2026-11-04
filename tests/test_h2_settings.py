@@ -72,7 +72,7 @@ def test_adjust_send_windows_skips_send_closed_streams():
     """A SETTINGS_INITIAL_WINDOW_SIZE change adjusts open streams' send windows but
     SKIPS send-closed ones — matching h2 (its decrease branch guards
     is_send_closed()), which avoids pointlessly adjusting a window we'll never use and a
-    needless inc_window overflow teardown on the increase side (F41)."""
+    needless inc_window overflow teardown on the increase side."""
     conn = _client()
     closed, streaming = Stream(conn.backend), Stream(conn.backend)
     assert conn.try_claim_slot() and conn.try_claim_slot()
@@ -104,7 +104,7 @@ def test_constructor_validates_ranges():
 
 
 def test_goaway_debug_data_is_the_frames_own_object():
-    # BOUNDARY_NOTES U5: the peer's GOAWAY debug data is stored as the frame's `bytes`
+    # The peer's GOAWAY debug data is stored as the frame's `bytes`
     # and handed back as-is by `goaway_info` — no Rust copy in between.
     conn = _client()
     conn.recv_settings(_settings_frame())  # the peer's SETTINGS come first

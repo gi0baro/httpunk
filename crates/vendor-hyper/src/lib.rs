@@ -1,19 +1,22 @@
-//! Vendored from hyperium/hyper 1.11.1 (MIT licensed — see `THIRD-PARTY.md`).
+//! Vendored from hyperium/hyper (MIT licensed — see `crates/vendor-hyper/LICENSE`).
+//! Pinned version: `crates/vendor-hyper/UPSTREAM_VERSION`.
 //!
 //! Only hyper's **synchronous, sans-IO** HTTP/1 pieces are vendored: `proto::h1`
-//! head parse/encode (`role`) and the body `Encoder` (`encode`), plus the tiny
-//! support types they depend on (`headers`, `ext`, `error`, `body::length`,
-//! `proto::MessageHead`). hyper's async `conn`, `decode`, `io`, `dispatch`,
-//! `client`, `server` and `upgrade` are intentionally *not* vendored — that
-//! orchestration is rewritten in Python.
+//! head parse/encode (`role`), the body `Encoder` (`encode`) and `Decoder`
+//! (`decode`), the cached `Date` header (`common::date`), plus the tiny support
+//! types they depend on (`headers`, `ext`, `error`, `body::length`,
+//! `proto::MessageHead`). hyper's async `conn`, `io`, `dispatch`, `client`,
+//! `server` and `upgrade` are intentionally *not* vendored — that orchestration
+//! is rewritten in Python (`proto::h1::io` here is hand-written glue).
 //!
 //! The `.rs` files under here are kept **byte-identical to upstream** so a
 //! `git diff` between two vendored versions shows only genuine upstream changes.
 //! Because this is a separate crate, hyper's own crate-root paths (`crate::proto`,
 //! `crate::error`, `crate::Method`, …) resolve here natively — the re-exports
 //! below reproduce the names hyper's `lib.rs` re-exports at its crate root, and
-//! the `pub mod`s mirror hyper's `src/` layout. Deviations from upstream are
-//! enumerated in `THIRD-PARTY.md`. The httpunk-authored bridge/facade
+//! the `pub mod`s mirror hyper's `src/` layout. `scripts/vendor-hyper.sh` enumerates
+//! the visibility widening and encode/decode/date shims; module glue is maintained
+//! by hand. The httpunk-authored bridge/facade
 //! (`proto::h1::httpunk`) is re-exported publicly at the bottom for the main crate.
 
 #![allow(dead_code)]
@@ -59,6 +62,6 @@ pub use crate::proto::h1::httpunk::{
     connection_any_close, date_header_value, encode_request, encode_response, error_kind,
     error_parse_kind, error_user_kind, has_h2_prefix, parse_request, parse_response,
     server_parse_failure, too_large_error, BodyDecode, BodyDecoder, BodyEncoder, BodyTail,
-    FramedChunk, ParsedHead, ParsedRequest, CHUNKED_TERMINATOR, CONTINUE_RESPONSE,
+    FramedChunk, ParsedHead, ParsedRequest, ParserConfig, CHUNKED_TERMINATOR, CONTINUE_RESPONSE,
     DEFAULT_MAX_BUFFER_SIZE, H2_PREFACE, MINIMUM_MAX_BUFFER_SIZE,
 };

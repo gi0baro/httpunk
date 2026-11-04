@@ -66,7 +66,13 @@ class BaseClientConnection:
     low-level, and a single arbitrary shortcut would be inconsistent)."""
 
     async def __aenter__(self) -> Self:
-        await self._conn.connect()
+        try:
+            await self._conn.connect()
+        except BaseException:
+            # hyper client/conn/http1.rs:586, http2.rs:579: the handshake owns
+            # the IO; failing or dropping it drops the IO without poll_shutdown.
+            self._conn.abort()
+            raise
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, exc_tb: object) -> bool:
@@ -91,7 +97,12 @@ class BaseServer(Generic[_RequestT]):
     `self._conn` (which exposes `start`/`close`/`next_request`)."""
 
     async def __aenter__(self) -> Self:
-        await self._conn.start()
+        try:
+            await self._conn.start()
+        except BaseException:
+            # h2 server.rs:1500-1519: the handshake owns the flushing codec/IO.
+            self._conn.abort()
+            raise
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, exc_tb: object) -> bool:
@@ -119,5 +130,5 @@ class BaseServer(Generic[_RequestT]):
         on an idle connection) — the orderly transport shutdown is awaited here, since
         it is what ends the parked idle read. In-flight work finishes as the caller
         keeps driving the accept loop, which then ends and closes.
-        `httpunk.util.GracefulShutdown` coordinates this over many connections (§11.3)."""
+        `httpunk.util.GracefulShutdown` coordinates this over many connections."""
         return self._conn.graceful_shutdown()

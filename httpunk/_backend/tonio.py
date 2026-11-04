@@ -318,8 +318,10 @@ class TonioBackend:
     # (`ConnectionError`: ConnectionResetError/BrokenPipeError), or a TLS close
     # without close_notify (tonio wraps the SSLEOFError in `ResourceBroken`) —
     # which httpunk's own abortive `close_transport` produces, so an httpunk
-    # peer that drops a connection makes the other side see one. The h1 server
-    # maps these at the request-head boundary to a clean end-of-iteration (F47).
+    # peer that drops a connection makes the other side see one.
+    # DIVERGENCE: the h1 server maps these at the request-head boundary to a clean
+    # end-of-iteration, even mid-head; hyper raises IncompleteMessage on mid-head EOF.
+    # This preserves httpunk's public clean-close iteration contract.
     broken_transport_errors = (ConnectionError, ResourceBroken)
 
     # Spawn task(s) NOW, discarding their results; returns the join handle.

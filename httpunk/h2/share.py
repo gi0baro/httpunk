@@ -6,7 +6,7 @@ releases its recv-window capacity through the connection state (which turns it
 into WINDOW_UPDATEs). Closing an unfinished body sends RST_STREAM(CANCEL) so the
 peer stops sending (h2: `RecvStream` + `SendStream::send_reset`).
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.19.
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20.
 """
 
 
@@ -38,6 +38,6 @@ class H2ResponseBody:
         unfinished body resets the stream so the peer stops sending. A fully-received
         body needs no RST (h2 guards its Drop-reset on `!eos`) but still returns every
         buffered-but-unread byte's connection window (`release_closed_capacity`,
-        streams.rs L1670-1676): aclose is this driver's deterministic drop hook. One
+        streams.rs L1682-1687): aclose is this driver's deterministic drop hook. One
         locked step in Rust (`aclose_body`), idempotent."""
         self._conn._aclose_body(self._stream)

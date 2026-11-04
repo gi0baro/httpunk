@@ -82,7 +82,7 @@ async def test_shutdown_with_no_connections_returns_immediately():
 @pytest.mark.tonio
 async def test_watch_registers_count_synchronously():
     """watch() bumps the count when CALLED — before the driving coroutine is scheduled —
-    so count()/shutdown() can't race a not-yet-run watch (hyper-util watcher(), F53).
+    so count()/shutdown() can't race a not-yet-run watch (hyper-util watcher()).
     With the old async-registration the count stayed 0 until the coroutine ran."""
     graceful = GracefulShutdown()
     release = Event()
@@ -148,7 +148,7 @@ async def test_h2_frame_above_goaway_ignored_not_errored():
     """A NON-headers frame (DATA/etc.) on a client stream above the last-stream-id of
     our GOAWAY is silently IGNORED (dropped with conn-window accounting, h2
     `ignore_data`), never an RST(STREAM_CLOSED) or a connection PROTOCOL_ERROR that
-    would abort the graceful drain (F42)."""
+    would abort the graceful drain."""
     conn = H2ServerConnection(_IdleTransport(), max_concurrent_streams=100)
     conn.set_max_stream_id(1)  # as phase-2 graceful lowers it
     # Stream 3 (> 1) was refused by our GOAWAY: a late frame on it is ignored, not raised.
@@ -158,7 +158,7 @@ async def test_h2_frame_above_goaway_ignored_not_errored():
 
 @pytest.mark.tonio
 async def test_h2_graceful_shutdown_emits_two_phase_goaways():
-    """The graceful primitive emits the two-phase frames (F7), decoded straight off the
+    """The graceful primitive emits the two-phase frames, decoded straight off the
     bytes the connection wrote: PHASE 1 = GOAWAY(2^31-1, NO_ERROR) + a (non-ack) shutdown
     PING; PHASE 2 (on the ping's ack) = GOAWAY(the real last-processed id)."""
     t = _CapturingTransport()
@@ -354,7 +354,7 @@ async def test_h1_graceful_releases_idle_connection_and_closes():
         await conn.__aexit__(None, None, None)
 
 
-# ----- two-party transitions (HTTPUNK_RUST_STATE_DESIGN.md §3.4) -----
+# ----- two-party transitions -----
 
 
 @pytest.mark.tonio
@@ -362,7 +362,7 @@ async def test_shutdown_signal_and_liveness_sample_are_one_step():
     """`shutdown()` signals and samples "anyone live?" under the lock: a watch
     registered before the call is always waited for, and one whose serve ends before
     the signal was ever observed drops the count exactly once (the release latch),
-    so `shutdown()` returns instead of hanging on a negative count (U3, U5)."""
+    so `shutdown()` returns instead of hanging on a negative count."""
     graceful = GracefulShutdown()
     release = Event()
 

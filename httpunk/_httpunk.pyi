@@ -154,14 +154,27 @@ class H1Codec:
         self,
         *,
         max_headers: int | None = ...,
+        max_header_size: int | None = ...,
         ignore_invalid_headers: bool = ...,
+        allow_multiple_spaces_in_request_line_delimiters: bool = ...,
+        allow_spaces_after_header_name_in_responses: bool = ...,
+        allow_obsolete_multiline_headers_in_responses: bool = ...,
+        ignore_invalid_headers_in_responses: bool = ...,
         title_case_headers: bool = ...,
         date_header: bool = ...,
         max_buf_size: int = ...,
     ) -> None:
-        """Options (hyper `server::conn::http1::Builder`): `max_headers` (None = hyper's
-        100), `ignore_invalid_headers`, `title_case_headers`, `date_header`
-        (`auto_date_header`) — server role only; `max_buf_size` (hyper io.rs: the read
+        """Options (hyper client/conn/http1.rs:388-560, server/conn/http1.rs:243-430):
+        `max_headers` (None = 100; both roles' head/trailer count, conn.rs:318-330),
+        `title_case_headers` (both roles' outgoing headers), `ignore_invalid_headers`
+        and `allow_multiple_spaces_in_request_line_delimiters` (requests only),
+        `allow_spaces_after_header_name_in_responses`,
+        `allow_obsolete_multiline_headers_in_responses`, `ignore_invalid_headers_in_responses`
+        (responses only; all parser relaxations default to False), `date_header`
+        (server `auto_date_header`); `max_header_size` (head bytes
+        including the start/status line, also chunked trailer bytes; None leaves the head
+        bounded by `max_buf_size` and trailers at 16 KB; hyper server/conn/http1.rs:346-358,
+        client/conn/http1.rs:506-518); `max_buf_size` (hyper io.rs: the read
         buffer cap a still-incomplete head may reach before `Parse::TooLarge`, default
         8192 + 4096 * 100, minimum 8192 — raises `ValueError` below it) — both roles.
         One codec per connection: see `reset`."""
@@ -176,7 +189,7 @@ class H1Codec:
 
     @staticmethod
     def continue_response() -> bytes:
-        """`HTTP/1.1 100 Continue\r\n\r\n` — hyper conn.rs L409."""
+        """`HTTP/1.1 100 Continue\r\n\r\n` — hyper conn.rs L415."""
 
     def serialize_request(
         self,
@@ -269,6 +282,14 @@ class H1Codec:
         and just closes (an HTTP/2 preface: `Parse::VersionH2`)."""
 
     @property
+    def max_headers(self) -> int | None:
+        """Configured header count limit, also used for trailers (hyper conn.rs:318-330)."""
+
+    @property
+    def max_header_size(self) -> int | None:
+        """Configured head/trailer byte limit (hyper conn.rs:318-330)."""
+
+    @property
     def max_buf_size(self) -> int:
         """hyper's `max_buf_size`: the incomplete-head cap, and the driver's coalescing
         cap for an immediate body written together with the head."""
@@ -317,9 +338,18 @@ class H1BodyDecoder:
     """A synchronous HTTP/1 body decoder (content-length / chunked / close-
     delimited) over the vendored hyper `Decoder`."""
 
-    def __init__(self, kind: str, length: int = ...) -> None:
+    def __init__(
+        self,
+        kind: str,
+        length: int = ...,
+        *,
+        max_headers: int | None = ...,
+        max_header_size: int | None = ...,
+    ) -> None:
         """`kind`: "empty" | "length" | "chunked" | "close"; `length` is the
-        Content-Length when `kind == "length"`."""
+        Content-Length when `kind == "length"`. Trailer limits are the connection's
+        `max_headers` and `max_header_size` (hyper conn.rs:318-330); None defaults to
+        100 fields / 16 KB (decode.rs:180-181)."""
 
     def feed(self, data: bytes) -> None:
         """Append received body bytes."""
@@ -358,9 +388,10 @@ class H2FrameHeaders:
     path: str | None
     status: int | None
     headers: HeaderMap
-    content_length: int | None  # the first `content-length`, via h2 `frame::parse_u64`; None if absent/unparsable
-    content_length_invalid: bool  # a `content-length` was present but did not parse (h2: stream PROTOCOL_ERROR)
+    content_length: int | None  # first parsed value; None if absent or first unparsable (h2 recv.rs:178-200)
+    content_length_invalid: bool  # any unparsable or conflicting value (h2 recv.rs:178-200: stream PROTOCOL_ERROR)
     is_informational: bool  # a 1xx response head (h2 `Headers::is_informational`)
+    is_over_size: bool  # decoded header list reached the limit (h2 recv.rs:221-238)
     def __repr__(self) -> str: ...
 
 class H2FrameData:
@@ -482,7 +513,7 @@ class H2Codec:
         end_stream: bool = ...,
         auto_date: bool = ...,
     ) -> bytes:
-        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L484)."""
+        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L477-481)."""
 
     def feed_preface(self, data: bytes) -> bool | None:
         """Server side: feed bytes of the client connection preface. None = matches so
@@ -627,8 +658,9 @@ class H2ContentLength:
         """False = a declared length still unsatisfied at END_STREAM."""
 
 class H2DataFrameBudget:
-    """h2 0.4.19 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`)
-    over `DataFrameBudget::resolve`."""
+    """h2 0.4.20 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`,
+    counts.rs:120-147). `Budget` tracks spent overhead (counts.rs:4-36); Auto is resolved
+    via `set_target_connection_window_size` (counts.rs:112-116)."""
 
     def __init__(self, configured: int | None = ..., connection_window: int | None = ...) -> None: ...
     def record(self, payload_len: int) -> int:
@@ -696,6 +728,10 @@ class H1ServerState:
     def half_close(self) -> bool: ...
     @property
     def keep_alive_enabled(self) -> bool: ...
+    @property
+    def peer_http10(self) -> bool:
+        """Last parsed request's version, retained between requests (conn.rs L301, L1132-1161)."""
+
     @property
     def shutdown_requested(self) -> bool: ...
     @property
@@ -958,7 +994,7 @@ class H2Streams:
         *,
         initial_window_size: int,
         connection_window: int,
-        max_frame_size: int,
+        max_frame_size: int | None,
         max_header_list_size: int,
         max_send_buf_size: int,
         max_concurrent_streams: int | None = ...,
@@ -967,8 +1003,13 @@ class H2Streams:
         data_frame_budget: int | None = ...,
         auto_date_header: bool = ...,
         enable_push: bool | None = ...,
+        header_table_size: int | None = ...,
+        max_concurrent_reset_streams: int | None = ...,
+        reset_stream_duration: float | None = ...,
     ) -> None:
-        """`role`: "client" | "server". Validates the RFC ranges at construction."""
+        """`role`: "client" | "server". Validates the RFC ranges at construction.
+        `header_table_size`: None = not advertised; applied on SETTINGS ACK.
+        Reset retention defaults to 50 streams / 1 second; duration is in seconds."""
 
     @property
     def is_server(self) -> bool: ...
@@ -1007,7 +1048,7 @@ class H2Streams:
         """`(aborted, flags)`: the streams above last_stream_id, with their stop."""
 
     def maybe_goaway_reply(self) -> int: ...
-    def send_goaway(self, reason: int) -> int: ...
+    def send_goaway(self, reason: int, debug_data: bytes | None = None) -> int: ...
     def fail(self, exc: BaseException | None = ..., message: str = ...) -> list[tuple[object, H2Stopped]]:
         """Record the error (first writer wins; `exc` is a traceback-free copy) and fan
         it out; returns the `(handle, stop)` pairs to notify."""

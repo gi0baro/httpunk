@@ -38,7 +38,7 @@ class _AsyncioStream(asyncio.Protocol):
         self._transport = None
         # Received `bytes` objects as they came from the socket, in order, plus the
         # unread offset into the first one. A reader that asks for at least a whole
-        # object gets THAT object, no copy (BOUNDARY_NOTES S2); only a read smaller than
+        # object gets THAT object, no copy; only a read smaller than
         # the object at the head copies out its slice. `_buffered` is the unread total
         # (the backpressure watermark).
         self._chunks = _collections.deque()
@@ -73,7 +73,7 @@ class _AsyncioStream(asyncio.Protocol):
         self._eof = True
         self._wake_reader()
         # Keep the write half open — HTTP half-close: the peer closed its write side
-        # (our read sees EOF) but we still send the response. NOTE (F33b): asyncio
+        # (our read sees EOF) but we still send the response. DIVERGENCE: asyncio
         # honours this over plain TCP, but its SSL layer force-closes the transport on
         # an unexpected EOF (no close_notify) regardless of this return — so a TLS
         # half-close won't keep writing here the way tonio's does. That's an asyncio
@@ -88,7 +88,7 @@ class _AsyncioStream(asyncio.Protocol):
         # everything the frames reference until a gen-2 GC (exceptions.fresh_exc).
         self._error = exc.with_traceback(None) if exc is not None else None
         self._eof = True
-        self._conn_lost = True  # writes to a dead socket must now raise (F32)
+        self._conn_lost = True  # writes to a dead socket must now raise
         self._wake_reader()
         self._writing_paused = False
         if self._drain_waiter is not None and not self._drain_waiter.done():
@@ -123,7 +123,7 @@ class _AsyncioStream(asyncio.Protocol):
             # Single-reader contract: a second concurrent receive_some would overwrite
             # the first's waiter, and the first caller would then park forever. The
             # drivers read one-at-a-time, so this is a bug — fail loudly rather than
-            # hang silently (F55).
+            # hang silently.
             raise RuntimeError("concurrent receive_some on one stream (single-reader contract)")
         self._read_waiter = self._loop.create_future()
         try:
@@ -172,7 +172,7 @@ class _AsyncioStream(asyncio.Protocol):
             waiter.set_result(True)
 
     async def send_all(self, data):
-        # A write to a dead socket must fail (F32): asyncio's transport silently
+        # A write to a dead socket must fail: asyncio's transport silently
         # DISCARDS writes after connection_lost, but tonio (like a raw socket) raises
         # EPIPE/ECONNRESET — drivers detect a dead peer via that failure. Surface the
         # real error, or EPIPE if the close carried none (a clean peer FIN).
@@ -382,11 +382,11 @@ class AsyncioBackend:
         Handshake failure: sslproto force-closes the socket itself and the error
         (`ssl.SSLError`/`CertificateError`, or `ConnectionResetError` on an EOF mid-
         handshake) comes out of `start_tls` — nothing for the caller to clean up. A
-        stream whose socket is already gone fails up front the way `send_all` does
-        (F32): `start_tls` on a dead transport would otherwise sit in the handshake
+        stream whose socket is already gone fails up front the way `send_all` does:
+        `start_tls` on a dead transport would otherwise sit in the handshake
         until its timeout, the ClientHello silently discarded.
 
-        Runtime limitation (like F33b): `start_tls` has no seam between the protocol
+        DIVERGENCE: `start_tls` has no seam between the protocol
         swap and the ClientHello, so bytes the peer sent BEFORE the handshake — `prefix`
         (the tunnel's `read_buf`), or bytes asyncio's eager drain already buffered on
         `stream` — cannot be fed to the SSL layer the way the tonio twin (hyper's
@@ -541,8 +541,10 @@ class AsyncioBackend:
     # Abrupt-peer-teardown exceptions (see the tonio backend's twin attribute):
     # an RST surfaces as `ConnectionError` from `connection_lost`; a TLS close
     # without close_notify as `ssl.SSLEOFError` (asyncio's SSL layer raises it
-    # on an unexpected EOF). The h1 server maps these at the request-head
-    # boundary to a clean end-of-iteration (F47).
+    # on an unexpected EOF).
+    # DIVERGENCE: the h1 server maps these at the request-head boundary to a clean
+    # end-of-iteration, even mid-head; hyper raises IncompleteMessage on mid-head EOF.
+    # This preserves httpunk's public clean-close iteration contract.
     broken_transport_errors = (ConnectionError, _ssl.SSLEOFError)
 
     # asyncio's Lock/Event/Semaphore already match the seam's neutral contract

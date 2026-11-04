@@ -29,8 +29,8 @@ Body = bytes | Iterable[bytes] | AsyncIterator[bytes] | None
 class Version(enum.Enum):
     """The HTTP version a message was received in (≈ `http::Version`, same member
     names). Every message carries one: h2 stamps `HTTP_2` on requests and responses
-    (h2 server.rs L1676 / client.rs L1722), the h1 parser sets `HTTP_10` / `HTTP_11`
-    (hyper role.rs L191-195)."""
+    (h2 server.rs L1674 / client.rs L1726), the h1 parser sets `HTTP_10` / `HTTP_11`
+    (hyper role.rs L196-204)."""
 
     HTTP_10 = "HTTP/1.0"
     HTTP_11 = "HTTP/1.1"

@@ -57,7 +57,7 @@ async def test_ready_returns_when_unlimited_and_raises_after_goaway():
 async def test_ready_prefers_goaway_over_eof_error():
     """After a graceful GOAWAY the peer closes, so both the GOAWAY and the EOF error
     (ConnectionClosedError) end up recorded. `ready()` must surface the retry-relevant
-    GoAwayError, not the EOF error (F20)."""
+    GoAwayError, not the EOF error."""
     conn = Connection(None)
     conn._dispatch(_goaway_frame(), None)
     conn._fail(ConnectionClosedError("connection closed by peer"))  # EOF after the GOAWAY
@@ -68,7 +68,7 @@ async def test_ready_prefers_goaway_over_eof_error():
 @pytest.mark.tonio
 async def test_acquire_slot_fails_promptly_on_goaway():
     """A request parked at MAX_CONCURRENT_STREAMS when a GOAWAY arrives fails at once
-    (GoAwayError), not after waiting for a surviving stream to free a slot (F20)."""
+    (GoAwayError), not after waiting for a surviving stream to free a slot."""
     conn = Connection(None)
     conn.apply_stream_limit(1)
     await conn._acquire_slot()  # occupy the only slot

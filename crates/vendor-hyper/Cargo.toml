@@ -1,5 +1,6 @@
 # Vendored hyper h1 sans-IO code (role head parse/encode + body Encoder) plus the
-# httpunk bridge facade — see ../../THIRD-PARTY.md. Workspace member crate: owns
+# httpunk bridge facade; scripts/vendor-hyper.sh enumerates every modification
+# to upstream. Workspace member crate: owns
 # its crate root (upstream `crate::` paths, no rewrite) and is fmt/clippy-excluded
 # from the main crate via `cargo fmt -p`.
 [package]

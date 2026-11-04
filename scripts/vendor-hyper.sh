@@ -2,16 +2,16 @@
 #
 # (Re)vendor hyperium/hyper's synchronous, sans-IO HTTP/1 modules into
 # crates/vendor-hyper/src/. Run this to bump the vendored version or verify it
-# hasn't drifted. See THIRD-PARTY.md.
+# hasn't drifted. The steps below enumerate every modification.
 #
 # Usage:
 #   scripts/vendor-hyper.sh                    # vendor the pinned version
-#   HYPER_VERSION=1.11.0 scripts/vendor-hyper.sh
+#   HYPER_VERSION=1.12.0 scripts/vendor-hyper.sh
 #
 # Like vendor-h2.sh, the copy is kept byte-identical to upstream so `git diff`
 # between two vendored versions shows only genuine upstream changes. The only
-# modifications are the uniform pub(crate)->pub widening and two documented
-# client-only shims (encode.rs / decode.rs; see below and THIRD-PARTY.md).
+# modifications are the uniform pub(crate)->pub widening and the documented
+# encode.rs / decode.rs / common/date.rs shims (see below).
 #
 # Built with the `client` + `server` + `http1` features (both roles, HTTP/1).
 #
@@ -23,7 +23,7 @@
 #     structural shims: drop the unvendored conn/dispatch/h2/upgrade wiring)
 set -euo pipefail
 
-HYPER_VERSION="${HYPER_VERSION:-1.11.1}"
+HYPER_VERSION="${HYPER_VERSION:-1.12.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/crates/vendor-hyper/src"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"

@@ -44,8 +44,9 @@ create_exception!(
      message: str); `kind` is the hyper `Parse` variant: `method`, `version`, \
      `version_h2` (an HTTP/2 preface on an HTTP/1 connection), `uri`, `uri_too_long`, \
      `header_token`, `header_content_length_invalid`, `header_transfer_encoding_invalid`, \
-     `header_transfer_encoding_unexpected`, `too_large` (the head exceeded \
-     `max_buf_size`), `status`, `internal`."
+     `header_transfer_encoding_unexpected`, `too_large` (a head limit was reached: \
+     `max_headers`, `max_header_size`, or `max_buf_size`; hyper role.rs:183-187, \
+     io.rs:204-215), `status`, `internal`."
 );
 create_exception!(
     _httpunk,

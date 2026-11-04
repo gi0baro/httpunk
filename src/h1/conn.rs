@@ -7,9 +7,9 @@
 //! in parallel. Every method is one critical section that performs a whole
 //! check-and-act and returns a verdict; the Python driver (`httpunk/h1/server.py`,
 //! a subclass) owns only the async machinery and acts on the verdict after the
-//! call returns. See HTTPUNK_RUST_STATE_DESIGN.md §3.2.
+//! call returns.
 //!
-//! Lock order (design rule 4): this state → `H1Codec` → `HeaderMap`; this state →
+//! Lock order: this state → `H1Codec` → `HeaderMap`; this state →
 //! `H1BodyDecoder`. The codec and the decoder are never held together; nothing
 //! takes any of them in reverse. The nested locks are taken only where a byte
 //! move must be atomic with a state change (the arm decision, the drain, the
@@ -18,7 +18,7 @@
 //!
 //! Requests are identified by a sequence number (`seq`): the state holds ONE
 //! current request, and a `ServerRequest` outliving its exchange gets a
-//! deterministic `STALE` answer (§3.2 "Request identity").
+//! deterministic `STALE` answer.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -93,6 +93,9 @@ struct Current {
     seq: u64,
     decoder: Option<Py<H1BodyDecoder>>,
     expect_continue: bool,
+    /// Last parsed version, initially HTTP/1.1 (conn.rs L85, L301). Kept by
+    /// `ready_for_next`, like hyper's `State::idle` (conn.rs L1132-1161), so an
+    /// automatic parse-error response uses the previous request's version too.
     http10: bool,
     /// The request was keep-alive (hyper `wants_keep_alive`'s request half).
     request_keep_alive: bool,
@@ -338,7 +341,7 @@ impl Inner {
         let wants_keep_alive =
             self.current.request_keep_alive && self.keep_alive_enabled && !self.shutdown_requested;
         // The hand-off decision (hyper `on_upgrade`): a 101 the request asked for, or a
-        // 2xx to CONNECT. A 101 the request did not ask for is not a tunnel (F28) — it
+        // 2xx to CONNECT. A 101 the request did not ask for is not a tunnel — it
         // still ends the connection (`is_last`).
         let is_switch = (status == 101 && self.current.is_upgrade)
             || (self.current.is_connect && (200..300).contains(&status));
@@ -441,7 +444,7 @@ impl H1ServerState {
         }
     }
 
-    // ===== GC visibility (design §4) =====
+    // ===== GC visibility =====
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Ok(me) = self.inner.try_lock() {
@@ -510,6 +513,12 @@ impl H1ServerState {
     #[getter]
     fn half_close(&self) -> bool {
         self.lock().half_close
+    }
+
+    /// hyper's persistent `state.version` (conn.rs L301), even between requests.
+    #[getter]
+    fn peer_http10(&self) -> bool {
+        self.lock().current.http10
     }
 
     #[getter]
@@ -641,9 +650,16 @@ impl H1ServerState {
             .cast::<RequestHead>()
             .expect("receive_request_head yields an H1RequestHead")
             .get();
+        // hyper conn.rs:318-330: use the connection's limits for trailers too.
+        let codec = me.codec.get();
         let decoder = Py::new(
             py,
-            H1BodyDecoder::new(h.kind, h.content_length.unwrap_or(0)),
+            H1BodyDecoder::new(
+                h.kind,
+                h.content_length.unwrap_or(0),
+                codec.max_headers(),
+                codec.max_header_size(),
+            ),
         )?;
         // state → decoder: the body bytes that came with the head.
         let body = me.codec.get().take_body_raw();
@@ -739,7 +755,7 @@ impl H1ServerState {
     // ===== the current request =====
 
     /// `100 Continue`: claimed by the body reader only while `Writing::Init` (no
-    /// response begun) and only for HTTP/1.1+ (hyper conn.rs L409-415, L311), once.
+    /// response begun) and only for HTTP/1.1+ (hyper conn.rs L411-421, L317), once.
     /// Decided under the same lock as `try_respond`, so a head can never overtake it
     /// (the responder awaits the continue's write when told to).
     fn try_send_continue(&self, seq: u64) -> bool {
@@ -782,7 +798,7 @@ impl H1ServerState {
     }
 
     /// `peer_closed()`: `Some(flag)` when the window is already over (or the request
-    /// is stale — a stale request always completed without a FIN, see §3.2);
+    /// is stale — a stale request always completed without a FIN);
     /// `None` = still open: arm the watcher and wait.
     fn peer_closed_now(&self, seq: u64) -> Option<bool> {
         let me = self.lock();
@@ -848,7 +864,7 @@ impl H1ServerState {
         }
     }
 
-    /// The watcher's read completed (hyper conn.rs L491-508): `data` = its bytes
+    /// The watcher's read completed (hyper conn.rs L493-510): `data` = its bytes
     /// (`b""` = EOF), `None` with `error` = a transport error, both `None` = it found
     /// no transport. An EOF / error while the response is still in flight means the
     /// client is gone: non-reusable, the request `peer_closed` -> returns `True` so
@@ -1074,7 +1090,7 @@ impl H1ServerState {
 }
 
 // ===========================================================================
-// The client connection (design §3.3) — hyper's client `Conn` + `Dispatcher`
+// The client connection — hyper's client `Conn` + `Dispatcher`
 // state: the single in-flight slot (`Conn::is_busy`), the idle watcher (the
 // re-expression of hyper's always-polled `Connection` future), the background
 // request-body writer, the error slot.
@@ -1464,7 +1480,7 @@ impl H1ClientState {
     }
 
     /// The watcher's read completed: dispatched by state (hyper conn.rs
-    /// L463-489 / L510-520). Returns `(verdict, transport)`: `WATCH_HANDOFF` — an
+    /// L465-490 / L512-521). Returns `(verdict, transport)`: `WATCH_HANDOFF` — an
     /// exchange is active, the bytes/error are its first read; `WATCH_IDLE_EOF` —
     /// closed here, close the returned transport; `WATCH_IDLE_BYTES` — poison
     /// (`new_unexpected_message`); `WATCH_IDLE_ERROR` — fail with the error;

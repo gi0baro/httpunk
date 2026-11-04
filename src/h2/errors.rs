@@ -5,6 +5,7 @@
 
 use pyo3::create_exception;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use vendor_h2::codec::UserError;
 use vendor_h2::frame::Reason;
@@ -96,6 +97,26 @@ fn initiator_str(i: Initiator) -> &'static str {
     }
 }
 
+// h2 proto/error.rs:48-50: retain opaque GOAWAY data separately from the
+// diagnostic message. The internal attribute leaves the public args unchanged;
+// fresh_exc copies it with the exception's __dict__.
+fn with_debug_data(error: PyErr, data: &[u8]) -> PyErr {
+    Python::attach(|py| {
+        error
+            .value(py)
+            .setattr("_debug_data", PyBytes::new(py, data))
+            .expect("H2ProtocolError supports instance attributes");
+    });
+    error
+}
+
+pub(crate) fn protocol_err_with_debug(reason: Reason, msg: &str, data: &[u8]) -> PyErr {
+    with_debug_data(
+        H2ProtocolError::new_err((Some(u32::from(reason)), msg.to_string())),
+        data,
+    )
+}
+
 /// Map an h2 `proto::Error` to a Python exception, **preserving the
 /// stream-vs-connection distinction** (h2 `proto/error.rs`):
 /// - `Reset(id, reason, initiator)` is a *stream-level* error -> `H2StreamError`;
@@ -104,7 +125,7 @@ fn initiator_str(i: Initiator) -> &'static str {
 ///   sends GOAWAY and tears down.
 /// - `Io` is a transport error, NOT a protocol violation, so it surfaces as a
 ///   `ConnectionClosedError` (transport-closed) rather than a PROTOCOL_ERROR
-///   GOAWAY (G41). It is still unreachable at the state-machine call sites wired
+///   GOAWAY. It is still unreachable at the state-machine call sites wired
 ///   today (they only return `library_go_away`/stored `Reset`), but a future
 ///   call site that can produce `Io` now maps correctly.
 pub(crate) fn map_proto_err(e: &Error) -> PyErr {
@@ -112,7 +133,7 @@ pub(crate) fn map_proto_err(e: &Error) -> PyErr {
         Error::Reset(id, r, initiator) => {
             H2StreamError::new_err((u32::from(*id), u32::from(*r), initiator_str(*initiator)))
         }
-        Error::GoAway(_, r, _) => H2ProtocolError::new_err((Some(u32::from(*r)), e.to_string())),
+        Error::GoAway(data, r, _) => protocol_err_with_debug(*r, &e.to_string(), data.as_ref()),
         Error::Io(..) => ConnectionClosedError::new_err((e.to_string(),)),
     }
 }

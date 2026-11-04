@@ -2,18 +2,19 @@
 #
 # (Re)vendor hyperium/h2's synchronous, sans-IO modules (frame + hpack + ext)
 # into crates/vendor-h2/src/. Run this to bump the vendored version or verify it hasn't
-# drifted. See THIRD-PARTY.md.
+# drifted. The steps below enumerate every modification.
 #
 # Usage:
 #   scripts/vendor-h2.sh                 # vendor the pinned version
-#   H2_VERSION=0.4.19 scripts/vendor-h2.sh
+#   H2_VERSION=0.4.20 scripts/vendor-h2.sh
 #
 # The copy is kept byte-identical to upstream so `git diff` between two vendored
-# versions shows only genuine upstream changes. Modifications: drop hpack/test/, one documented state.rs shim, and a
-# uniform pub(crate)->pub widening (see steps below and THIRD-PARTY.md).
+# versions shows only genuine upstream changes. Modifications: drop hpack/test/,
+# two documented state.rs edits (the recv_open shim and stripping its test
+# module), and a uniform pub(crate)->pub widening (see steps below).
 set -euo pipefail
 
-H2_VERSION="${H2_VERSION:-0.4.19}"
+H2_VERSION="${H2_VERSION:-0.4.20}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/crates/vendor-h2/src"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
@@ -40,9 +41,10 @@ cp -R "$SRC/src/frame" "$DST/frame"
 cp -R "$SRC/src/hpack" "$DST/hpack"
 cp "$SRC/src/ext.rs" "$DST/ext.rs"
 
-# 2. Sole modification: drop the hpack test fixtures (they pull external
+# 2. Drop the hpack test fixtures (they pull external
 #    test-only deps) and the `#[cfg(test)] mod test;` line that references them.
-#    Inline `#[cfg(test)] mod tests {…}` blocks are std-only and kept verbatim.
+#    Inline `#[cfg(test)]` blocks in these modules are kept verbatim and not run
+#    here (tested upstream).
 rm -rf "$DST/hpack/test"
 perl -0pi -e 's/#\[cfg\(test\)\]\s*\nmod test;\n//' "$DST/hpack/mod.rs"
 
@@ -69,7 +71,7 @@ cp "$SRC/src/error.rs" "$DST/error.rs"
 #   and `crate::Error` is vendored above, so `ensure_reason` is byte-identical.)
 perl -0pi -e 's/pub fn recv_open\(&mut self, frame: &frame::Headers\) -> Result<bool, Error> \{\n        let mut initial = false;\n        let eos = frame\.is_end_stream\(\);/pub fn recv_open(\&mut self, eos: bool, informational: bool) -> Result<bool, Error> {\n        let mut initial = false;/' "$DST/proto/streams/state.rs"
 perl -0pi -e 's/frame\.is_informational\(\)/informational/g' "$DST/proto/streams/state.rs"
-#   d. strip the trailing inline `#[cfg(test)] mod tests` (added in 0.4.16): it
+#   d. strip the trailing inline `#[cfg(test)] mod tests`: it
 #      drives `recv_open(&frame::Headers)`, the pre-shim signature from (b), so it
 #      can't compile against the shimmed file (same tradeoff as hyper's stripped
 #      decode.rs/date.rs test modules).

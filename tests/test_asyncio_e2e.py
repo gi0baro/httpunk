@@ -116,8 +116,8 @@ async def test_h1_idle_fin_closes_connection_promptly():
     """The idle watcher on the asyncio backend (a single parked read over
     `_AsyncioStream`): a server FIN on a PARKED keep-alive connection flips
     `closed` promptly with NO send and no error (hyper's clean idle close,
-    conn.rs L471-481), and the next send_request raises with `request_unsent`
-    (client/conn/http1.rs L247-263)."""
+    conn.rs L472-482), and the next send_request raises with `request_unsent`
+    (client/conn/http1.rs L261-281)."""
     backend = AsyncioBackend()
     host, port, accept, listener = await _listen()
     r1_read = asyncio.Event()
@@ -379,7 +379,7 @@ async def test_wrap_tls_tunnel_h1_keep_alive_and_abort(ca):
             resp = await conn.request("POST", "/", headers={"host": "127.0.0.1:443"}, body=body)
             assert await resp.read() == b"tls:" + body
         backend.close_transport(stream)  # no close_notify: the origin's read breaks or ends
-    assert not errors  # the h1 server maps the broken transport at the head boundary to a clean end (F47)
+    assert not errors  # the h1 server maps the broken transport at the head boundary to a clean end
 
 
 @pytest.mark.asyncio
@@ -462,7 +462,7 @@ async def test_wrap_tls_rejects_buffered_bytes(ca):
 async def test_wrap_tls_dead_stream_fails_fast(ca):
     """A stream whose peer already closed: no handshake can complete, and `start_tls`
     would silently drop the ClientHello and sit until its own timeout — fail up front
-    with a `ConnectionError` instead (the F32 rule `send_all` follows)."""
+    with a `ConnectionError` instead (the rule `send_all` follows)."""
     backend = AsyncioBackend()
     host, port, accept, listener = await _listen()
 

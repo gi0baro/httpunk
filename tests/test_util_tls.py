@@ -52,7 +52,7 @@ async def test_https_alpn_negotiates_h2(ca):
     host, port = listener.transport.socket.getsockname()[:2]
 
     async def server_side():
-        # Echo the request's :scheme so the client can assert it. F1 regression
+        # Echo the request's :scheme so the client can assert it. Regression
         # guard: a TLS-dialed h2 connection must carry :scheme=https, not the old
         # hardcoded "http".
         server = await auto.serve(await listener.accept())

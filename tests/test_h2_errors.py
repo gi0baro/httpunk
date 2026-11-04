@@ -525,7 +525,7 @@ async def test_head_response_content_length_not_enforced():
 async def test_content_length_over_19_digits_rejected():
     """A content-length with >19 digits risks overflowing u64, so h2's `parse_u64`
     rejects it outright (headers.rs L329) before parsing. The client resets that stream
-    with PROTOCOL_ERROR rather than accepting an unparseable length (F37)."""
+    with PROTOCOL_ERROR rather than accepting an unparseable length."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
 
@@ -549,7 +549,7 @@ async def test_content_length_over_19_digits_rejected():
 async def test_stream_id_overflow_refuses_new_stream():
     """Once client stream ids are exhausted (past 2^31-1), a new request is refused —
     h2 `StreamId::next_id` returns `StreamIdOverflow` — as a user error, while the
-    connection itself stays alive (F43)."""
+    connection itself stays alive."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
 
@@ -574,7 +574,7 @@ async def test_stream_id_overflow_refuses_new_stream():
 async def test_1xx_with_end_stream_is_reset_not_hung():
     """A 1xx interim response carrying END_STREAM is malformed — a 1xx is not the final
     response, so it can't end the stream (RFC 9113 §8.1). The client resets it
-    (PROTOCOL_ERROR) instead of hanging forever on a final head that never comes (F38)."""
+    (PROTOCOL_ERROR) instead of hanging forever on a final head that never comes."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
 
@@ -596,7 +596,7 @@ async def test_1xx_with_end_stream_is_reset_not_hung():
 @pytest.mark.tonio
 async def test_empty_body_rides_end_stream_on_headers():
     """A statically-empty body (`b""`) is bodyless: END_STREAM rides the HEADERS frame
-    with NO trailing empty DATA frame — hyper's empty body reports is_end_stream() (F39)."""
+    with NO trailing empty DATA frame — hyper's empty body reports is_end_stream()."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     seen = {}
@@ -621,7 +621,7 @@ async def test_empty_body_rides_end_stream_on_headers():
 @pytest.mark.tonio
 async def test_zero_length_interior_data_frame_sent_not_elided():
     """An interior zero-length body chunk goes on the wire as an empty non-END_STREAM
-    DATA frame, not elided — h2 queues zero-length DATA frames (prioritize.rs) (F40)."""
+    DATA frame, not elided — h2 queues zero-length DATA frames (prioritize.rs)."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     seen = {}
@@ -680,8 +680,8 @@ async def test_goaway_high_last_stream_id_accepted():
 async def test_close_wakes_inflight_waiter():
     """Closing a connection with an in-flight request must WAKE that request with an
     error, never hang it. The pump normally fails all streams on EOF, but close()'s
-    cancel races that; fail_all in close() guarantees the straggler wakes regardless
-    (F44). (A hang would trip the per-test tonio deadline and fail loudly.)"""
+    cancel races that; fail_all in close() guarantees the straggler wakes regardless.
+    (A hang would trip the per-test tonio deadline and fail loudly.)"""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     req_received = Event()
@@ -725,7 +725,7 @@ async def test_aclose_after_connection_failure_is_clean():
     """When the connection fails while a response body is still open, the stream is
     transitioned to Closed (recv_eof fans out via fail_all), so aclose()-ing the
     response is a clean no-op instead of trying to RST_STREAM on the dead transport
-    and erroring (F60)."""
+    and erroring."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     got_resp = Event()
@@ -747,7 +747,7 @@ async def test_aclose_after_connection_failure_is_clean():
         while not conn._conn.is_failed():  # wait until the pump processed the EOF (fail_all ran)
             await sleep(0)
         # The stream is now Closed via recv_eof; aclose must NOT RST the dead transport.
-        await resp.aclose()  # would raise without F60
+        await resp.aclose()  # must not reset the dead transport
         await conn.__aexit__(None, None, None)
         s.cancel()
 
@@ -756,7 +756,7 @@ async def test_aclose_after_connection_failure_is_clean():
 async def test_client_replies_goaway_when_idle_after_peer_goaway():
     """After the peer GOAWAYs and the in-flight stream finishes, the client sends its
     OWN acknowledging GOAWAY(NO_ERROR) rather than lingering until the peer closes the
-    socket — h2 go_away_now-on-idle (F23)."""
+    socket — h2 go_away_now-on-idle."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
     got_client_goaway = Event()
@@ -791,8 +791,7 @@ async def test_end_stream_with_content_length_resets_not_hangs():
     """A response whose final HEADERS carry END_STREAM AND content-length>0 is malformed
     (the declared length can't match the zero body bytes). The client resets it
     (PROTOCOL_ERROR) and send_request raises PROMPTLY, instead of hanging forever on the
-    response head because reset_stream skipped waking the waiter on the closed stream
-    (F18)."""
+    response head because reset_stream skipped waking the waiter on the closed stream."""
     listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
     host, port = listener.socket.getsockname()[:2]
 
@@ -817,8 +816,8 @@ async def test_end_stream_with_content_length_resets_not_hangs():
 async def test_close_flushes_queued_frames_even_after_connection_error():
     """`close()` drains the control-frame queue BEFORE the FIN regardless of
     `error` being set — h2's `State::Closing` runs `codec.shutdown` (flush, then
-    shutdown) on every non-IO close (connection.rs L304-310). The GOAWAY-exchanged
-    clean close (F23) relies on this: its reply GOAWAY is queued with `error` already
+    shutdown) on every non-IO close (connection.rs L341-348). The GOAWAY-exchanged
+    clean close relies on this: its reply GOAWAY is queued with `error` already
     set, and whether the write pump wakes before `close()` tears it down is a
     scheduler race. The write-pump wake is stubbed out so the queue is guaranteed
     to still hold the frame when `close()` runs."""
@@ -879,3 +878,169 @@ async def test_close_flushes_queued_frames_even_after_connection_error():
         s.cancel()
 
     assert any(isinstance(f, Ping) and f.data == b"flushme!" for f in seen), seen
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize(
+    ("values", "valid"),
+    [
+        (("2", "2", "2"), True),
+        (("2", "02", "002"), True),
+        (("2", "3", "2"), False),
+        (("2", "2", "3"), False),
+        (("2", "2", "invalid"), False),
+        (("2", "2", "18446744073709551616"), False),
+    ],
+)
+async def test_validate_multiple_content_length_headers(method, values, valid):
+    # h2 tests/h2-tests/tests/client_request.rs:1467 validate_multiple_content_length_headers.
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    done = Event()
+    resets = []
+
+    async def server():
+        try:
+            stream, codec, frames = await _accept_handshake(listener)
+            sid = await _read_until_request(stream, codec, frames)
+            assert sid == 1
+            await stream.send_all(
+                codec.serialize_response_headers(sid, 200, HeaderMap([("content-length", v) for v in values]))
+            )
+            if valid:
+                await stream.send_all(codec.serialize_data(sid, b"" if method == "HEAD" else b"ok", end_stream=True))
+            while chunk := await stream.receive_some(65536):
+                resets.extend((f.stream_id, f.error_code) for f in codec.receive(chunk) if isinstance(f, RstStream))
+        finally:
+            done.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            if valid:
+                resp = await conn.request(method, "/")
+                assert [bytes(chunk) async for chunk in resp.aiter_bytes()] == [b"" if method == "HEAD" else b"ok"]
+            else:
+                with pytest.raises(StreamResetError) as exc:
+                    await conn.request(method, "/")
+                assert type(exc.value) is StreamResetError
+                assert exc.value.error_code == H2Reason.PROTOCOL_ERROR
+                assert exc.value.stream_id == 1
+        await done.wait()
+        s.cancel()
+
+    assert resets == ([] if valid else [(1, H2Reason.PROTOCOL_ERROR)])
+
+
+@pytest.mark.tonio
+async def test_recv_too_big_headers():
+    # h2 tests/h2-tests/tests/client_request.rs:893 recv_too_big_headers.
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    done, errors_ready = Event(), Event()
+    requests, resets, errors = [], [], []
+
+    async def server():
+        try:
+            stream, codec, frames = await _accept_handshake(listener)
+            while len(requests) < 2:
+                for f in frames:
+                    if isinstance(f, Settings) and not f.ack:
+                        assert f.max_header_list_size == 40
+                        await stream.send_all(codec.serialize_settings_ack())
+                    elif isinstance(f, Headers):
+                        requests.append(f.stream_id)
+                        assert f.method == "GET" and f.end_stream
+                        assert f.scheme == "https" and f.authority == "http2.akamai.com" and f.path == "/"
+                if len(requests) < 2:
+                    chunk = await stream.receive_some(65536)
+                    assert chunk
+                    frames = codec.receive(chunk)
+            assert requests == [1, 3]
+            await stream.send_all(
+                codec.serialize_response_headers(1, 200, end_stream=True) + codec.serialize_response_headers(3, 200)
+            )
+            while chunk := await stream.receive_some(65536):
+                resets.extend((f.stream_id, f.error_code) for f in codec.receive(chunk) if isinstance(f, RstStream))
+        finally:
+            done.set()
+
+    async def request(conn):
+        with pytest.raises(StreamResetError) as exc:
+            await conn.request("GET", "https://http2.akamai.com/")
+        assert type(exc.value) is StreamResetError
+        assert exc.value.error_code == H2Reason.PROTOCOL_ERROR
+        errors.append(exc.value.stream_id)
+        if len(errors) == 2:
+            errors_ready.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port, max_header_list_size=40) as conn:
+            s.spawn(request(conn))
+            s.spawn(request(conn))
+            await errors_ready.wait()
+        await done.wait()
+        s.cancel()
+    assert sorted(errors) == [1, 3]
+    assert resets == [(3, H2Reason.PROTOCOL_ERROR)]
+
+
+@pytest.mark.tonio
+async def test_response_missing_status():
+    # h2 tests/h2-tests/tests/client_request.rs:824 response_missing_status.
+    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
+    host, port = listener.socket.getsockname()[:2]
+    done = Event()
+    requests = []
+    resets = []
+
+    async def server():
+        try:
+            stream, codec, frames = await _accept_handshake(listener)
+            while True:
+                for f in frames:
+                    if isinstance(f, Settings) and not f.ack:
+                        await stream.send_all(codec.serialize_settings_ack())
+                    elif isinstance(f, RstStream):
+                        resets.append((f.stream_id, f.error_code))
+                    elif isinstance(f, Headers):
+                        requests.append(f.stream_id)
+                        assert f.method == "GET"
+                        assert f.end_stream
+                        if f.stream_id == 1:
+                            # Empty HPACK block: HEADERS with END_HEADERS | END_STREAM.
+                            await stream.send_all(b"\x00\x00\x00\x01\x05\x00\x00\x00\x01")
+                        elif f.stream_id == 3:
+                            await stream.send_all(codec.serialize_response_headers(3, 103))
+                            # Literal without indexing, new name: server: test, no :status.
+                            block = b"\x00\x06server\x04test"
+                            await stream.send_all(len(block).to_bytes(3, "big") + b"\x01\x04\x00\x00\x00\x03" + block)
+                        elif f.stream_id == 5:
+                            assert resets == [(3, H2Reason.PROTOCOL_ERROR)]
+                            await stream.send_all(codec.serialize_response_headers(5, 204, end_stream=True))
+                        else:
+                            pytest.fail(f"unexpected request stream {f.stream_id}")
+                chunk = await stream.receive_some(65536)
+                if not chunk:
+                    break
+                frames = codec.receive(chunk)
+        finally:
+            done.set()
+
+    async with scope() as s:
+        s.spawn(server())
+        async with open_h2(host, port) as conn:
+            for sid in (1, 3):
+                with pytest.raises(StreamResetError) as exc:
+                    await conn.request("GET", "/")
+                assert type(exc.value) is StreamResetError
+                assert exc.value.stream_id == sid
+                assert exc.value.error_code == H2Reason.PROTOCOL_ERROR
+            assert (await conn.request("GET", "/")).status == 204
+        await done.wait()
+        s.cancel()
+
+    assert requests == [1, 3, 5]
+    assert resets == [(3, H2Reason.PROTOCOL_ERROR)]

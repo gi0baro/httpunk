@@ -56,7 +56,7 @@ class GracefulShutdown:
         `watch(server, serve)` drives the connection to completion. Mirrors hyper-util
         `GracefulShutdown::watcher()`: the count is bumped on the caller's task, before
         any spawn, so `count()`/`shutdown()` can't race a not-yet-scheduled watch — the
-        exact footgun hyper-util's docs call out (F53). Call this on the main task, then
+        exact footgun hyper-util's docs call out. Call this on the main task, then
         spawn `watcher.watch(...)`."""
         with self._lock:
             self._live += 1
@@ -68,7 +68,7 @@ class GracefulShutdown:
         driving coroutine to spawn. NOTE this is a plain (sync) method: it registers the
         slot synchronously when CALLED (via `watcher()`), so `spawn(graceful.watch(...))`
         bumps the count before the coroutine is scheduled, matching hyper-util's
-        `watch() = watcher().watch()` (F53)."""
+        `watch() = watcher().watch()`."""
         return self.watcher().watch(server, serve)
 
     async def shutdown(self) -> None:

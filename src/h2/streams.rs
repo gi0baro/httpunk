@@ -14,7 +14,7 @@ use vendor_h2::frame::{Reason, Reset, StreamId};
 use vendor_h2::proto::Initiator;
 use vendor_h2::proto::streams::{FlowControl, State};
 
-use super::errors::{H2ProtocolError, map_proto_err, map_reason, map_user_err};
+use super::errors::{map_proto_err, map_reason, map_user_err, protocol_err_with_debug};
 
 pub(super) fn parse_initiator(s: &str) -> PyResult<Initiator> {
     match s {
@@ -189,7 +189,7 @@ impl H2StreamState {
 }
 
 /// h2's window arithmetic is `i32` behind a `u32` `WindowSize` (flow_control.rs L216,
-/// L226 cast `as i32`): an amount above 2^31-1 — which the wire can never carry
+/// L231 cast `as i32`): an amount above 2^31-1 — which the wire can never carry
 /// (`WindowUpdate::load` masks to 31 bits) — would flip sign and corrupt the window.
 /// Reject it at the boundary instead.
 pub(super) fn check_window_size(sz: u32) -> PyResult<()> {
@@ -297,10 +297,10 @@ impl H2FlowControl {
 // `proto/streams/stream.rs` (`ContentLength`) and `proto/streams/counts.rs` (the
 // DATA-frame budget) are not vendored — they are the async stream store and its
 // bookkeeping, rewritten in Python. The two pure pieces of numeric state they own
-// are mirrored here verbatim (h2 0.4.19 line references), so the driver does no
+// are adapted here (h2 0.4.20 line references), so the driver does no
 // per-frame arithmetic itself.
 
-/// h2 `proto/mod.rs` L38-40 (0.4.19): the DATA-framing budget constants.
+/// h2 `proto/mod.rs` L38-40 (0.4.20): the DATA-framing budget constants.
 pub const DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD: usize = 256;
 pub const DEFAULT_DATA_FRAME_BUDGET: usize = DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 100;
 pub const MAX_RECV_EMPTY_DATA_FRAMES: usize = 100;
@@ -325,20 +325,20 @@ impl ContentLength {
         }
     }
 
-    /// h2 `ContentLength::is_head` (stream.rs L597).
+    /// h2 `ContentLength::is_head` (stream.rs L595).
     pub(super) fn is_head(self) -> bool {
         matches!(self, ContentLength::Head)
     }
 
-    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L175-201): a no-op
-    /// for a HEAD response, whose block h2 skips entirely.
+    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L202-205): a no-op
+    /// for a HEAD response, whose length h2 validates but does not store.
     pub(super) fn set(&mut self, value: u64) {
         if !matches!(*self, ContentLength::Head) {
             *self = ContentLength::Remaining(value);
         }
     }
 
-    /// h2 stream.rs `dec_content_length` (L338-353): consume `len` body bytes. `false`
+    /// h2 stream.rs `dec_content_length` (L338-351): consume `len` body bytes. `false`
     /// = more data than declared, or any data on a HEAD response.
     pub(super) fn dec(&mut self, len: u64) -> bool {
         match *self {
@@ -354,7 +354,7 @@ impl ContentLength {
         }
     }
 
-    /// h2 stream.rs `ensure_content_length_zero` (L355-361): `false` = a declared
+    /// h2 stream.rs `ensure_content_length_zero` (L353-359): `false` = a declared
     /// length still unsatisfied at END_STREAM.
     pub(super) fn is_satisfied(self) -> bool {
         !matches!(self, ContentLength::Remaining(n) if n != 0)
@@ -394,8 +394,9 @@ impl H2ContentLength {
     }
 }
 
-/// h2 counts.rs `Budget` (0.4.19): `consume` fails once exhausted, `replenish`
-/// saturates at the resolved maximum.
+/// h2 counts.rs:4-37 `Budget` tracks spent overhead: `consume` fails above max,
+/// `replenish` saturating-subtracts spent. With a fixed max, remaining capacity
+/// here is equivalent to `max - spent`.
 pub(super) struct Budget {
     current: usize,
     max: usize,
@@ -420,9 +421,10 @@ pub(super) struct DataFrameCounts {
     num_recv_empty_data_frames: usize,
 }
 
-/// The connection's DATA-framing budget — h2 0.4.19 counts.rs `record_data_frame` /
-/// `release_data_frame` (L99-125) over `DataFrameBudget::resolve` (proto/connection.rs
-/// L96-106). Flow control bounds payload BYTES, not frame COUNT: a peer fragmenting
+/// The connection's DATA-framing budget — h2 counts.rs `record_data_frame` /
+/// `release_data_frame` (L120-147), with Auto following the target connection window
+/// via `set_target_connection_window_size` (L112-116). Flow control bounds payload
+/// BYTES, not frame COUNT: a peer fragmenting
 /// data into tiny frames bloats the buffered chunk queue while staying inside every
 /// window; non-final frames below the threshold consume the overhead they impose,
 /// larger ones earn it back, empty ones count against their own lifetime cap.
@@ -432,17 +434,19 @@ pub struct H2DataFrameBudget {
 }
 
 pub(super) fn budget_exhausted() -> PyErr {
-    // streams.rs L644-647: `BudgetExhausted` -> connection ENHANCE_YOUR_CALM.
-    H2ProtocolError::new_err((
-        Some(u32::from(Reason::ENHANCE_YOUR_CALM)),
-        "too_many_data_frames".to_string(),
-    ))
+    // h2 proto/streams/streams.rs:659-662: BudgetExhausted -> GOAWAY with data.
+    protocol_err_with_debug(
+        Reason::ENHANCE_YOUR_CALM,
+        "too_many_data_frames",
+        b"too_many_data_frames",
+    )
 }
 
 impl DataFrameCounts {
-    /// `DataFrameBudget::resolve`: a configured budget as-is; otherwise ("Auto") half
-    /// the connection recv window (`connection_window`, default
-    /// DEFAULT_INITIAL_WINDOW_SIZE), floored at DEFAULT_DATA_FRAME_BUDGET.
+    /// h2 counts.rs:106-115 initializes the budget, then
+    /// `set_target_connection_window_size` resolves Auto: half the target window,
+    /// floored at DEFAULT_DATA_FRAME_BUDGET (proto/connection.rs:99-108). A configured
+    /// budget is unchanged. This driver has no runtime target-window setter.
     pub(super) fn new(configured: Option<usize>, connection_window: Option<u32>) -> Self {
         let max = configured.unwrap_or_else(|| {
             let window = connection_window.unwrap_or(vendor_h2::frame::DEFAULT_INITIAL_WINDOW_SIZE);
@@ -455,7 +459,7 @@ impl DataFrameCounts {
     }
 
     /// `record_data_frame` for a received NON-FINAL DATA frame (the caller guards:
-    /// a final frame is never budgeted, streams.rs L640-649). Returns the charge taken
+    /// a final frame is never budgeted, streams.rs L655-662). Returns the charge taken
     /// from the budget (0 for an empty or a large frame) — what `release` gives back
     /// once the chunk leaves the buffer. Raises `H2ProtocolError(ENHANCE_YOUR_CALM)`
     /// on exhaustion of the byte budget or the empty-frame cap.

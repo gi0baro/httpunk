@@ -31,6 +31,18 @@ def test_serialize_request_no_body():
     assert codec.serialize_end() == b""
 
 
+def test_client_hop_by_hop_headers():
+    # hyper tests/client.rs: client_hop_by_hop_headers (v1.12.0).
+    codec = H1Codec()
+    head = codec.serialize_request(
+        "GET", "/", HeaderMap([("connection", "close, x-hop"), ("x-hop", "..."), ("host", "h")])
+    )
+    assert head == b"GET / HTTP/1.1\r\nconnection: close, x-hop\r\nx-hop: ...\r\nhost: h\r\n\r\n"
+    response = codec.receive_head(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+    assert response.status == 200
+    assert response.body_kind == "empty"
+
+
 def test_serialize_request_absolute_form_for_proxy():
     # An absolute-URL target is sent in absolute-form (for an HTTP proxy), and an
     # authority target in authority-form (CONNECT) — hyper sends the target as-is.
@@ -136,7 +148,7 @@ def test_parse_error_kinds_mirror_hyper_parse_variants():
 
 
 def test_response_1xx_status_is_user_error_unsupported_status_code():
-    """hyper `Server::encode` refuses a 1xx (not 101) response (role.rs L400-405,
+    """hyper `Server::encode` refuses a 1xx (not 101) response (role.rs L411-416,
     `User::UnsupportedStatusCode`) and rewinds `dst`: nothing is encoded."""
     codec = H1Codec()
     codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
@@ -148,7 +160,7 @@ def test_response_1xx_status_is_user_error_unsupported_status_code():
 
 def test_response_content_length_and_transfer_encoding_is_user_error_unexpected_header():
     """Both `content-length` and `transfer-encoding` on a response: hyper `Server::encode`
-    cancels with `User::UnexpectedHeader` (role.rs L803-807) and rewinds `dst`."""
+    cancels with `User::UnexpectedHeader` (role.rs L815-820) and rewinds `dst`."""
     codec = H1Codec()
     codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
     hdrs = HeaderMap([("content-length", "5"), ("transfer-encoding", "chunked")])
@@ -186,7 +198,7 @@ def test_invalid_status_argument_stays_value_error():
 
 
 def test_head_terminated_by_bare_lf_then_crlf_parses():
-    """hyper 1.11.1 `is_complete_fast`: a bare-LF header line ending followed by a CRLF
+    """hyper 1.12.0 `is_complete_fast`: a bare-LF header line ending followed by a CRLF
     blank line ends the head (httparse accepts it), so the partial-read fast path must
     recognise it too instead of waiting for more bytes. Both roles."""
     codec = H1Codec()
@@ -199,7 +211,7 @@ def test_head_terminated_by_bare_lf_then_crlf_parses():
     assert head is not None and head.status == 204 and head.headers["a"] == b"b"
 
 
-# ----- body framing crosses the boundary without copying (BOUNDARY_NOTES.md §2.2) -----
+# ----- body framing crosses the boundary without copying -----
 
 
 def test_serialize_data_content_length_returns_the_callers_object():
@@ -311,7 +323,7 @@ def test_head_buffer_is_reused_across_messages():
 
 
 def test_take_body_into_moves_head_adjacent_body_bytes_and_later_feeds_continue():
-    # The client's shape (BOUNDARY_NOTES S9): body bytes that arrived with the head move
+    # The client's shape: body bytes that arrived with the head move
     # from the codec's read buffer straight into the decoder, then the decoder keeps
     # taking transport bytes; the body decodes whole and in order.
     from httpunk._httpunk import H1BodyDecoder
@@ -343,7 +355,7 @@ def test_take_body_into_with_nothing_buffered_is_a_no_op():
     assert decoder.decode() == b"abc" and decoder.is_complete
 
 
-# ----- head strings are built once and shared where the set is closed (rules 6/7) -----
+# ----- head strings are built once and shared where the set is closed -----
 
 
 def _request_head(codec, raw):

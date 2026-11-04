@@ -1,6 +1,6 @@
-//! Vendored from hyperium/h2 (MIT licensed — see `LICENSE-h2` and
-//! `THIRD-PARTY.md`). Pinned version is in `src/h2/UPSTREAM_VERSION`; re-vendor
-//! with `scripts/vendor-h2.sh`.
+//! Vendored from hyperium/h2 (MIT licensed — see `crates/vendor-h2/LICENSE`).
+//! Pinned version is in `crates/vendor-h2/UPSTREAM_VERSION`; re-vendor with
+//! `scripts/vendor-h2.sh`, which enumerates every modification to upstream.
 //!
 //! Only h2's **synchronous, sans-IO** modules are vendored: `frame` (HTTP/2
 //! frame parse/serialize) and `hpack` (HPACK header compression), the tiny
@@ -11,13 +11,12 @@
 //! their state is re-expressed in httpunk's `src/h2/conn.rs`, their async half
 //! in Python.
 //!
-//! The `.rs` files under here are kept **byte-identical to upstream modulo a
-//! uniform `crate::` -> `crate::` rewrite** the vendor script applies, so
-//! this crate's h2 code is isolated under `crate::` — symmetric with the
-//! vendored hyper code under `crate::hyper::`, neither owning the crate root. A
-//! `git diff` between two vendored versions still shows only genuine upstream
-//! changes. The other edit the vendor script applies is dropping `hpack/test/`
-//! (heavy external test-only deps) and its module reference.
+//! The vendored `.rs` files are kept **byte-identical to upstream** modulo the
+//! script's edits: dropping `hpack/test/` (heavy external test-only deps) and its
+//! module reference, the `state.rs` `recv_open` shim and test-module strip, and a
+//! uniform `pub(crate)` -> `pub` widening. This is a separate crate, so upstream's
+//! `crate::` paths resolve natively. A `git diff` between two vendored versions
+//! shows only genuine upstream changes.
 
 #![allow(dead_code)]
 #![allow(unused_imports)]

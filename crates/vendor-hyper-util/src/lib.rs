@@ -1,9 +1,10 @@
-//! Vendored hyper-util (`hyper_util`) sans-IO code — currently just the proxy
-//! matcher. Hand-written crate-root glue: it owns the crate root so upstream's own
-//! `self::`/`crate::` paths resolve verbatim (no namespace rewrite), and re-exposes
-//! only the vendored `client::proxy::matcher`. The genuinely-IO / async and
-//! platform-specific hyper-util code (legacy client, pool, connect, `from_system`)
-//! is not vendored. See ../../THIRD-PARTY.md.
+//! Vendored hyper-util (`hyper_util`) sans-IO proxy matcher plus upstream's
+//! feature-gated `client/mod.rs` and `client/proxy/mod.rs`. Only this crate root is
+//! hand-written: upstream's `lib.rs` unconditionally wires unvendored common/rt
+//! modules. Owning the crate root preserves upstream's `self::`/`crate::` paths.
+//! `client-proxy` is on by default; legacy, pool and platform features stay off
+//! because their code/dependencies are not vendored. `scripts/vendor-hyper-util.sh`
+//! enumerates every modification to the copied files.
 
 // The vendored `.rs` files are byte-identical to upstream, so they are exempt from
 // this workspace's lints (upstream targets a different clippy/rustc version and
