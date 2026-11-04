@@ -49,7 +49,7 @@ _audit = ["dep:h2", "dep:hyper", "dep:hyper-util"]
 bytes = "1"
 http = "1.1"
 mimalloc = { version = "0.1.49", default-features = false, features = ["local_dynamic_tls"], optional = true }
-pyo3 = { version = "=0.29", features = ["extension-module", "generate-import-lib"] }
+pyo3 = { version = "=0.30", features = ["extension-module", "generate-import-lib"] }
 vendor-h2 = { path = "crates/vendor-h2" }
 vendor-hyper = { path = "crates/vendor-hyper", features = ["client", "server", "http1"] }
 vendor-hyper-util = { path = "crates/vendor-hyper-util" }

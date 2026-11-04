@@ -16,14 +16,7 @@ use pyo3::prelude::*;
 
 use vendor_h2::frame::Reason;
 
-#[pyclass(
-    module = "httpunk._httpunk",
-    name = "H2Reason",
-    eq,
-    eq_int,
-    frozen,
-    skip_from_py_object
-)]
+#[pyclass(module = "httpunk._httpunk", name = "H2Reason", eq, eq_int, frozen)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u32)]
 pub enum H2Reason {
