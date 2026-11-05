@@ -3,23 +3,22 @@ No upstream test mirrors Python context-entry cancellation or the spawned driver
 """
 
 import pytest
-from _runtime import cancelled_type, connected_pair
-from conftest import TONIO_OK
+from _net import read_to_eof, tcp_pair
+from tonio.colored import Event, scope
+from tonio.exceptions import CancelledError
 
 from httpunk import H2Connection
-from httpunk._backend import Backend
 from httpunk.exceptions import ConnectionClosedError
 from httpunk.h2.connection import PREFACE
 from httpunk.h2.server import H2Server
 
 
 class _ObservedStream:
-    def __init__(self, stream, backend, *, gate_write=False):
+    def __init__(self, stream, *, gate_write=False):
         self.stream = stream
-        self.backend = backend
-        self.read_started = backend.event()
-        self.write_started = backend.event()
-        self.write_gate = backend.event() if gate_write else None
+        self.read_started = Event()
+        self.write_started = Event()
+        self.write_gate = Event() if gate_write else None
         self.aborts = 0
 
     async def receive_some(self, size):
@@ -35,25 +34,18 @@ class _ObservedStream:
 
     def close(self):
         self.aborts += 1
-        self.backend.close_transport(self.stream)
+        self.stream.close()
 
     abort = close
 
 
-async def _assert_eof(peer, backend):
-    try:
-        while await peer.receive_some(65536):
-            pass
-    except backend.broken_transport_errors:
-        pass  # an abort with unread bytes may be a reset rather than FIN
-
-
-async def _client_handshake_aborts_transport_and_pumps(runtime, outcome):
-    backend = Backend(runtime).create()
-    async with connected_pair(runtime, backend) as (stream, peer):
-        observed = _ObservedStream(stream, backend)
-        conn = H2Connection(observed, backend=backend)
-        finished = backend.event()
+@pytest.mark.tonio
+@pytest.mark.parametrize("outcome", ["cancel", "eof"])
+async def test_h2_client_handshake_aborts_transport_and_pumps(outcome):
+    async with tcp_pair() as (stream, peer):
+        observed = _ObservedStream(stream)
+        conn = H2Connection(observed)
+        finished = Event()
         errors = []
 
         async def connect():
@@ -67,22 +59,22 @@ async def _client_handshake_aborts_transport_and_pumps(runtime, outcome):
             finally:
                 finished.set()
 
-        async with backend.scope() as scope:
-            scope.spawn(connect())
+        async with scope() as s:
+            s.spawn(connect())
             preface = b""
             while len(preface) < len(PREFACE):
                 preface += await peer.receive_some(65536)
             assert preface.startswith(PREFACE)
             await observed.read_started.wait()
             if outcome == "cancel":
-                scope.cancel()
+                s.cancel()
             else:
-                backend.close_transport(peer)
+                peer.close()
         await finished.wait()
         assert len(errors) == 1
         if outcome == "cancel":
-            assert isinstance(errors[0], cancelled_type(runtime))
-            await _assert_eof(peer, backend)
+            assert isinstance(errors[0], CancelledError)
+            await read_to_eof(peer, allow_reset=True)
         else:
             assert isinstance(errors[0], ConnectionClosedError)
         assert observed.aborts == 1
@@ -101,12 +93,13 @@ async def _client_handshake_aborts_transport_and_pumps(runtime, outcome):
         await read
 
 
-async def _server_handshake_aborts_during_initial_flush(runtime, outcome):
-    backend = Backend(runtime).create()
-    async with connected_pair(runtime, backend) as (peer, stream):
-        observed = _ObservedStream(stream, backend, gate_write=True)
-        server = H2Server(observed, backend=backend)
-        finished = backend.event()
+@pytest.mark.tonio
+@pytest.mark.parametrize("outcome", ["cancel", "error"])
+async def test_h2_server_handshake_aborts_during_initial_flush(outcome):
+    async with tcp_pair() as (peer, stream):
+        observed = _ObservedStream(stream, gate_write=True)
+        server = H2Server(observed)
+        finished = Event()
         errors = []
 
         async def start():
@@ -120,17 +113,17 @@ async def _server_handshake_aborts_during_initial_flush(runtime, outcome):
             finally:
                 finished.set()
 
-        async with backend.scope() as scope:
-            scope.spawn(start())
+        async with scope() as s:
+            s.spawn(start())
             await observed.write_started.wait()
             if outcome == "cancel":
-                scope.cancel()
+                s.cancel()
             else:
                 observed.write_gate.set()
         await finished.wait()
         assert len(errors) == 1
         if outcome == "cancel":
-            assert isinstance(errors[0], cancelled_type(runtime))
+            assert isinstance(errors[0], CancelledError)
         else:
             assert isinstance(errors[0], OSError)
             assert errors[0].args == ("handshake write failed",)
@@ -138,30 +131,4 @@ async def _server_handshake_aborts_during_initial_flush(runtime, outcome):
         assert server._conn.is_closed()
         assert server._conn.take_pump_handle() is None
         assert server._conn.take_read_handle() is None
-        await _assert_eof(peer, backend)
-
-
-@pytest.mark.tonio
-@pytest.mark.skipif(not TONIO_OK, reason="tonio needs free-threaded Python")
-@pytest.mark.parametrize("outcome", ["cancel", "eof"])
-async def test_h2_client_handshake_aborts_transport_and_pumps_tonio(outcome):
-    await _client_handshake_aborts_transport_and_pumps("tonio", outcome)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["cancel", "eof"])
-async def test_h2_client_handshake_aborts_transport_and_pumps_asyncio(outcome):
-    await _client_handshake_aborts_transport_and_pumps("asyncio", outcome)
-
-
-@pytest.mark.tonio
-@pytest.mark.skipif(not TONIO_OK, reason="tonio needs free-threaded Python")
-@pytest.mark.parametrize("outcome", ["cancel", "error"])
-async def test_h2_server_handshake_aborts_during_initial_flush_tonio(outcome):
-    await _server_handshake_aborts_during_initial_flush("tonio", outcome)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["cancel", "error"])
-async def test_h2_server_handshake_aborts_during_initial_flush_asyncio(outcome):
-    await _server_handshake_aborts_during_initial_flush("asyncio", outcome)
+        await read_to_eof(peer, allow_reset=True)

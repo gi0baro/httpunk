@@ -10,10 +10,9 @@ before the connection closes.
 from types import SimpleNamespace
 
 import pytest
-from _client import open_h1  # noqa: F401  (kept for symmetry; loopback uses raw connections)
+from _net import listen, open_h1  # noqa: F401  (kept for symmetry; loopback uses raw connections)
 from _transport import StubStream
 from tonio.colored import Event, scope, sleep
-from tonio.colored.net import open_tcp_listeners
 
 from httpunk import H1Connection, H2Connection, H2Reason
 from httpunk._backend.tonio import TonioBackend
@@ -59,12 +58,6 @@ class _CapturingTransport(_IdleTransport):
 
     async def send_all(self, data):
         self.sent += data
-
-
-async def _listener():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
-    return listener, host, port
 
 
 # ----- coordinator basics -----
@@ -278,7 +271,7 @@ async def test_h2_graceful_drains_open_connection_then_closes():
     # request fails. (In-flight *concurrent* completion is guaranteed structurally — the
     # accept loop only ends once `_streams` is empty, see `_release_slot` — and the
     # two-phase serve/ignore + frame emission are covered by the direct unit tests above.)
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     graceful = GracefulShutdown()
 
     async def serve(server):
@@ -318,7 +311,7 @@ async def test_h2_graceful_drains_open_connection_then_closes():
 
 @pytest.mark.tonio
 async def test_h1_graceful_releases_idle_connection_and_closes():
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     graceful = GracefulShutdown()
     served = Event()
 

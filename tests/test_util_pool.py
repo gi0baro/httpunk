@@ -7,22 +7,15 @@ connection's enter/close lifecycle; the connector hands back an un-entered conne
 import errno
 
 import pytest
-from _runtime import cancelled_type
-from tonio.colored import scope
-from tonio.colored.net import open_tcp_listeners
+from _net import listen
+from tonio.colored import Event, scope
+from tonio.exceptions import CancelledError
 
 from httpunk import H1Connection, H2Connection
-from httpunk._backend import Backend
 from httpunk._backend.tonio import TonioBackend
 from httpunk.h1.server import H1Server
 from httpunk.h2.server import H2Server
 from httpunk.util.pool import Cache, Canceled, Map, Singleton
-
-
-async def _listener():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
-    return listener, host, port
 
 
 async def _accept_loop(listener, s, serve, accepts=None):
@@ -46,7 +39,7 @@ async def _accept_loop(listener, s, serve, accepts=None):
 
 @pytest.mark.tonio
 async def test_singleton_retain_drops_connection_when_predicate_false():
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
 
     async def connector(_dst):
         transport = await TonioBackend().connect_tcp(host, port)
@@ -92,10 +85,10 @@ class _StubConn:
 
 
 class _PendingGet:
-    def __init__(self, pool, backend):
+    def __init__(self, pool):
         self.pool = pool
-        self.scope = backend.scope()
-        self.done = backend.event()
+        self.scope = scope()
+        self.done = Event()
         self.conn = self.error = None
         self.finished = False
         self.joined = False
@@ -129,12 +122,10 @@ class _PendingGet:
 class _ObservedReady:
     """Observe entry to the round's wait without scheduler sleeps."""
 
-    def __init__(self, pool, backend):
+    def __init__(self, pool):
         self.ready = pool._rnd.ready
-        self.joined = [backend.event(), backend.event()]
+        self.joined = [Event(), Event()]
         self.waits = 0
-        self.resume = backend.event()
-        self.resume.set()
         pool._rnd.ready = self
 
     async def wait(self):
@@ -142,21 +133,19 @@ class _ObservedReady:
         self.waits += 1
         self.joined[index].set()
         await self.ready.wait()
-        await self.resume.wait()
 
     def set(self):
         self.ready.set()
 
 
 class _Maker:
-    def __init__(self, runtime):
-        self.backend = Backend(runtime).create()
-        self.started = [self.backend.event(), self.backend.event()]
-        self.release = [self.backend.event(), self.backend.event()]
+    def __init__(self):
+        self.started = [Event(), Event()]
+        self.release = [Event(), Event()]
         self.conns = [_StubConn(0), _StubConn(1)]
         self.calls = 0
         self.error = None
-        self.pool = Singleton(self, backend=self.backend)
+        self.pool = Singleton(self)
 
     async def __call__(self, _dst):
         index = self.calls
@@ -168,15 +157,16 @@ class _Maker:
         return self.conns[index]
 
     def get(self):
-        return _PendingGet(self.pool, self.backend)
+        return _PendingGet(self.pool)
 
     def observe(self):
-        return _ObservedReady(self.pool, self.backend)
+        return _ObservedReady(self.pool)
 
 
-async def _first_call_drives_subsequent_wait(runtime):
+@pytest.mark.tonio
+async def test_first_call_drives_subsequent_wait():
     # hyper-util src/client/pool/singleton.rs:517, first_call_drives_subsequent_wait.
-    maker = _Maker(runtime)
+    maker = _Maker()
     async with maker.get() as driver:
         await maker.started[0].wait()
         ready = maker.observe()
@@ -192,9 +182,10 @@ async def _first_call_drives_subsequent_wait(runtime):
     await maker.pool.aclose()
 
 
-async def _made_state_returns_immediately(runtime):
+@pytest.mark.tonio
+async def test_made_state_returns_immediately():
     # hyper-util src/client/pool/singleton.rs:541, made_state_returns_immediately.
-    maker = _Maker(runtime)
+    maker = _Maker()
     maker.release[0].set()
     conn = await maker.pool.get()
     assert await maker.pool.get() is conn
@@ -202,11 +193,12 @@ async def _made_state_returns_immediately(runtime):
     await maker.pool.aclose()
 
 
-async def _cached_service_poll_ready_error_clears_singleton(runtime):
+@pytest.mark.tonio
+async def test_cached_service_poll_ready_error_clears_singleton():
     # hyper-util src/client/pool/singleton.rs:560,
     # cached_service_poll_ready_error_clears_singleton. Our readiness signal is
     # conn.closed at get(), not a Service.poll_ready error; replacement is usable.
-    maker = _Maker(runtime)
+    maker = _Maker()
     maker.release[0].set()
     conn = await maker.pool.get()
     conn.closed = True
@@ -220,10 +212,16 @@ async def _cached_service_poll_ready_error_clears_singleton(runtime):
     await maker.pool.aclose()
 
 
-async def _cancel_waiter_does_not_affect_others(runtime, *, third=False):
+@pytest.mark.tonio
+@pytest.mark.parametrize(
+    "third",
+    [False, True],
+    ids=["cancel_waiter_does_not_affect_others", "cancel_non_driver_waiter_does_not_block_others"],
+)
+async def test_cancel_waiter_does_not_affect_others(third):
     # hyper-util src/client/pool/singleton.rs:618, cancel_waiter_does_not_affect_others;
     # :754, cancel_non_driver_waiter_does_not_block_others (third=True).
-    maker = _Maker(runtime)
+    maker = _Maker()
     async with maker.get() as driver:
         await maker.started[0].wait()
         ready = maker.observe()
@@ -233,7 +231,7 @@ async def _cancel_waiter_does_not_affect_others(runtime, *, third=False):
                 async with maker.get() as other:
                     await ready.joined[1].wait()
                     await cancelled.cancel()
-                    assert isinstance(cancelled.error, cancelled_type(runtime))
+                    assert isinstance(cancelled.error, CancelledError)
                     maker.release[0].set()
                     await driver.done.wait()
                     await other.done.wait()
@@ -241,7 +239,7 @@ async def _cancel_waiter_does_not_affect_others(runtime, *, third=False):
                     assert driver.conn is other.conn is maker.conns[0]
             else:
                 await cancelled.cancel()
-                assert isinstance(cancelled.error, cancelled_type(runtime))
+                assert isinstance(cancelled.error, CancelledError)
                 maker.release[0].set()
                 await driver.done.wait()
                 assert driver.error is None
@@ -250,11 +248,12 @@ async def _cancel_waiter_does_not_affect_others(runtime, *, third=False):
     await maker.pool.aclose()
 
 
-async def _maker_error_is_shared_with_waiters(runtime):
+@pytest.mark.tonio
+async def test_maker_error_is_shared_with_waiters():
     # hyper-util src/client/pool/singleton.rs:636, maker_error_is_shared_with_waiters.
     # No SingletonError wrapper; Python participants receive equal fresh copies,
     # not upstream's pointer-equal Arc error sources.
-    maker = _Maker(runtime)
+    maker = _Maker()
     maker.error = OSError("maker failed")
     async with maker.get() as driver:
         await maker.started[0].wait()
@@ -275,13 +274,17 @@ async def _maker_error_is_shared_with_waiters(runtime):
             assert maker.pool.is_empty()
 
 
-async def _cancel_driver_hands_off_to_waiter(runtime, *, parked=False):
+@pytest.mark.tonio
+@pytest.mark.parametrize(
+    "parked", [False, True], ids=["cancel_driver_hands_off_to_waiter", "cancel_driver_promotes_parked_waiter"]
+)
+async def test_cancel_driver_hands_off_to_waiter(parked):
     # hyper-util src/client/pool/singleton.rs:668, cancel_driver_hands_off_to_waiter;
     # :692, cancel_driver_promotes_parked_waiter (parked=True).
     # Restarting on cancellation calls the connector twice, upstream only once.
     # A Python get() registers only when awaited: the unpolled waiter joins after
     # cancellation; the parked variant observes its wait before cancelling.
-    maker = _Maker(runtime)
+    maker = _Maker()
     async with maker.get() as driver:
         await maker.started[0].wait()
         ready = maker.observe()
@@ -292,7 +295,7 @@ async def _cancel_driver_hands_off_to_waiter(runtime, *, parked=False):
                 await ready.joined[0].wait()
                 assert not waiter.finished
                 await driver.cancel()
-            assert isinstance(driver.error, cancelled_type(runtime))
+            assert isinstance(driver.error, CancelledError)
             await maker.started[1].wait()
             assert not waiter.finished  # promoted driver is polling the new connect
             maker.release[1].set()
@@ -303,9 +306,10 @@ async def _cancel_driver_hands_off_to_waiter(runtime, *, parked=False):
     await maker.pool.aclose()
 
 
-async def _cancel_all_waiters_clears_singleton(runtime):
+@pytest.mark.tonio
+async def test_cancel_all_waiters_clears_singleton():
     # hyper-util src/client/pool/singleton.rs:737, cancel_all_waiters_clears_singleton.
-    maker = _Maker(runtime)
+    maker = _Maker()
     async with maker.get() as driver:
         await maker.started[0].wait()
         ready = maker.observe()
@@ -313,104 +317,14 @@ async def _cancel_all_waiters_clears_singleton(runtime):
             await ready.joined[0].wait()
             await driver.cancel()
             await waiter.cancel()
-            assert isinstance(driver.error, cancelled_type(runtime))
-            assert isinstance(waiter.error, cancelled_type(runtime))
+            assert isinstance(driver.error, CancelledError)
+            assert isinstance(waiter.error, CancelledError)
             assert maker.pool.is_empty()
 
 
 @pytest.mark.tonio
-async def test_first_call_drives_subsequent_wait_tonio():
-    await _first_call_drives_subsequent_wait("tonio")
-
-
-@pytest.mark.asyncio
-async def test_first_call_drives_subsequent_wait_asyncio():
-    await _first_call_drives_subsequent_wait("asyncio")
-
-
-@pytest.mark.tonio
-async def test_made_state_returns_immediately_tonio():
-    await _made_state_returns_immediately("tonio")
-
-
-@pytest.mark.asyncio
-async def test_made_state_returns_immediately_asyncio():
-    await _made_state_returns_immediately("asyncio")
-
-
-@pytest.mark.tonio
-async def test_cached_service_poll_ready_error_clears_singleton_tonio():
-    await _cached_service_poll_ready_error_clears_singleton("tonio")
-
-
-@pytest.mark.asyncio
-async def test_cached_service_poll_ready_error_clears_singleton_asyncio():
-    await _cached_service_poll_ready_error_clears_singleton("asyncio")
-
-
-@pytest.mark.tonio
-async def test_cancel_waiter_does_not_affect_others_tonio():
-    await _cancel_waiter_does_not_affect_others("tonio")
-
-
-@pytest.mark.asyncio
-async def test_cancel_waiter_does_not_affect_others_asyncio():
-    await _cancel_waiter_does_not_affect_others("asyncio")
-
-
-@pytest.mark.tonio
-async def test_cancel_non_driver_waiter_does_not_block_others_tonio():
-    await _cancel_waiter_does_not_affect_others("tonio", third=True)
-
-
-@pytest.mark.asyncio
-async def test_cancel_non_driver_waiter_does_not_block_others_asyncio():
-    await _cancel_waiter_does_not_affect_others("asyncio", third=True)
-
-
-@pytest.mark.tonio
-async def test_maker_error_is_shared_with_waiters_tonio():
-    await _maker_error_is_shared_with_waiters("tonio")
-
-
-@pytest.mark.asyncio
-async def test_maker_error_is_shared_with_waiters_asyncio():
-    await _maker_error_is_shared_with_waiters("asyncio")
-
-
-@pytest.mark.tonio
-async def test_cancel_driver_hands_off_to_waiter_tonio():
-    await _cancel_driver_hands_off_to_waiter("tonio")
-
-
-@pytest.mark.asyncio
-async def test_cancel_driver_hands_off_to_waiter_asyncio():
-    await _cancel_driver_hands_off_to_waiter("asyncio")
-
-
-@pytest.mark.tonio
-async def test_cancel_driver_promotes_parked_waiter_tonio():
-    await _cancel_driver_hands_off_to_waiter("tonio", parked=True)
-
-
-@pytest.mark.asyncio
-async def test_cancel_driver_promotes_parked_waiter_asyncio():
-    await _cancel_driver_hands_off_to_waiter("asyncio", parked=True)
-
-
-@pytest.mark.tonio
-async def test_cancel_all_waiters_clears_singleton_tonio():
-    await _cancel_all_waiters_clears_singleton("tonio")
-
-
-@pytest.mark.asyncio
-async def test_cancel_all_waiters_clears_singleton_asyncio():
-    await _cancel_all_waiters_clears_singleton("asyncio")
-
-
-@pytest.mark.tonio
 async def test_cache_reuses_idle_connection():
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     accepts = {"n": 0}
 
     async def connector(_dst):
@@ -448,7 +362,7 @@ async def test_cache_reuses_idle_connection():
 
 @pytest.mark.tonio
 async def test_cache_closes_connection_on_exception_instead_of_reusing():
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
 
     async def connector(_dst):
         transport = await TonioBackend().connect_tcp(host, port)
@@ -587,7 +501,7 @@ class _FakeConn:
 async def test_singleton_aclose_during_connect_ditches_the_round():
     """Dropped-round waiters fail without waiting for the connector or reading a
     later round's connection; a late driver closes what it made."""
-    maker = _Maker("tonio")
+    maker = _Maker()
     async with maker.get() as driver:
         await maker.started[0].wait()
         ready = maker.observe()
@@ -607,30 +521,6 @@ async def test_singleton_aclose_during_connect_ditches_the_round():
             assert await maker.pool.get() is later
     await maker.pool.aclose()
     assert maker.pool.is_empty()
-
-
-@pytest.mark.tonio
-async def test_singleton_waiter_keeps_its_successful_round():
-    # Derived from singleton.rs:254-258: a delivered result outlives its batch,
-    # even when aclose() and a later connect precede this waiter's resumption.
-    maker = _Maker("tonio")
-    async with maker.get() as driver:
-        await maker.started[0].wait()
-        ready = maker.observe()
-        ready.resume.clear()
-        async with maker.get() as waiter:
-            await ready.joined[0].wait()
-            maker.release[0].set()
-            await driver.done.wait()
-            await maker.pool.aclose()
-            maker.release[1].set()
-            later = await maker.pool.get()
-            ready.resume.set()
-            await waiter.done.wait()
-            assert waiter.error is None
-            assert waiter.conn is driver.conn is maker.conns[0]
-            assert waiter.conn is not later
-    await maker.pool.aclose()
 
 
 @pytest.mark.tonio

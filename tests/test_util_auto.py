@@ -6,10 +6,9 @@ server (the replayed preface / request line parses correctly).
 """
 
 import pytest
-from _client import open_h1, open_h2
+from _net import listen, open_h1, open_h2
 from _transport import StubStream
 from tonio.colored import Event, scope
-from tonio.colored.net import open_tcp_listeners
 
 from httpunk.h1.server import H1Server
 from httpunk.h2.connection import PREFACE
@@ -45,12 +44,6 @@ class _ScriptedTransport(StubStream):  # `StubStream`: the tonio stream surface 
 
     def close(self):
         self.closed = True
-
-
-async def _listener():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
-    return listener, host, port
 
 
 # ----- unit: protocol detection -----
@@ -215,7 +208,7 @@ async def test_prime_rejects_a_non_preface():
 
 @pytest.mark.tonio
 async def test_auto_serves_h2_client_end_to_end():
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     picked = {}
 
     async def server_side():
@@ -237,7 +230,7 @@ async def test_auto_serves_h2_client_end_to_end():
 
 @pytest.mark.tonio
 async def test_auto_serves_h1_client_end_to_end():
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     picked = {}
 
     async def server_side():

@@ -27,10 +27,11 @@ except ImportError:
 _gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
 TONIO_OK = _tonio_installed and not _gil_enabled
 
-# A test module needs tonio if it imports it or constructs `TonioBackend` (matched on
+# A test module needs tonio if it imports it (directly or through the `_net` helpers)
+# or constructs `TonioBackend` (matched on
 # source so new files need no registration; `AutoServerProtocol` etc. mention "tonio"
 # only in prose, which these patterns don't hit).
-_NEEDS_TONIO = re.compile(r"from tonio|import tonio|_backend\.tonio|\bTonioBackend\b")
+_NEEDS_TONIO = re.compile(r"from tonio|import tonio|_backend\.tonio|\bTonioBackend\b|from _net import")
 
 
 def pytest_ignore_collect(collection_path, config):

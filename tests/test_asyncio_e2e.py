@@ -14,6 +14,7 @@ import trustme
 from httpunk import H1Connection, H2Connection, HTTPunkError
 from httpunk._backend.asyncio import AsyncioBackend, _AsyncioStream
 from httpunk.h1.server import H1Server
+from httpunk.h2.connection import PREFACE
 from httpunk.h2.server import H2Server
 from httpunk.util import auto, connect
 from httpunk.util.graceful import GracefulShutdown
@@ -589,3 +590,106 @@ async def test_h2_graceful_drains_and_refuses_new():
         with pytest.raises(HTTPunkError):  # new work refused after shutdown (GoAway or ConnClosed)
             await conn.request("GET", "/")
         await conn.__aexit__(None, None, None)
+
+
+_HANG_GUARD = 5.0  # seconds, like the tonio tests' deadline
+
+
+class _HandshakeSpyStream(_AsyncioStream):
+    """`_AsyncioStream` recording the handshake's first read and write and counting
+    aborts; with `gate_write` the write parks until cancelled."""
+
+    gate_write = False
+
+    def __init__(self):
+        super().__init__()
+        self.read_started = asyncio.Event()
+        self.write_started = asyncio.Event()
+        self.aborts = 0
+
+    async def receive_some(self, max_bytes=65536):
+        self.read_started.set()
+        return await super().receive_some(max_bytes)
+
+    async def send_all(self, data):
+        self.write_started.set()
+        if self.gate_write:
+            await asyncio.get_running_loop().create_future()
+        await super().send_all(data)
+
+    def abort(self):
+        self.aborts += 1
+        super().abort()
+
+
+class _GatedWriteStream(_HandshakeSpyStream):
+    gate_write = True
+
+
+async def _enter(conn):
+    async with conn:
+        pytest.fail("the handshake cannot finish")
+
+
+async def _assert_eof(stream):
+    try:
+        while await stream.receive_some(65536):
+            pass
+    except ConnectionError:
+        pass  # an abort with unread bytes may be a reset rather than FIN
+
+
+@pytest.mark.asyncio
+async def test_h2_client_handshake_cancel_aborts_transport_and_pumps():
+    """The asyncio twin of test_handshake_abort.py's client cancel case."""
+    async with asyncio.timeout(_HANG_GUARD):  # a regression hangs: fail it instead
+        host, port, accept, listener = await _listen()
+        _transport, stream = await asyncio.get_running_loop().create_connection(_HandshakeSpyStream, host, port)
+        peer = await accept()
+        listener.close()
+        conn = H2Connection(stream, backend=AsyncioBackend())
+        entering = asyncio.ensure_future(_enter(conn))
+        preface = b""
+        while len(preface) < len(PREFACE):
+            preface += await peer.receive_some(65536)
+        assert preface.startswith(PREFACE)
+        await stream.read_started.wait()
+        entering.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await entering
+        await _assert_eof(peer)
+        assert stream.aborts == 1
+        assert conn.closed
+        error = conn._conn.conn_error()
+        assert error is not None
+        assert error.__traceback__ is None
+        # Join only: no close(), cancel, or extra signal can hide a leaked pump.
+        write = conn._conn.take_pump_handle()
+        read = conn._conn.take_read_handle()
+        assert write is not None and read is not None
+        await write
+        await read
+        peer.close()
+
+
+@pytest.mark.asyncio
+async def test_h2_server_handshake_cancel_during_initial_flush_aborts_transport():
+    """The asyncio twin of test_handshake_abort.py's server cancel case."""
+    async with asyncio.timeout(_HANG_GUARD):  # a regression hangs: fail it instead
+        backend = AsyncioBackend()
+        host, port, accept, listener = await _listen(stream_cls=_GatedWriteStream)
+        peer = await backend.connect_tcp(host, port)
+        stream = await accept()
+        listener.close()
+        server = H2Server(stream, backend=backend)
+        entering = asyncio.ensure_future(_enter(server))
+        await stream.write_started.wait()
+        entering.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await entering
+        assert stream.aborts == 1
+        assert server._conn.is_closed()
+        assert server._conn.take_pump_handle() is None
+        assert server._conn.take_read_handle() is None
+        await _assert_eof(peer)
+        peer.close()

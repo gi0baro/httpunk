@@ -9,8 +9,8 @@ import ssl
 
 import pytest
 import trustme
+from _net import listen
 from tonio.colored import Event, scope
-from tonio.colored.net import open_tcp_listeners
 from tonio.colored.net.tls import TLSStream, open_tls_over_tcp_listeners
 from tonio.colored.time import time as _now
 from tonio.exceptions import CancelledError, ResourceBroken
@@ -177,8 +177,7 @@ class _Pair:
 
 
 async def _tcp_pair(s):
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     accepted, got = [], Event()
 
     async def accept():

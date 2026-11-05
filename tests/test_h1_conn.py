@@ -6,9 +6,8 @@ import asyncio
 import select
 
 import pytest
-from _client import open_h1
+from _net import h1_client_against, listen, open_h1, read_head, read_to_eof
 from tonio.colored import Event, scope, sleep
-from tonio.colored.net import open_tcp_listeners
 
 from httpunk import (
     Backend,
@@ -28,12 +27,9 @@ from httpunk.h1.client import Connection
 async def _read_request(stream):
     """Read one HTTP/1 request from `stream` — head + any Content-Length body.
     Returns `(head_bytes, body_bytes)` or None on EOF before a full head."""
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = await stream.receive_some(65536)
-        if not chunk:
-            return None
-        buf += chunk
+    buf = await read_head(stream)
+    if buf is None:
+        return None
     head, _, rest = buf.partition(b"\r\n\r\n")
     clen = 0
     for line in head.split(b"\r\n"):
@@ -48,72 +44,53 @@ async def _read_request(stream):
     return head, bytes(body)
 
 
-async def _serve(listener, responses, requests, done):
-    """Accept one connection; for each queued response, read a request and reply.
-    Records requests seen. Then drains until the client closes."""
-    try:
-        stream = await listener.accept()
+def _serve(responses, requests):
+    """A server for `h1_client_against`: for each queued response, read a request and
+    reply. Records requests seen. Then drains until the client closes."""
+
+    async def serve(stream):
         for resp in responses:
             req = await _read_request(stream)
             if req is None:
                 return
             requests.append(req)
             await stream.send_all(resp)
-        while await stream.receive_some(65536):
-            pass
-    finally:
-        done.set()
+        await read_to_eof(stream)
 
-
-async def _listener():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
-    return listener, host, port
+    return serve
 
 
 @pytest.mark.tonio
 async def test_get_content_length():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     resp = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [resp], requests, done))
-        async with open_h1(host, port) as conn:
-            # Low-level h1 conn: the caller supplies Host (like hyper's
-            # client::conn::http1; it is not auto-added).
-            r = await conn.request("GET", "/thing", headers={"host": f"{host}:{port}"})
-            assert r.status == 200
-            assert r.version is Version.HTTP_11  # a 1.1 peer
-            assert r.headers["content-type"] == b"text/plain"
-            assert await r.read() == b"hello"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([resp], requests)) as conn:
+        authority = conn._conn.authority
+        # Low-level h1 conn: the caller supplies Host (like hyper's
+        # client::conn::http1; it is not auto-added).
+        r = await conn.request("GET", "/thing", headers={"host": authority})
+        assert r.status == 200
+        assert r.version is Version.HTTP_11  # a 1.1 peer
+        assert r.headers["content-type"] == b"text/plain"
+        assert await r.read() == b"hello"
 
     head = requests[0][0]
     assert head.startswith(b"GET /thing HTTP/1.1\r\n")
-    assert f"host: {host}:{port}".encode() in head.lower()
+    assert f"host: {authority}".encode() in head.lower()
 
 
 @pytest.mark.tonio
 async def test_get_chunked():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
     resp = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [resp], requests, done))
-        async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/")
-            assert await r.read() == b"hello world"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([resp], [])) as conn:
+        r = await conn.request("GET", "/")
+        assert await r.read() == b"hello world"
 
 
 @pytest.mark.tonio
 async def test_chunked_trailers_surfaced():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
     # A chunked body followed by trailing headers (hyper delivers them as
     # Frame::trailers; we surface them on the response).
     resp = (
@@ -121,30 +98,20 @@ async def test_chunked_trailers_surfaced():
         b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n"
     )
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [resp], requests, done))
-        async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/")
-            assert await r.read() == b"hello"
-            assert r.trailers is not None
-            assert r.trailers["x-checksum"] == b"abc123"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([resp], [])) as conn:
+        r = await conn.request("GET", "/")
+        assert await r.read() == b"hello"
+        assert r.trailers is not None
+        assert r.trailers["x-checksum"] == b"abc123"
 
 
 @pytest.mark.tonio
 async def test_streaming_body_iter():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
     resp = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [resp], requests, done))
-        async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/")
-            chunks = [c async for c in r.aiter_bytes()]
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([resp], [])) as conn:
+        r = await conn.request("GET", "/")
+        chunks = [c async for c in r.aiter_bytes()]
 
     assert b"".join(chunks) == b"abcdef"
 
@@ -155,21 +122,16 @@ async def test_bodyless_response_frees_slot_without_read():
     it is returned — a caller that only inspects status/headers and never reads a
     (nonexistent) body must still be able to send the next request. Regression:
     the decoder was reporting is_complete=False at construction, so the slot leaked."""
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     r1 = b"HTTP/1.1 204 No Content\r\n\r\n"  # bodyless, keep-alive (1.1 default)
     r2 = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [r1, r2], requests, done))
-        async with open_h1(host, port) as conn:
-            resp1 = await conn.request("GET", "/a")
-            assert resp1.status == 204
-            # Deliberately do NOT read resp1 — there is no body. The connection
-            # must be reusable immediately, so this second request must not hang.
-            assert await (await conn.request("GET", "/b")).read() == b"hi"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([r1, r2], requests)) as conn:
+        resp1 = await conn.request("GET", "/a")
+        assert resp1.status == 204
+        # Deliberately do NOT read resp1 — there is no body. The connection
+        # must be reusable immediately, so this second request must not hang.
+        assert await (await conn.request("GET", "/b")).read() == b"hi"
 
     assert requests[0][0].startswith(b"GET /a ")
     assert requests[1][0].startswith(b"GET /b ")
@@ -177,18 +139,13 @@ async def test_bodyless_response_frees_slot_without_read():
 
 @pytest.mark.tonio
 async def test_keep_alive_two_requests():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     r1 = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
     r2 = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nbye"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [r1, r2], requests, done))
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a")).read() == b"ok"
-            assert await (await conn.request("GET", "/b")).read() == b"bye"  # same connection reused
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([r1, r2], requests)) as conn:
+        assert await (await conn.request("GET", "/a")).read() == b"ok"
+        assert await (await conn.request("GET", "/b")).read() == b"bye"  # same connection reused
 
     # both requests arrived on the one connection
     assert requests[0][0].startswith(b"GET /a ")
@@ -314,20 +271,15 @@ async def test_http10_downgrade_reasserts_keep_alive_by_value_appending_token():
     re-asserts keep-alive by VALUE (not mere header presence), APPENDING it to a
     non-keep-alive Connection token that stays on the wire — hyper conn.rs
     `fix_keep_alive` (L672-697, #4196)."""
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     r1 = b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 2\r\n\r\nok"
     r2 = b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 3\r\n\r\nbye"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [r1, r2], requests, done))
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
-            # r2 carries a custom Connection token; the downgrade must still re-assert
-            # keep-alive (a presence-check would leave it, so the server would close).
-            assert await (await conn.request("GET", "/b", headers={"connection": "x-foo"})).read() == b"bye"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([r1, r2], requests)) as conn:
+        assert await (await conn.request("GET", "/a")).read() == b"ok"  # 1.0 keep-alive → reused + downgrade
+        # r2 carries a custom Connection token; the downgrade must still re-assert
+        # keep-alive (a presence-check would leave it, so the server would close).
+        assert await (await conn.request("GET", "/b", headers={"connection": "x-foo"})).read() == b"bye"
 
     r2_lines = requests[1][0].lower().split(b"\r\n")
     assert r2_lines[0] == b"get /b http/1.0"
@@ -340,42 +292,25 @@ async def test_http10_downgrade_reasserts_keep_alive_by_value_appending_token():
 
 @pytest.mark.tonio
 async def test_connection_close_refuses_reuse():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
     resp = b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nhi"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [resp], requests, done))
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/")).read() == b"hi"
-            with pytest.raises(HTTPunkError):  # ConnectionClosedError: server said Connection: close
-                await conn.request("GET", "/again")
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([resp], [])) as conn:
+        assert await (await conn.request("GET", "/")).read() == b"hi"
+        with pytest.raises(HTTPunkError):  # ConnectionClosedError: server said Connection: close
+            await conn.request("GET", "/again")
 
 
 @pytest.mark.tonio
 async def test_close_delimited_body():
-    listener, host, port = await _listener()
-    done = Event()
+    async def server(stream):
+        await _read_request(stream)
+        # no content-length, no chunked, Connection: close -> body ends at EOF
+        await stream.send_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nbody-until-eof")
+        stream.close()
 
-    async def server():
-        try:
-            stream = await listener.accept()
-            await _read_request(stream)
-            # no content-length, no chunked, Connection: close -> body ends at EOF
-            await stream.send_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nbody-until-eof")
-            stream.close()
-        finally:
-            done.set()
-
-    async with scope() as s:
-        s.spawn(server())
-        async with open_h1(host, port) as conn:
-            r = await conn.request("GET", "/")
-            assert await r.read() == b"body-until-eof"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(server) as conn:
+        r = await conn.request("GET", "/")
+        assert await r.read() == b"body-until-eof"
 
 
 @pytest.mark.tonio
@@ -384,36 +319,20 @@ async def test_early_response_during_upload():
     auth) and stops reading must not deadlock the client. hyper interleaves reads
     and writes, so the early response is delivered even while a large body is
     still being written (dispatch.rs `poll_loop`)."""
-    listener, host, port = await _listener()
-    done = Event()
 
-    async def server():
-        try:
-            stream = await listener.accept()
-            # Read only the request head, then answer early and stop reading the
-            # (large) body — the client's write would block on a full send buffer.
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = await stream.receive_some(65536)
-                if not chunk:
-                    return
-                buf += chunk
-            await stream.send_all(
-                b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 3\r\n\r\nbig"
-            )
-            stream.close()
-        finally:
-            done.set()
+    async def server(stream):
+        # Read only the request head, then answer early and stop reading the
+        # (large) body — the client's write would block on a full send buffer.
+        if await read_head(stream) is None:
+            return
+        await stream.send_all(b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 3\r\n\r\nbig")
+        stream.close()
 
-    async with scope() as s:
-        s.spawn(server())
-        async with open_h1(host, port) as conn:
-            big = b"x" * (5 * 1024 * 1024)  # larger than the socket send buffer
-            r = await conn.request("POST", "/upload", headers={"host": f"{host}:{port}"}, body=big)
-            assert r.status == 413
-            assert await r.read() == b"big"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(server) as conn:
+        big = b"x" * (5 * 1024 * 1024)  # larger than the socket send buffer
+        r = await conn.request("POST", "/upload", headers={"host": conn._conn.authority}, body=big)
+        assert r.status == 413
+        assert await r.read() == b"big"
 
 
 @pytest.mark.tonio
@@ -425,16 +344,11 @@ async def test_early_response_does_not_truncate_upload():
     cannot release the slot (and cancel the writer) until the upload has completed;
     the old behavior cancelled the writer at head-arrival, so the server's drain would
     hang forever waiting for bytes that were never sent."""
-    listener, host, port = await _listener()
-    done = Event()
     body = b"x" * (5 * 1024 * 1024)  # > the socket send buffer, so the writer is mid-send
     received = {}
 
-    async def server():
-        stream = await listener.accept()
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            buf += await stream.receive_some(65536)
+    async def server(stream):
+        buf = await read_head(stream)
         await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n")  # early HEAD only
         drained = len(buf.split(b"\r\n\r\n", 1)[1])
         while drained < len(body):
@@ -442,16 +356,11 @@ async def test_early_response_does_not_truncate_upload():
         received["n"] = drained
         await stream.send_all(b"ok")  # only now can the client's r.read() complete
         stream.close()
-        done.set()
 
-    async with scope() as s:
-        s.spawn(server())
-        async with open_h1(host, port) as conn:
-            r = await conn.request("POST", "/up", headers={"host": f"{host}:{port}"}, body=body)
-            assert r.status == 200
-            assert await r.read() == b"ok"  # completes only after the full body was drained
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(server) as conn:
+        r = await conn.request("POST", "/up", headers={"host": conn._conn.authority}, body=body)
+        assert r.status == 200
+        assert await r.read() == b"ok"  # completes only after the full body was drained
     assert received["n"] == len(body)  # the upload was NOT truncated at head-arrival
 
 
@@ -461,18 +370,14 @@ async def test_101_upgrade_tunnel():
     an `H1Upgraded` the caller drives directly (hyper `Upgraded`). Bytes the server
     sent right after the 101 head are delivered first, then the tunnel echoes.
     The transport must survive the connection's `async with` exit."""
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     done = Event()
 
     async def server():
         try:
             stream = await listener.accept()
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = await stream.receive_some(65536)
-                if not chunk:
-                    return
-                buf += chunk
+            if await read_head(stream) is None:
+                return
             # 101 + immediately some upgraded-protocol bytes (become `leftover`).
             await stream.send_all(
                 b"HTTP/1.1 101 Switching Protocols\r\nupgrade: myproto\r\nconnection: upgrade\r\n\r\nHELLO"
@@ -507,39 +412,25 @@ async def test_101_upgrade_tunnel():
 async def test_connect_tunnel():
     """A 2xx to a CONNECT request is a tunnel: the response is an upgrade and the
     transport is handed off as an `H1Upgraded`."""
-    listener, host, port = await _listener()
-    done = Event()
 
-    async def server():
-        try:
-            stream = await listener.accept()
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = await stream.receive_some(65536)
-                if not chunk:
-                    return
-                buf += chunk
-            assert buf.startswith(b"CONNECT example.com:443 HTTP/1.1\r\n")
-            await stream.send_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            while True:
-                data = await stream.receive_some(65536)
-                if not data:
-                    break
-                await stream.send_all(data[::-1])  # echo reversed
-        finally:
-            done.set()
+    async def server(stream):
+        if (buf := await read_head(stream)) is None:
+            return
+        assert buf.startswith(b"CONNECT example.com:443 HTTP/1.1\r\n")
+        await stream.send_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        while True:
+            data = await stream.receive_some(65536)
+            if not data:
+                break
+            await stream.send_all(data[::-1])  # echo reversed
 
-    async with scope() as s:
-        s.spawn(server())
-        async with open_h1(host, port) as conn:
-            resp = await conn.request("CONNECT", "example.com:443", headers={"host": "example.com:443"})
-            assert resp.status == 200
-            assert resp.is_upgrade
-            async with resp.upgraded as up:
-                await up.send_all(b"abc")
-                assert await up.receive_some() == b"cba"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(server) as conn:
+        resp = await conn.request("CONNECT", "example.com:443", headers={"host": "example.com:443"})
+        assert resp.status == 200
+        assert resp.is_upgrade
+        async with resp.upgraded as up:
+            await up.send_all(b"abc")
+            assert await up.receive_some() == b"cba"
 
 
 @pytest.mark.tonio
@@ -548,18 +439,14 @@ async def test_upgraded_downcast_takes_io_and_read_buf():
     the backend's stream plus the bytes read past the head, and the handle is spent —
     reads/writes on it raise, a second downcast raises, `aclose` no longer touches the
     transport (the caller owns it now)."""
-    listener, host, port = await _listener()
+    listener, host, port = await listen()
     done = Event()
 
     async def server():
         try:
             stream = await listener.accept()
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = await stream.receive_some(65536)
-                if not chunk:
-                    return
-                buf += chunk
+            if await read_head(stream) is None:
+                return
             await stream.send_all(b"HTTP/1.1 200 Connection Established\r\n\r\nHELLO")  # 200 + tunnel bytes
             while True:
                 data = await stream.receive_some(65536)
@@ -592,18 +479,13 @@ async def test_upgraded_downcast_takes_io_and_read_buf():
 
 @pytest.mark.tonio
 async def test_post_request_body():
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     resp = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [resp], requests, done))
-        async with open_h1(host, port) as conn:
-            r = await conn.request("POST", "/submit", body=b"payload!")
-            assert r.status == 200
-            assert await r.read() == b""
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([resp], requests)) as conn:
+        r = await conn.request("POST", "/submit", body=b"payload!")
+        assert r.status == 200
+        assert await r.read() == b""
 
     head, body = requests[0]
     assert head.startswith(b"POST /submit HTTP/1.1\r\n")
@@ -617,19 +499,14 @@ async def test_http10_keepalive_peer_downgrades_next_request():
     downgrades subsequent requests on the reused connection to HTTP/1.0 and
     re-asserts Connection: keep-alive — hyper's enforce_version / fix_keep_alive
     (conn.rs L672-709). The first request (peer unknown) stays HTTP/1.1."""
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     r10 = b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok"
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [r10, r10], requests, done))
-        async with open_h1(host, port) as conn:
-            resp = await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})
-            assert resp.version is Version.HTTP_10  # the peer's version is public (hyper `Response::version()`)
-            assert await resp.read() == b"ok"
-            assert await (await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})).read() == b"ok"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([r10, r10], requests)) as conn:
+        resp = await conn.request("GET", "/a", headers={"host": conn._conn.authority})
+        assert resp.version is Version.HTTP_10  # the peer's version is public (hyper `Response::version()`)
+        assert await resp.read() == b"ok"
+        assert await (await conn.request("GET", "/b", headers={"host": conn._conn.authority})).read() == b"ok"
 
     assert requests[0][0].startswith(b"GET /a HTTP/1.1\r\n")  # peer unknown → 1.1
     assert requests[1][0].startswith(b"GET /b HTTP/1.0\r\n")  # downgraded after the 1.0 response
@@ -643,29 +520,18 @@ async def test_unexpected_bytes_past_body_poison_connection():
     hyper `require_empty_read` -> `new_unexpected_message` (conn.rs L465-468) —
     rather than silently drop the extra bytes and reuse a corrupted stream.
     The response itself is still delivered intact."""
-    listener, host, port = await _listener()
-    done = Event()
 
-    async def serve():
-        try:
-            stream = await listener.accept()
-            await _read_request(stream)
-            # a valid 2-byte response, then UNSOLICITED junk past the body
-            await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhiSURPRISE-JUNK")
-            while await stream.receive_some(65536):
-                pass
-        finally:
-            done.set()
+    async def serve(stream):
+        await _read_request(stream)
+        # a valid 2-byte response, then UNSOLICITED junk past the body
+        await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhiSURPRISE-JUNK")
+        await read_to_eof(stream)
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            r1 = await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})
-            assert await r1.read() == b"hi"  # the response is intact
-            with pytest.raises(H1UnexpectedMessageError):
-                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})  # connection poisoned
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        r1 = await conn.request("GET", "/a", headers={"host": conn._conn.authority})
+        assert await r1.read() == b"hi"  # the response is intact
+        with pytest.raises(H1UnexpectedMessageError):
+            await conn.request("GET", "/b", headers={"host": conn._conn.authority})  # connection poisoned
 
 
 @pytest.mark.tonio
@@ -677,41 +543,35 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
     by the pre-write `receive_nowait` check, which (like hyper's single poll loop)
     runs ahead of the write EVEN under scheduler starvation — already-delivered bytes
     are never misparsed as the next request's response."""
-    listener, host, port = await _listener()
     r1_read, junk_sent = Event(), Event()
 
-    async def serve():
-        stream = await listener.accept()
+    async def serve(stream):
         await _read_request(stream)
         await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
         await r1_read.wait()  # the client has fully consumed r1 — the connection is idle
         await stream.send_all(b"HTTP/1.1 500 unsolicited\r\n\r\n")  # junk into the idle socket
         junk_sent.set()
-        while await stream.receive_some(65536):
-            pass
+        await read_to_eof(stream)
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
-            r1_read.set()
-            await junk_sent.wait()  # the server wrote the junk...
-            # ...but its `send_all` returning does not put it in the client's socket
-            # buffer yet (loopback delivery is asynchronous, and slower under load):
-            # wait until the socket is readable — a non-consuming readiness poll — or the
-            # idle watcher already consumed it (the connection is then poisoned).
-            transport = conn._conn.transport_ref()
-            while transport is not None and not conn._conn.is_dead():
-                try:
-                    readable, _, _ = select.select([transport.socket._sock], [], [], 0)
-                except (ValueError, OSError):
-                    break  # the watcher consumed the junk and closed the socket under us: poisoned
-                if readable:
-                    break
-                await sleep(0)
-            with pytest.raises(H1UnexpectedMessageError):
-                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        assert await (await conn.request("GET", "/a", headers={"host": conn._conn.authority})).read() == b"ok"
+        r1_read.set()
+        await junk_sent.wait()  # the server wrote the junk...
+        # ...but its `send_all` returning does not put it in the client's socket
+        # buffer yet (loopback delivery is asynchronous, and slower under load):
+        # wait until the socket is readable — a non-consuming readiness poll — or the
+        # idle watcher already consumed it (the connection is then poisoned).
+        transport = conn._conn.transport_ref()
+        while transport is not None and not conn._conn.is_dead():
+            try:
+                readable, _, _ = select.select([transport.socket._sock], [], [], 0)
+            except (ValueError, OSError):
+                break  # the watcher consumed the junk and closed the socket under us: poisoned
+            if readable:
+                break
+            await sleep(0)
+        with pytest.raises(H1UnexpectedMessageError):
+            await conn.request("GET", "/b", headers={"host": conn._conn.authority})
 
 
 @pytest.mark.tonio
@@ -722,32 +582,27 @@ async def test_idle_fin_closes_connection_promptly():
     is really closed (no CLOSE_WAIT parking — the task drops its io, dispatch.rs
     L152-160), and the next send_request raises `ConnectionClosedError` carrying
     `request_unsent` (hyper's TrySendError give-back, client/conn/http1.rs L261-281)."""
-    listener, host, port = await _listener()
     r1_read = Event()
 
-    async def serve():
-        stream = await listener.accept()
+    async def serve(stream):
         await _read_request(stream)
         await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
         await r1_read.wait()  # the client fully consumed r1 — the connection is parked
         stream.close()  # FIN into the idle connection
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
-            r1_read.set()
-            for _ in range(400):  # bounded wait — no send may be needed to notice
-                if conn.closed:
-                    break
-                await sleep(0.005)
-            assert conn.closed
-            assert conn._conn.error is None  # clean close, not an error
-            assert conn._conn.transport_ref() is None  # socket closed NOW, not at next use
-            with pytest.raises(HTTPunkError) as excinfo:
-                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
-            assert getattr(excinfo.value, "request_unsent", False) is True
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        assert await (await conn.request("GET", "/a", headers={"host": conn._conn.authority})).read() == b"ok"
+        r1_read.set()
+        for _ in range(400):  # bounded wait — no send may be needed to notice
+            if conn.closed:
+                break
+            await sleep(0.005)
+        assert conn.closed
+        assert conn._conn.error is None  # clean close, not an error
+        assert conn._conn.transport_ref() is None  # socket closed NOW, not at next use
+        with pytest.raises(HTTPunkError) as excinfo:
+            await conn.request("GET", "/b", headers={"host": conn._conn.authority})
+        assert getattr(excinfo.value, "request_unsent", False) is True
 
 
 @pytest.mark.tonio
@@ -757,33 +612,27 @@ async def test_idle_stray_bytes_poison_promptly():
     (hyper `new_unexpected_message`, conn.rs L486-490 — the errored task drops its
     io), and the next send_request raises the recorded error with `request_unsent`
     set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L723-739)."""
-    listener, host, port = await _listener()
     r1_read = Event()
 
-    async def serve():
-        stream = await listener.accept()
+    async def serve(stream):
         await _read_request(stream)
         await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
         await r1_read.wait()
         await stream.send_all(b"HTTP/1.1 500 unsolicited\r\n\r\n")  # junk into the parked conn
-        while await stream.receive_some(65536):  # drains to EOF once the watcher closes
-            pass
+        await read_to_eof(stream)  # drains to EOF once the watcher closes
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            assert await (await conn.request("GET", "/a", headers={"host": f"{host}:{port}"})).read() == b"ok"
-            r1_read.set()
-            for _ in range(400):  # bounded wait — the watcher must poison with no send
-                if conn.closed:
-                    break
-                await sleep(0.005)
-            assert conn.closed
-            assert isinstance(conn._conn.error, H1UnexpectedMessageError)
-            with pytest.raises(H1UnexpectedMessageError) as excinfo:
-                await conn.request("GET", "/b", headers={"host": f"{host}:{port}"})
-            assert getattr(excinfo.value, "request_unsent", False) is True
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        assert await (await conn.request("GET", "/a", headers={"host": conn._conn.authority})).read() == b"ok"
+        r1_read.set()
+        for _ in range(400):  # bounded wait — the watcher must poison with no send
+            if conn.closed:
+                break
+            await sleep(0.005)
+        assert conn.closed
+        assert isinstance(conn._conn.error, H1UnexpectedMessageError)
+        with pytest.raises(H1UnexpectedMessageError) as excinfo:
+            await conn.request("GET", "/b", headers={"host": conn._conn.authority})
+        assert getattr(excinfo.value, "request_unsent", False) is True
 
 
 @pytest.mark.tonio
@@ -791,20 +640,15 @@ async def test_unsent_marker_absent_once_write_begins():
     """The `request_unsent` boundary: once the request is handed to the writer, a
     failure must NOT carry the marker — hyper returns `message: None` after the
     dispatcher takes the request, even if nothing was flushed to the wire."""
-    listener, host, port = await _listener()
 
-    async def serve():
-        stream = await listener.accept()
+    async def serve(stream):
         await _read_request(stream)  # the request was written — past the boundary
         stream.close()  # kill the connection with no response
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            with pytest.raises(HTTPunkError) as excinfo:
-                await conn.request("GET", "/", headers={"host": f"{host}:{port}"})
-            assert getattr(excinfo.value, "request_unsent", False) is False
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        with pytest.raises(HTTPunkError) as excinfo:
+            await conn.request("GET", "/", headers={"host": conn._conn.authority})
+        assert getattr(excinfo.value, "request_unsent", False) is False
 
 
 @pytest.mark.tonio
@@ -812,7 +656,6 @@ async def test_body_iterable_error_fails_promptly():
     """A request body iterable that raises mid-upload fails send_request PROMPTLY with
     that error, instead of the error being swallowed / hanging on the response head
     until the server times out."""
-    listener, host, port = await _listener()
 
     class _BoomError(Exception):
         pass
@@ -821,20 +664,15 @@ async def test_body_iterable_error_fails_promptly():
         yield b"chunk-1"
         raise _BoomError("body generator failed mid-upload")
 
-    async def serve():
+    async def serve(transport):
         # Read whatever arrives; NEVER respond (the request is incomplete). Without the
         # fix the client would hang here forever; with it, the client closes on the body
         # error and this drains to EOF.
-        transport = await listener.accept()
-        while await transport.receive_some(65536):
-            pass
+        await read_to_eof(transport)
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            with pytest.raises(_BoomError):
-                await conn.request("POST", "/", headers={"host": f"{host}:{port}"}, body=body())
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        with pytest.raises(_BoomError):
+            await conn.request("POST", "/", headers={"host": conn._conn.authority}, body=body())
 
 
 # ----- hyper error kinds on the client (0.3.0) -----
@@ -845,19 +683,14 @@ async def test_server_close_before_response_head_is_incomplete_message():
     """EOF while the response head is expected: hyper reports `IncompleteMessage` from
     parsing (io.rs L224-227, conn.rs L339-367) — a sibling of the io
     error kind, so `H1IncompleteMessageError`, not `ConnectionClosedError`."""
-    listener, host, port = await _listener()
 
-    async def serve():
-        stream = await listener.accept()
+    async def serve(stream):
         await _read_request(stream)
         stream.close()  # hang up without answering
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            with pytest.raises(H1IncompleteMessageError):
-                await conn.request("GET", "/", headers={"host": f"{host}:{port}"})
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        with pytest.raises(H1IncompleteMessageError):
+            await conn.request("GET", "/", headers={"host": conn._conn.authority})
 
 
 @pytest.mark.tonio
@@ -865,23 +698,18 @@ async def test_response_body_truncated_by_server_close_is_body_error():
     """The server closes mid-body: hyper's decoder `UnexpectedEof` (`IncompleteBody`)
     surfaces from the body stream as `Kind::Body` -> `H1BodyError(io_kind=
     "unexpected_eof")` out of `read()`; the connection is not reused."""
-    listener, host, port = await _listener()
 
-    async def serve():
-        stream = await listener.accept()
+    async def serve(stream):
         await _read_request(stream)
         await stream.send_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello")
         stream.close()
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            resp = await conn.request("GET", "/", headers={"host": f"{host}:{port}"})
-            with pytest.raises(H1BodyError) as ei:
-                await resp.read()
-            assert ei.value.args[0] == "unexpected_eof"
-            assert conn.closed
-        s.cancel()
+    async with h1_client_against(serve) as conn:
+        resp = await conn.request("GET", "/", headers={"host": conn._conn.authority})
+        with pytest.raises(H1BodyError) as ei:
+            await resp.read()
+        assert ei.value.args[0] == "unexpected_eof"
+        assert conn.closed
 
 
 @pytest.mark.tonio
@@ -889,28 +717,14 @@ async def test_request_body_short_of_content_length_is_user_error():
     """A streamed request body that ends short of its explicit `content-length`: the
     encoder's `NotEof` -> `User::BodyWriteAborted`. The writer fails promptly and
     `request()` raises the `H1UserError`; the connection is poisoned."""
-    listener, host, port = await _listener()
-    done = Event()
-
-    async def serve():
-        try:
-            stream = await listener.accept()
-            while await stream.receive_some(65536):  # read until the client closes
-                pass
-        finally:
-            done.set()
 
     async def body():
         yield b"abc"
 
-    async with scope() as s:
-        s.spawn(serve())
-        async with open_h1(host, port) as conn:
-            with pytest.raises(H1UserError) as ei:
-                await conn.request("POST", "/", headers={"host": f"{host}:{port}", "content-length": "10"}, body=body())
-            assert ei.value.args[0] == "body_write_aborted"
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(read_to_eof) as conn:  # the server reads until the client closes
+        with pytest.raises(H1UserError) as ei:
+            await conn.request("POST", "/", headers={"host": conn._conn.authority, "content-length": "10"}, body=body())
+        assert ei.value.args[0] == "body_write_aborted"
 
 
 @pytest.mark.tonio
@@ -927,19 +741,14 @@ async def test_request_connection_close_is_never_reused(connection_headers):
     and answers keep-alive: hyper 1.12.0 `encode_head` -> `connection_any_close` ->
     `disable_keep_alive` up front (previously reuse was derived from the response alone).
     The connection closes once the response is consumed."""
-    listener, host, port = await _listener()
-    requests, done = [], Event()
+    requests = []
     keep_alive_response = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"  # no `Connection: close`
 
-    async with scope() as s:
-        s.spawn(_serve(listener, [keep_alive_response], requests, done))
-        async with open_h1(host, port) as conn:
-            headers = HeaderMap([("host", f"{host}:{port}"), *connection_headers])
-            resp = await conn.request("GET", "/", headers=headers)
-            assert await resp.read() == b"ok"
-            assert conn.closed
-            with pytest.raises(HTTPunkError):
-                await conn.request("GET", "/again", headers={"host": f"{host}:{port}"})
-        await done.wait()
-        s.cancel()
+    async with h1_client_against(_serve([keep_alive_response], requests)) as conn:
+        headers = HeaderMap([("host", conn._conn.authority), *connection_headers])
+        resp = await conn.request("GET", "/", headers=headers)
+        assert await resp.read() == b"ok"
+        assert conn.closed
+        with pytest.raises(HTTPunkError):
+            await conn.request("GET", "/again", headers={"host": conn._conn.authority})
     assert len(requests) == 1

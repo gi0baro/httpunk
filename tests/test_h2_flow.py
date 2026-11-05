@@ -5,9 +5,8 @@ for WINDOW_UPDATEs before sending past them — so the recv path is exercised fo
 real."""
 
 import pytest
-from _client import open_h2
+from _net import H2Peer, listen, open_h2
 from tonio.colored import Event, scope, sleep
-from tonio.colored.net import open_tcp_listeners
 from tonio.colored.sync import Lock
 
 from httpunk import H2Reason, StreamResetError
@@ -19,13 +18,11 @@ from httpunk._httpunk import (
     H2Codec,
     H2FrameData as Data,
     H2FrameHeaders as Headers,
-    H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
     H2Streams,
 )
 from httpunk.exceptions import H2ProtocolError
 from httpunk.h2.client import Connection
-from httpunk.h2.connection import PREFACE
 from httpunk.h2.share import H2ResponseBody
 from httpunk.h2.stream import Stream
 from httpunk.http import HeaderMap
@@ -47,41 +44,23 @@ class _Server:
         self._slock = Lock()  # serialize socket writes
         self._window_evt = Event()
         self._conn_window = _DEFAULT_WINDOW  # raised by the client's initial WINDOW_UPDATE(0)
-        # The per-stream send window we may use toward the client = the client's
-        # advertised SETTINGS_INITIAL_WINDOW_SIZE (applied in `_process`), NOT the bare
-        # protocol default — else we'd under-send when the client advertises a larger
-        # window (e.g. hyper's 2 MB) and deadlock waiting for a WINDOW_UPDATE it has no
-        # reason to send.
-        self._client_initial_window = _DEFAULT_WINDOW
         self._stream_windows = {}
 
+    @property
+    def _client_initial_window(self):
+        # The per-stream send window we may use toward the client = the client's
+        # advertised SETTINGS_INITIAL_WINDOW_SIZE, NOT the bare protocol default — else
+        # we'd under-send when the client advertises a larger window (e.g. hyper's 2 MB)
+        # and deadlock waiting for a WINDOW_UPDATE it has no reason to send.
+        settings = self._peer.settings
+        if settings is None or settings.initial_window_size is None:
+            return _DEFAULT_WINDOW
+        return settings.initial_window_size
+
     async def serve(self, responder, reqscope):
-        self._stream = await self.listener.accept()
-        self._codec = H2Codec("server")
-        await self._send(self._codec.serialize_settings(**self.settings))
-
-        raw = b""
-        while len(raw) < len(PREFACE):
-            chunk = await self._stream.receive_some(65536)
-            if not chunk:
-                return
-            raw += chunk
-        assert raw[: len(PREFACE)] == PREFACE
-
-        await self._process(self._codec.receive(raw[len(PREFACE) :]), responder, reqscope)
-        while True:
-            chunk = await self._stream.receive_some(65536)
-            if not chunk:
-                break
-            await self._process(self._codec.receive(chunk), responder, reqscope)
-
-    async def _process(self, frames, responder, reqscope):
-        for f in frames:
-            if isinstance(f, Settings) and not f.ack:
-                if f.initial_window_size is not None:
-                    self._client_initial_window = f.initial_window_size  # streams the client will accept
-                await self._send(self._codec.serialize_settings_ack())
-            elif isinstance(f, WindowUpdate):
+        self._peer = await H2Peer.accept(self.listener, **self.settings)
+        while (f := await self._peer.recv()) is not None:
+            if isinstance(f, WindowUpdate):
                 self.window_updates += 1
                 async with self._wlock:
                     if f.stream_id == 0:
@@ -107,7 +86,7 @@ class _Server:
 
     async def _send(self, data):
         async with self._slock:
-            await self._stream.send_all(data)
+            await self._peer.send(data)
 
     async def _send_headers(self, sid, status, headers):
         # HPACK encoding mutates the encoder's dynamic table: encode order MUST equal
@@ -117,7 +96,7 @@ class _Server:
         # the peer a HEADERS that indexes a table entry it has not received yet
         # (`Hpack(InvalidTableIndex)`, a connection error).
         async with self._slock:
-            await self._stream.send_all(self._codec.serialize_response_headers(sid, status, headers))
+            await self._peer.send(self._peer.codec.serialize_response_headers(sid, status, headers))
 
     async def send_response(self, sid, body, *, status=200, chunk=16384):
         await self._send_headers(sid, status, HeaderMap([("content-type", b"text/plain")]))
@@ -137,9 +116,9 @@ class _Server:
                 )
                 self._conn_window -= n
                 self._stream_windows[sid] -= n
-            await self._send(self._codec.serialize_data(sid, body[offset : offset + n], end_stream=False))
+            await self._send(self._peer.codec.serialize_data(sid, body[offset : offset + n], end_stream=False))
             offset += n
-        await self._send(self._codec.serialize_data(sid, b"", end_stream=True))
+        await self._send(self._peer.codec.serialize_data(sid, b"", end_stream=True))
 
     def _available(self, sid):
         return min(self._conn_window, self._stream_windows.get(sid, self._client_initial_window))
@@ -147,8 +126,7 @@ class _Server:
 
 @pytest.mark.tonio
 async def test_streaming_large_body():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     server = _Server(listener)
     payload = bytes(3 * 1024 * 1024)  # > the client's 2 MB stream window -> requires WINDOW_UPDATEs
 
@@ -173,8 +151,7 @@ async def test_streaming_large_body():
 
 @pytest.mark.tonio
 async def test_multiplexing_two_streams():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     server = _Server(listener)
 
     async def responder(srv, sid):
@@ -212,8 +189,7 @@ async def test_multiplexing_two_streams():
 
 @pytest.mark.tonio
 async def test_max_concurrent_streams_gating():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     # Advertise a limit of 1: the client must not open a second stream until the
     # first has closed.
     server = _Server(listener, settings={"max_concurrent_streams": 1})
@@ -259,8 +235,7 @@ async def test_max_concurrent_streams_gating():
 
 @pytest.mark.tonio
 async def test_request_body_echo():
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     server = _Server(listener)
 
     async def responder(srv, sid):
@@ -293,29 +268,15 @@ async def test_reset_wakes_flow_blocked_sender():
     reset. Regression for the client `recv_reset` wakeup (a hang would trip the
     6s deadline). The peer advertises a tiny window, so the client sends its
     window-worth and parks, then the peer RSTs instead of sending WINDOW_UPDATE."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
 
     async def peer():
-        stream = await listener.accept()
-        codec = H2Codec("server")
-        await stream.send_all(codec.serialize_settings(initial_window_size=5))
-        raw = b""
-        while len(raw) < len(PREFACE):
-            raw += await stream.receive_some(65536)
-        data, rst_sent = raw[len(PREFACE) :], False
-        while True:
-            for f in codec.receive(data):
-                if isinstance(f, Settings) and not f.ack:
-                    await stream.send_all(codec.serialize_settings_ack())
-                elif isinstance(f, Data) and not rst_sent:
-                    # The client has sent its 5-byte window and is now parked
-                    # waiting for a WINDOW_UPDATE we never send — RST instead.
-                    await stream.send_all(codec.serialize_rst_stream(f.stream_id, int(H2Reason.CANCEL)))
-                    rst_sent = True
-            data = await stream.receive_some(65536)
-            if not data:
-                break
+        peer = await H2Peer.accept(listener, initial_window_size=5)
+        f = await peer.recv(Data)
+        # The client has sent its 5-byte window and is now parked
+        # waiting for a WINDOW_UPDATE we never send — RST instead.
+        await peer.send_rst_stream(f.stream_id, int(H2Reason.CANCEL))
+        await peer.frames()
 
     async with scope() as s:
         s.spawn(peer())
@@ -546,27 +507,15 @@ async def _flow_blocked_peer(listener, *, on_first_data, seen):
     """A raw h2c peer advertising a 5-byte stream window: the client queues 5 bytes of
     its body inline and parks the rest. `on_first_data(codec, sid)` decides what the
     peer sends back; `seen` collects the request body until END_STREAM."""
-    stream = await listener.accept()
-    codec = H2Codec("server")
-    await stream.send_all(codec.serialize_settings(initial_window_size=5))
-    raw = b""
-    while len(raw) < len(PREFACE):
-        raw += await stream.receive_some(65536)
-    data, first = raw[len(PREFACE) :], True
-    while True:
-        for f in codec.receive(data):
-            if isinstance(f, Settings) and not f.ack:
-                await stream.send_all(codec.serialize_settings_ack())
-            elif isinstance(f, Data):
-                seen.append(f.data)
-                if first:
-                    first = False
-                    await stream.send_all(on_first_data(codec, f.stream_id))
-                if f.end_stream:
-                    await stream.send_all(codec.serialize_response_headers(f.stream_id, 200, end_stream=True))
-        data = await stream.receive_some(65536)
-        if not data:
-            break
+    peer = await H2Peer.accept(listener, initial_window_size=5)
+    first = True
+    while (f := await peer.recv(Data)) is not None:
+        seen.append(f.data)
+        if first:
+            first = False
+            await peer.send(on_first_data(peer.codec, f.stream_id))
+        if f.end_stream:
+            await peer.send_response_headers(f.stream_id, 200, end_stream=True)
 
 
 @pytest.mark.tonio
@@ -574,8 +523,7 @@ async def test_buffered_request_body_is_queued_inline():
     """hyper `poll_pipe` polls the pipe once inline and only executes it if pending:
     a bytes body the windows take whole is queued by `send_request` itself — no
     background writer exists, only the two pump tasks."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     server = _Server(listener)
     spy = _SpyBackend()
 
@@ -596,8 +544,7 @@ async def test_flow_blocked_request_body_resumes_in_a_background_writer():
     """The inline attempt queues the 5-byte window and the remainder goes to ONE bare
     writer, which resumes at the right offset on WINDOW_UPDATE and ends on its own:
     afterwards the connection has no writer to wait for."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     spy, seen = _SpyBackend(), []
 
     def open_window(codec, sid):
@@ -622,8 +569,7 @@ async def test_close_waits_for_a_flow_blocked_writer():
     returns while the writer is parked on flow control. `close()` never cancels it
     (hyper's pipes are untracked): the connection's failure wakes it, it exits, and
     close() returns only after the last writer released its ref (`conn_drop_ref`)."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     spy, seen = _SpyBackend(), []
 
     def answer_early(codec, sid):

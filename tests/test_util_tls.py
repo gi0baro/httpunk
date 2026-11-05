@@ -8,8 +8,8 @@ import ssl
 
 import pytest
 import trustme
+from _net import listen, read_head
 from tonio.colored import Event, scope
-from tonio.colored.net import open_tcp_listeners
 from tonio.colored.net.tls import TLSStream, open_tls_over_tcp_listeners
 from tonio.exceptions import ResourceBroken
 
@@ -144,8 +144,7 @@ async def test_h1_client_orderly_close_sends_close_notify(ca):
 @pytest.mark.tonio
 async def test_http_cleartext_is_h1(ca):
     # No TLS, no ALPN -> h1 over plain TCP (h2c is out of scope, matching hyper-util).
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
 
     async def server_side():
         await _echo(await auto.serve(await listener.accept()))
@@ -236,23 +235,13 @@ async def test_h1_server_drains_small_unread_body_over_tls(ca):
 _CONNECT_OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 
 
-async def _read_head(stream):
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = await stream.receive_some(65536)
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
 async def _tunnel_origin(listener, server_ctx, errors):
     """A CONNECT proxy and the `https` origin behind it, in one: answer the CONNECT with
     200, then speak TLS on the SAME TCP connection (that is what a tunnel carries) and
     serve HTTP over it. Errors are recorded, never swallowed (see `_echo`'s caller)."""
     try:
         stream = await listener.accept()
-        head = await _read_head(stream)
+        head = await read_head(stream)
         assert head is not None and head.startswith(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n")
         await stream.send_all(_CONNECT_OK)
         tls = TLSStream(stream, server_ctx, server_side=True)
@@ -278,8 +267,7 @@ async def _connect_tunnel(backend, host, port):
 @pytest.mark.tonio
 async def test_wrap_tls_tunnel_alpn_h2(ca):
     """The origin's TLS runs inside the tunnel; ALPN picks h2 exactly as `connect_tls` would."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     errors = []
     backend = TonioBackend()
 
@@ -303,8 +291,7 @@ async def test_wrap_tls_tunnel_h1_keep_alive(ca):
     (the send-time peek before the second request runs on the wrapped stream — the
     `receive_nowait` TLS arm, the very path punkreq's own wrapper broke on) and the
     orderly close ending the server loop cleanly."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     errors = []
     backend = TonioBackend()
 
@@ -327,15 +314,14 @@ async def test_wrap_tls_tunnel_close_ends_reach_the_socket(ca):
     """hyper's two ends through the tunnel: the orderly close writes close_notify (the
     origin reads a clean EOF); the abortive `close_transport` closes the socket beneath
     the TLS layer with no alert (the origin's read breaks)."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     ends = []
     backend = TonioBackend()
 
     async def raw_origin(n):
         for _ in range(n):
             stream = await listener.accept()
-            assert await _read_head(stream) is not None  # the CONNECT
+            assert await read_head(stream) is not None  # the CONNECT
             await stream.send_all(_CONNECT_OK)
             tls = TLSStream(stream, _server_ctx(ca, ("http/1.1",)), server_side=True)
             await tls.handshake()
@@ -374,14 +360,13 @@ async def test_wrap_tls_prefix_feeds_the_handshake(ca):
     NOT consume the prefix would park waiting for a ServerHello; one that did fails on
     it at once (not a TLS record) — before the ClientHello ever leaves the egress BIO.
     The failure closes the socket: all the peer reads is EOF."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     ends = []
     backend = TonioBackend()
 
     async def silent_proxy():
         stream = await listener.accept()
-        assert await _read_head(stream) is not None
+        assert await read_head(stream) is not None
         await stream.send_all(_CONNECT_OK)
         ends.append(await stream.receive_some())  # the ClientHello would come here; only the close does
         stream.close()
@@ -403,14 +388,13 @@ async def test_wrap_tls_handshake_failure_closes_the_socket(ca):
     """A refused certificate: `connect_tls`'s error (`ResourceBroken` from the ssl
     error), and the socket beneath is closed before it propagates — the caller has no
     half-wrapped stream to tear down. The origin sees the alert, then EOF."""
-    listener = (await open_tcp_listeners(0, host="127.0.0.1"))[0]
-    host, port = listener.socket.getsockname()[:2]
+    listener, host, port = await listen()
     ends = []
     backend = TonioBackend()
 
     async def origin():
         stream = await listener.accept()
-        assert await _read_head(stream) is not None
+        assert await read_head(stream) is not None
         await stream.send_all(_CONNECT_OK)
         tls = TLSStream(stream, _server_ctx(ca, ("http/1.1",)), server_side=True)
         try:
