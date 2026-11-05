@@ -449,7 +449,8 @@ class H2ConnectionBase(H2Streams):
         future) at the app's own `await` or the flow-control wait — DATA is queued for
         the write pump, never written by this task, so no write is interrupted. The
         scope exit does not wait for a CANCELLED child to unwind, so wait for the pump's
-        own `done` (set in its `finally`, after the producer's cleanup ran)."""
+        own `done` (a cancelled pump sets it in its `finally`, after the producer's
+        cleanup ran; a finished one at its last frame, see `_pump_async_body`)."""
         backend = self.backend
         done, box = backend.event(), []
         abandoned = False
@@ -476,6 +477,12 @@ class H2ConnectionBase(H2Streams):
                 self._send_trailers(st, trailers)
             else:
                 await self._send_data(st, b"", end_stream=True)
+            # REGRESSION GUARD: `done` marks the final frame queued, not the generator close
+            # below: a reset landing in between would otherwise fail a finished response
+            # (hyper's `PipeToSendStream` is done in the poll that queues the final frame,
+            # proto/h2/mod.rs:183-184,241-242,252). The `finally` still sets it for the
+            # cancel and error paths; a finished pump is joined by the scope exit.
+            done.set()
         except Exception as exc:
             box.append(exc)
         finally:

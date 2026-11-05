@@ -16,6 +16,7 @@ import pytest
 
 try:
     from tonio.colored.time import timeout as _tonio_timeout
+    from tonio.exceptions import CancelledError as _TonioCancelledError
 
     _tonio_installed = True
 except ImportError:
@@ -54,6 +55,17 @@ if TONIO_OK:
 
     _TONIO_TEST_TIMEOUT = 6.0  # seconds; loopback tests finish in well under 1s
 
+    async def _carried(coro):
+        # tonio's `timeout` stores only an `Exception` outcome: any other BaseException
+        # (pytest's `fail`, or `raises` "DID NOT RAISE") leaves it empty and surfaces as a
+        # `TypeError` from its unpacking. Hand every outcome back as a value instead.
+        try:
+            return False, await coro
+        except _TonioCancelledError:
+            raise
+        except BaseException as exc:
+            return True, exc
+
     def pytest_collection_modifyitems(config, items):
         for item in items:
             if not isinstance(item, pytest.Function) or item.get_closest_marker("tonio") is None:
@@ -67,7 +79,7 @@ if TONIO_OK:
                 # tonio's `timeout` returns (result, completed): completed=False means
                 # the deadline hit — it aborts so `run_until_complete` returns instead
                 # of hanging the shared runtime forever.
-                result, completed = await _tonio_timeout(_orig(*args, **kwargs), _TONIO_TEST_TIMEOUT)
+                outcome, completed = await _tonio_timeout(_carried(_orig(*args, **kwargs)), _TONIO_TEST_TIMEOUT)
                 if not completed:
                     import gc
                     import types
@@ -86,7 +98,10 @@ if TONIO_OK:
                         f"tonio test {_name} exceeded {_TONIO_TEST_TIMEOUT}s (teardown hang?)\n"
                         f"suspended coroutines:\n  " + "\n  ".join(stuck or ["<none>"])
                     )
-                return result
+                raised, value = outcome
+                if raised:
+                    raise value
+                return value
 
             wrapped.__tonio_timeout_wrapped__ = True
             item.obj = wrapped

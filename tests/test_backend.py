@@ -265,6 +265,9 @@ async def test_receive_nowait_tls_abrupt_close_is_broken_transport(ca):
     async with scope() as s:
         pair = await _tls_pair(s, ca)
         try:
+            # The EAGAIN clears the readiness the handshake left set, so the wait below
+            # waits for the close instead of returning at once.
+            assert backend.receive_nowait(pair.server) is None
             backend.close_transport(pair.client)  # the socket beneath, no alert
             await pair.server.transport.wait_readable()
             with pytest.raises(ResourceBroken):

@@ -689,14 +689,15 @@ class ServerConnection(H1Framing, H1ServerState):
             try:
                 await self.backend.select_events(done, req._peer_closed_evt)
                 # The event also marks the window's close (`_close_window`), which cannot
-                # precede this response's own completion — the state's flag is the verdict.
+                # precede this response's own completion: the state's flag tells a FIN from
+                # it, and `done` (set at the last write) a FIN after the body from one mid-body.
                 abandoned = not done.is_set() and self.peer_closed_flag(req._seq)
             finally:
                 if not done.is_set():
                     scope.cancel()  # leave with the pump gone, whatever ended the wait
         # The scope exit does not wait for a CANCELLED child to unwind (see the h2 driver's
-        # `_send_async_body`): wait for the pump's own `done`, set in its `finally` after
-        # the producer unwound and the generator was closed.
+        # `_send_async_body`): wait for the pump's own `done`, which a cancelled pump sets
+        # in its `finally`, after the producer unwound and the generator was closed.
         await done.wait()
         if abandoned:
             await self._fail_response(req, H1IncompleteMessageError(_PEER_CLOSED_MSG))
@@ -707,6 +708,13 @@ class ServerConnection(H1Framing, H1ServerState):
         # A bare task: never lets an exception escape (it is reported through `box`).
         try:
             await self._send_body(self._codec, body, trailers)
+            # REGRESSION GUARD: `done` marks the last write, not the generator close below.
+            # A client that read the whole response may close at once, and the caller's
+            # verdict reads `done` the moment that FIN wakes it: set late, a fully written
+            # response fails as abandoned (hyper moves to `Writing::KeepAlive` in the call
+            # that buffers the final bytes, proto/h1/conn.rs:767-771). The `finally` sets it
+            # for the cancel and error paths; a finished pump is joined by the scope exit.
+            done.set()
         except Exception as exc:
             box.append(exc)
         finally:

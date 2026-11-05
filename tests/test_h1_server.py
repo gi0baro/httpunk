@@ -995,10 +995,6 @@ async def test_server_next_request_refuses_while_push_body_is_open():
 # ----- response trailers -----
 
 
-@pytest.mark.skip(
-    reason="intermittent: `_send_async_body` can fail a fully written response as abandoned "
-    "when the client's FIN lands before the pump sets `done` (httpunk/h1/server.py)"
-)
 @pytest.mark.tonio
 async def test_server_respond_trailers_need_chunked_framing_and_a_trailer_declaration():
     """`respond(trailers=)` is hyper's `Body` with trailer frames: the framing is the body's
