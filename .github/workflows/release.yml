@@ -44,6 +44,7 @@ jobs:
           - os: ubuntu
             platform: linux
             target: i686
+            runner: ubuntu-24.04
           - os: ubuntu
             platform: linux
             target: armv7
@@ -63,7 +64,7 @@ jobs:
           - os: windows
             target: aarch64
 
-    runs-on: ${{ matrix.os }}-latest
+    runs-on: ${{ matrix.runner || format('{0}-latest', matrix.os) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,6 +100,7 @@ jobs:
           - os: ubuntu
             platform: linux
             target: i686
+            runner: ubuntu-24.04
           - os: ubuntu
             platform: linux
             target: aarch64
@@ -125,7 +127,7 @@ jobs:
           - os: windows
             target: aarch64
 
-    runs-on: ${{ matrix.os }}-latest
+    runs-on: ${{ matrix.runner || format('{0}-latest', matrix.os) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
