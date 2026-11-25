@@ -4,6 +4,8 @@ H2Error, connection-closed under ConnectionClosedError), driven by a server that
 emits those frames."""
 
 import contextlib
+import socket
+import struct
 
 import pytest
 from _net import H2Peer, _client_against, h2_client_against, listen, open_h2, read_to_eof
@@ -581,7 +583,7 @@ async def test_end_stream_with_content_length_resets_not_hangs():
 async def test_close_flushes_queued_frames_even_after_connection_error():
     """`close()` drains the control-frame queue BEFORE the FIN regardless of
     `error` being set — h2's `State::Closing` runs `codec.shutdown` (flush, then
-    shutdown) on every non-IO close (connection.rs L341-348). The GOAWAY-exchanged
+    shutdown) on every non-IO close (connection.rs L371-380). The GOAWAY-exchanged
     clean close relies on this: its reply GOAWAY is queued with `error` already
     set, and whether the write pump wakes before `close()` tears it down is a
     scheduler race. The write-pump wake is stubbed out so the queue is guaranteed
@@ -740,3 +742,132 @@ async def test_response_missing_status():
 
     assert requests == [1, 3, 5]
     assert resets == [(3, H2Reason.PROTOCOL_ERROR)]
+
+
+# Ports of h2 0.4.21 tests/h2-tests/tests/go_away.rs: a transport error after the peer's
+# GOAWAY. Upstream's mock fails the read with ConnectionReset; here the peer closes its
+# socket abortively (`_reset`), so the client's next read fails with ECONNRESET, not EOF.
+# Upstream's handshake never waits; `connect()` waits for the peer's SETTINGS, and a GOAWAY
+# arriving meanwhile is a separate issue, so each GOAWAY is sent after `connect()` returned.
+
+
+def _reset(peer):
+    """Close the peer's socket abortively (SO_LINGER 0): a RST instead of a FIN."""
+    peer.stream.socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    peer.close()
+
+
+@pytest.mark.tonio
+async def test_received_go_away_survives_read_error():
+    # h2 0.4.21 tests/h2-tests/tests/go_away.rs:30 received_go_away_survives_read_error, the part with a surface in httpunk: `client.poll_ready`.
+    entered, reset = Event(), Event()
+
+    async def server(peer):
+        await entered.wait()  # `connect()` has returned
+        await peer.send_go_away(0, 0x40, b"backoff")
+        _reset(peer)
+        reset.set()
+
+    async with h2_client_against(server) as conn:
+        entered.set()
+        await reset.wait()
+        while not conn.closed:  # the GOAWAY is processed (upstream: `conn.await`)
+            await sleep(0)
+        with pytest.raises(GoAwayError) as exc:
+            await conn.ready()
+
+    assert (exc.value.error_code, exc.value.debug_data) == (0x40, b"backoff")
+
+
+@pytest.mark.tonio
+async def test_received_go_away_does_not_hide_io_error_on_active_stream():
+    # h2 0.4.21 tests/h2-tests/tests/go_away.rs:115 received_go_away_does_not_hide_io_error_on_active_stream, the part with a surface in httpunk: `response.await`.
+    async def server(peer):
+        await peer.request()  # sent once `connect()` has returned
+        await peer.send_go_away(1, 0x40, b"backoff")
+        _reset(peer)
+
+    async with h2_client_against(server) as conn:
+        with pytest.raises(ConnectionClosedError) as exc:
+            await conn.request("GET", "https://http2.akamai.com/")
+
+    assert "Connection reset" in str(exc.value)  # the transport error, not an EOF
+
+
+@pytest.mark.tonio
+async def test_received_go_away_survives_io_error_after_rejecting_stream():
+    # h2 0.4.21 tests/h2-tests/tests/go_away.rs:134 received_go_away_survives_io_error_after_rejecting_stream, the part with a surface in httpunk: `response.await`.
+    async def server(peer):
+        await peer.request()  # sent once `connect()` has returned
+        await peer.send_go_away(0, 0x40, b"backoff")
+        _reset(peer)
+
+    async with h2_client_against(server) as conn:
+        with pytest.raises(GoAwayError) as exc:
+            await conn.request("GET", "https://http2.akamai.com/")
+
+    assert (exc.value.error_code, exc.value.debug_data) == (0x40, b"backoff")
+
+
+@pytest.mark.tonio
+async def test_received_go_away_survives_io_error_after_completing_stream():
+    # h2 0.4.21 tests/h2-tests/tests/go_away.rs:151 received_go_away_survives_io_error_after_completing_stream, the part with a surface in httpunk: the response.
+    async def server(peer):
+        await peer.request()  # sent once `connect()` has returned
+        await peer.send_response_headers(1, 200, end_stream=True)
+        await peer.send_go_away(1, 0x40, b"backoff")
+        _reset(peer)
+
+    async with h2_client_against(server) as conn:
+        resp = await conn.request("GET", "https://http2.akamai.com/")
+        while not conn.closed:  # the GOAWAY is processed (upstream: `conn.await`)
+            await sleep(0)
+        assert resp.status == 200
+        assert await resp.read() == b""
+
+
+async def _open_body():
+    """A request body that never ends: the request stays open on the sending side."""
+    await Event().wait()
+    yield b""
+
+
+@pytest.mark.tonio
+async def test_recv_end_stream_survives_go_away():
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:1277 recv_end_stream_survives_go_away, the part with a surface in httpunk: the response (the request body's sender has no surface for its stop).
+    async def server(peer):
+        head = await peer.recv(Headers)
+        assert (head.stream_id, head.method, head.end_stream) == (1, "POST", False)
+        # last_stream_id 0 makes the GOAWAY close stream 1. One write: upstream processes
+        # the GOAWAY before it polls the response.
+        c = peer.codec
+        await peer.send(
+            c.serialize_response_headers(1, 200, end_stream=True), c.serialize_go_away(0, H2Reason.INTERNAL_ERROR)
+        )
+        await read_to_eof(peer.stream)
+
+    async with h2_client_against(server) as conn:
+        resp = await conn.request("POST", "https://example.com/", body=_open_body())
+        while not conn.closed:  # the GOAWAY is processed before the body is read
+            await sleep(0)
+        assert resp.status == 200
+        assert await resp.read() == b""
+        assert resp.trailers is None
+
+
+@pytest.mark.tonio
+async def test_recv_end_stream_survives_eof():
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:1320 recv_end_stream_survives_eof, the part with a surface in httpunk: the response (the request body's sender has no surface for its stop).
+    async def server(peer):
+        head = await peer.recv(Headers)
+        assert (head.stream_id, head.method, head.end_stream) == (1, "POST", False)
+        await peer.send_response_headers(1, 200, end_stream=True)
+        peer.close()
+
+    async with h2_client_against(server) as conn:
+        resp = await conn.request("POST", "https://example.com/", body=_open_body())
+        while not conn.closed:  # the connection has seen the EOF (upstream: `conn.await`)
+            await sleep(0)
+        assert resp.status == 200
+        assert await resp.read() == b""
+        assert resp.trailers is None

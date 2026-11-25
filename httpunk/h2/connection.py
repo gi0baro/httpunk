@@ -18,7 +18,7 @@ The client `Connection` (client.py) and the server `ServerConnection`
 what remains role-specific here is async glue only: the client's ready/slot
 events, the server's accept queue.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20 (see
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.21 (see
 crates/vendor-h2), paths relative to its `src/`.
 """
 
@@ -172,6 +172,13 @@ class H2ConnectionBase(H2Streams):
             return fresh_exc(err)
         return StreamResetError(st.id, int(H2Reason.CANCEL))
 
+    # DIVERGENCE: h2 keeps one connection-error slot: a clean close does not overwrite a
+    # stored peer GOAWAY (proto/streams/streams.rs:955), a transport error does
+    # (streams.rs:805, from proto/connection.rs:542-547), unless the GOAWAY had an error
+    # reason and no streams are left (connection.rs:283-295). So after a NO_ERROR GOAWAY,
+    # or one with streams still active, then a transport error, h2's `poll_ready` reports
+    # the IO error; httpunk raises the peer's GOAWAY first: the condition retry logic
+    # needs (maintainer's decision).
     def _raise_if_dead(self):
         """Raise the stored condition: the peer's GOAWAY first (the retry-relevant
         one; h2's `recv_eof` never overwrites an existing conn_error), then the
@@ -220,7 +227,7 @@ class H2ConnectionBase(H2Streams):
             handle.window_evt.set()
 
     def abort(self):
-        # h2 client.rs:1335-1343, server.rs:1500-1519: dropping a failed or
+        # h2 client.rs:1341-1349, server.rs:1506-1525: dropping a failed or
         # cancelled handshake drops its IO, without flushing or TLS close_notify.
         self.backend.close_transport(self._transport)
         self._fail(None)  # preserve a failure already recorded by the read pump
@@ -327,7 +334,7 @@ class H2ConnectionBase(H2Streams):
             # A protocol/flow violation we detected: notify the peer with GOAWAY, then
             # tear down (h2 `go_away_now`). Best-effort: the connection is going down.
             reason = exc.args[0] if exc.args and isinstance(exc.args[0], int) else int(H2Reason.PROTOCOL_ERROR)
-            # h2 proto/connection.rs:482-483, 537-558: forward library debug data.
+            # h2 proto/connection.rs:514-515, 569-590: forward library debug data.
             self._after(self.send_goaway(reason, getattr(exc, "_debug_data", None)))
             with contextlib.suppress(Exception):
                 await self._flush()
@@ -340,7 +347,7 @@ class H2ConnectionBase(H2Streams):
             self._fail(exc)
 
     def _dispatch(self, frame, spare):
-        # h2: the frame match in proto/connection.rs `recv_frame` (L560). Each arm is
+        # h2: the frame match in proto/connection.rs `recv_frame` (L592). Each arm is
         # one call into the state, then the acts its verdict asks for.
         if isinstance(frame, Headers):
             v = self.recv_headers(frame, spare)

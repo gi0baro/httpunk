@@ -5,19 +5,22 @@ for WINDOW_UPDATEs before sending past them — so the recv path is exercised fo
 real."""
 
 import pytest
-from _net import H2Peer, listen, open_h2
+from _net import H2Peer, h2_client_against, listen, open_h2
 from tonio.colored import Event, scope, sleep
 from tonio.colored.sync import Lock
+from tonio.colored.time import timeout
 
 from httpunk import H2Reason, StreamResetError
 from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2_DEFAULT_DATA_FRAME_BUDGET as _DATA_FRAME_BUDGET,
     H2_DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD as _DATA_FRAME_OVERHEAD_THRESHOLD,
-    H2_MAX_RECV_EMPTY_DATA_FRAMES as _MAX_RECV_EMPTY_DATA_FRAMES,
     H2Codec,
     H2FrameData as Data,
+    H2FrameGoAway as GoAway,
     H2FrameHeaders as Headers,
+    H2FrameRstStream as RstStream,
+    H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
     H2Streams,
 )
@@ -370,45 +373,190 @@ async def test_consumed_small_frames_return_budget():
     assert conn.data_frame_budget_available <= _DATA_FRAME_BUDGET
 
 
-@pytest.mark.tonio
-async def test_empty_nonfinal_data_dropped_and_capped():
-    """An empty non-final DATA frame has no effect on the HTTP message: it is
-    never delivered to the app, does NOT touch the byte budget, and counts
-    against its own per-connection lifetime cap instead (h2 counts.rs
-    `num_recv_empty_data_frames` — a flood dies with ENHANCE_YOUR_CALM)."""
-    conn, st, data = _recv_streaming_connection()
-    _deliver(conn, data(b""))  # dropped
-    assert conn.data_frame_budget_available == _DATA_FRAME_BUDGET  # byte budget untouched
-    assert conn.data_frame_budget_empty_frames == 1
-    _deliver(conn, data(b"real"))
-    assert await st.body_recv.receive() == (b"real", True)  # the empty frame never surfaced
-    # An empty FINAL frame is the message end and IS delivered, unbudgeted
-    # (h2: only `!is_end_stream` frames are budgeted or discarded).
-    _deliver(conn, data(b"", end=True))
-    assert await st.body_recv.receive() == (b"", False)
-    assert await st.body_recv.receive() is None  # EOF sentinel follows
-    assert conn.data_frame_budget_empty_frames == 1  # the final empty frame doesn't count
+# h2's default windows, which upstream's frame sequences assume; hyper's profile is larger.
+_H2_DEFAULT_WINDOWS = {"initial_window_size": _DEFAULT_WINDOW, "initial_connection_window_size": _DEFAULT_WINDOW}
+# h2-support `frames::data(1, [1, 0]).padded()`: a pad-length byte and one byte of
+# padding, an empty payload once decoded. H2Codec serializes no padded DATA.
+_PADDED_EMPTY_DATA = (2).to_bytes(3, "big") + b"\x00\x08" + (1).to_bytes(4, "big") + b"\x01\x00"
+_AKAMAI = "https://http2.akamai.com/"
+
+
+async def _respond_200(peer):
+    """Upstream's mock prelude: the handshake, the GET on stream 1, a 200 head."""
+    await peer.handshake()
+    request = await peer.expect(Headers)
+    assert (request.stream_id, request.method, request.end_stream) == (1, "GET", True)
+    assert (request.scheme, request.authority, request.path) == ("https", "http2.akamai.com", "/")
+    await peer.send_response_headers(1, 200)
 
 
 @pytest.mark.tonio
-async def test_empty_data_frame_flood_dies_at_cap():
-    """The empty-frame lifetime cap: MAX_RECV_EMPTY_DATA_FRAMES empties pass,
-    the next one is a connection ENHANCE_YOUR_CALM — and the byte budget is
-    still untouched (h2 counts.rs L120-128)."""
-    conn, st, data = _recv_streaming_connection()
-    for _ in range(_MAX_RECV_EMPTY_DATA_FRAMES):
-        _deliver(conn, data(b""))
-    with pytest.raises(H2ProtocolError) as exc:
-        _deliver(conn, data(b""))
-    assert exc.value.args[0] == int(H2Reason.ENHANCE_YOUR_CALM)
-    assert conn.data_frame_budget_available == _DATA_FRAME_BUDGET
+async def test_recv_ignores_empty_data_without_end_stream():
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:106 recv_ignores_empty_data_without_end_stream.
+    async def server(peer):
+        await _respond_200(peer)
+        for _ in range(51):
+            await peer.send_data(1, b"")
+        for _ in range(50):
+            await peer.send(_PADDED_EMPTY_DATA)
+        await peer.send_data(1, b"hello", end_stream=True)
+        await peer.frames()  # until the client closes
+
+    async with h2_client_against(server, **_H2_DEFAULT_WINDOWS) as conn:
+        response = await conn.request("GET", _AKAMAI)
+        assert [bytes(chunk) async for chunk in response.aiter_bytes()] == [b"hello"]
+        await conn.ready()  # upstream: the connection ends without an error
+
+
+@pytest.mark.tonio
+async def test_allow_nonconsecutive_empty_frames_from_gcp():
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:150 allow_nonconsecutive_empty_frames_from_gcp.
+    cycles = 192
+    body_chunk = b"x" * 300
+
+    async def server(peer):
+        await _respond_200(peer)
+        for _ in range(cycles):
+            await peer.send_data(1, body_chunk)
+            await peer.send(_PADDED_EMPTY_DATA)
+        await peer.send_data(1, b"done", end_stream=True)
+        await peer.frames()  # until the client closes
+
+    async with h2_client_against(server, **_H2_DEFAULT_WINDOWS) as conn:
+        response = await conn.request("GET", _AKAMAI)
+        chunks = [bytes(chunk) async for chunk in response.aiter_bytes()]
+        assert b"".join(chunks) == body_chunk * cycles + b"done"
+        await conn.ready()  # upstream: the connection ends without an error
+
+
+async def _empty_data_flood_sends_goaway(frame):
+    """Upstream's two GOAWAY tests, which differ only in the empty DATA frame sent."""
+    finished = Event()
+
+    async def server(peer):
+        try:
+            await _respond_200(peer)
+            for _ in range(102):
+                await peer.send(frame)
+            goaway = await peer.expect(GoAway)
+            assert (goaway.last_stream_id, goaway.error_code, goaway.debug_data) == (
+                0,
+                H2Reason.ENHANCE_YOUR_CALM,
+                b"too_many_data_frames",
+            )
+        finally:
+            finished.set()
+
+    async with h2_client_against(server, **_H2_DEFAULT_WINDOWS) as conn:
+        response = await conn.request("GET", _AKAMAI)
+        # Upstream holds the body unread; reading it waits for the connection to fail.
+        with pytest.raises(H2ProtocolError):
+            async for _chunk in response.aiter_bytes():
+                pass
+        with pytest.raises(H2ProtocolError) as exc:
+            await conn.ready()
+        assert exc.value.args[0] == H2Reason.ENHANCE_YOUR_CALM
+        await finished.wait()
+
+
+@pytest.mark.tonio
+async def test_too_many_empty_data_frames_sends_goaway():
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:197 too_many_empty_data_frames_sends_goaway.
+    await _empty_data_flood_sends_goaway(H2Codec("server").serialize_data(1, b""))
+
+
+@pytest.mark.tonio
+async def test_too_many_padded_empty_data_frames_sends_goaway():
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:239 too_many_padded_empty_data_frames_sends_goaway.
+    await _empty_data_flood_sends_goaway(_PADDED_EMPTY_DATA)
+
+
+@pytest.mark.tonio
+async def test_empty_data_frames_on_locally_reset_stream_send_goaway():
+    # Derived from h2 0.4.21 recv.rs:681-706 and streams.rs:651-671: DATA ignored on a
+    # locally reset stream is charged, never covered by the empty-frame allowance, so
+    # the 101st empty non-final frame passes the cap.
+    finished = Event()
+
+    async def server(peer):
+        try:
+            await _respond_200(peer)
+            reset = await peer.expect(RstStream)
+            assert (reset.stream_id, reset.error_code) == (1, H2Reason.CANCEL)
+            for _ in range(101):
+                await peer.send_data(1, b"")
+            # Without the charge the client answers the PING instead.
+            await peer.send_ping(b"\x01" * 8)
+            goaway = await peer.expect(GoAway)
+            assert (goaway.last_stream_id, goaway.error_code, goaway.debug_data) == (
+                0,
+                H2Reason.ENHANCE_YOUR_CALM,
+                b"too_many_data_frames",
+            )
+        finally:
+            finished.set()
+
+    async with h2_client_against(server, **_H2_DEFAULT_WINDOWS) as conn:
+        response = await conn.request("GET", _AKAMAI)
+        await response.aclose()  # RST_STREAM(CANCEL)
+        await finished.wait()
+        with pytest.raises(H2ProtocolError) as exc:
+            await conn.ready()
+        assert exc.value.args[0] == H2Reason.ENHANCE_YOUR_CALM
+
+
+@pytest.mark.tonio
+async def test_client_decrease_initial_window_size_sends_released_capacity():
+    # h2 0.4.21 tests/h2-tests/tests/flow_control.rs:1830 client_decrease_initial_window_size_sends_released_capacity, adapted: the shrink is the ACK of the handshake SETTINGS (initial_window_size=1024), delayed until the data is released.
+    consumed = Event()
+
+    async def server(peer):
+        # Read past H2Peer.recv, which would ACK the client's SETTINGS on sight.
+        frames = []
+        while not any(isinstance(frame, Headers) for frame in frames):
+            data = await peer.stream.receive_some(65536)
+            assert data, "the connection closed before the request"
+            frames.extend(peer.codec.receive(data))
+        [settings] = [frame for frame in frames if isinstance(frame, Settings) and not frame.ack]
+        assert settings.initial_window_size == 1024
+        [request] = [frame for frame in frames if isinstance(frame, Headers)]
+        assert len(frames) == 3  # and the ACK of our SETTINGS
+        assert (request.stream_id, request.method, request.end_stream) == (1, "GET", True)
+        assert (request.scheme, request.authority, request.path) == ("https", "http2.akamai.com", "/")
+        await peer.send_response_headers(1, 200)
+        await peer.send_data(1, b"a" * 16_384)
+
+        # The released 16_384 bytes are below the stream (and connection)
+        # WINDOW_UPDATE threshold, so nothing is sent before the ACK.
+        await consumed.wait()
+        await peer.ping_pong()
+        await peer.send_settings_ack()
+
+        # After the ACK the stream window is 49_151 - 64_511 = -15_360 while
+        # available is 1_024, so the 16_384 released bytes are now owed.
+        update, completed = await timeout(peer.expect(WindowUpdate), 5)
+        assert completed, "released stream capacity must be advertised after SETTINGS ACK"
+        assert (update.stream_id, update.increment) == (1, 16_384)
+
+        await peer.send_data(1, b"a" * 1024, end_stream=True)
+        await peer.frames()  # until the client closes
+
+    async with h2_client_against(
+        server, initial_window_size=1024, initial_connection_window_size=_DEFAULT_WINDOW
+    ) as conn:
+        response = await conn.request("GET", _AKAMAI)
+        chunks = response.aiter_bytes()
+        assert len(await anext(chunks)) == 16_384  # released as it is read
+        consumed.set()
+        assert [len(chunk) async for chunk in chunks] == [1024]
+        await conn.ready()  # upstream: the connection ends without an error
 
 
 @pytest.mark.tonio
 async def test_final_data_frame_never_budgeted():
     """A final (END_STREAM) DATA frame is exempt from the framing budget — a
     stream receives at most one, so it can't create unbounded overhead (h2
-    streams.rs L655-662). It is delivered tagged unbudgeted so the
+    streams.rs L655-671). It is delivered tagged unbudgeted so the
     reader doesn't release a charge that was never made."""
     conn, st, data = _recv_streaming_connection()
     _deliver(conn, data(b"x", end=True))  # tiny AND final -> no charge
@@ -420,7 +568,7 @@ async def test_final_data_frame_never_budgeted():
 @pytest.mark.tonio
 async def test_reset_releases_buffered_frames_budget():
     """Resetting a stream with buffered-but-unread small frames returns their
-    charge to the connection budget (h2 recv.rs:957-970: `clear_recv_buffer` /
+    charge to the connection budget (h2 recv.rs:985-998: `clear_recv_buffer` /
     `release_closed_capacity` release each budgeted frame) — without this, a
     long-lived connection leaks budget on every abandoned body. A release
     racing the teardown must not double-credit (clamped to the outstanding charge)."""
@@ -440,9 +588,9 @@ async def test_reset_releases_buffered_frames_budget():
 async def test_aclose_after_eos_reclaims_window_and_budget():
     """Abandoning a FULLY-RECEIVED body with unread buffered chunks returns both
     the connection recv window and the framing-budget charge: upstream's drop
-    path guards only the Drop-reset on eos (`maybe_cancel`, streams.rs L1700) —
+    path guards only the Drop-reset on eos (`maybe_cancel`, streams.rs L1708) —
     `release_closed_capacity` + `clear_recv_buffer` run UNCONDITIONALLY once no
-    handle can read the data (streams.rs L1682-1687, recv.rs L500-520). aclose
+    handle can read the data (streams.rs L1690-1695, recv.rs L505-525). aclose
     is this driver's deterministic drop hook. A straggling reader release after
     the reclaim credits nothing."""
     conn, st, data = _recv_streaming_connection()

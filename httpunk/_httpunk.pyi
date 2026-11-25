@@ -388,10 +388,10 @@ class H2FrameHeaders:
     path: str | None
     status: int | None
     headers: HeaderMap
-    content_length: int | None  # first parsed value; None if absent or first unparsable (h2 recv.rs:178-200)
-    content_length_invalid: bool  # any unparsable or conflicting value (h2 recv.rs:178-200: stream PROTOCOL_ERROR)
+    content_length: int | None  # first parsed value; None if absent or first unparsable (h2 recv.rs:183-205)
+    content_length_invalid: bool  # any unparsable or conflicting value (h2 recv.rs:183-205: stream PROTOCOL_ERROR)
     is_informational: bool  # a 1xx response head (h2 `Headers::is_informational`)
-    is_over_size: bool  # decoded header list reached the limit (h2 recv.rs:221-238)
+    is_over_size: bool  # decoded header list reached the limit (h2 recv.rs:226-243)
     def __repr__(self) -> str: ...
 
 class H2FrameData:
@@ -658,14 +658,15 @@ class H2ContentLength:
         """False = a declared length still unsatisfied at END_STREAM."""
 
 class H2DataFrameBudget:
-    """h2 0.4.20 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`,
+    """h2 0.4.21 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`,
     counts.rs:120-147). `Budget` tracks spent overhead (counts.rs:4-36); Auto is resolved
     via `set_target_connection_window_size` (counts.rs:112-116)."""
 
     def __init__(self, configured: int | None = ..., connection_window: int | None = ...) -> None: ...
     def record(self, payload_len: int) -> int:
-        """Charge a received non-final DATA frame; returns the charge taken (0 for an
-        empty or large frame). Raises `H2ProtocolError(ENHANCE_YOUR_CALM)` on exhaustion."""
+        """Charge a received non-final DATA frame (an empty one only when its stream's
+        empty-frame allowance is spent); returns the charge taken (0 for an empty or
+        large frame). Raises `H2ProtocolError(ENHANCE_YOUR_CALM)` on exhaustion."""
 
     def release(self, charge: int) -> None:
         """Give a charge back (saturating at the resolved budget)."""
@@ -963,7 +964,7 @@ class H2RecvHeadersVerdict:
 
 class H2RecvDataVerdict:
     handle: object | None
-    payload: bytes | None  # None: nothing to deliver (swallowed, or an empty budgeted frame)
+    payload: bytes | None  # None: nothing to deliver (swallowed, or an empty non-final frame)
     budgeted: bool
     eof: bool
     flags: int
@@ -1009,7 +1010,8 @@ class H2Streams:
     ) -> None:
         """`role`: "client" | "server". Validates the RFC ranges at construction.
         `header_table_size`: None = not advertised; applied on SETTINGS ACK.
-        Reset retention defaults to 50 streams / 1 second; duration is in seconds."""
+        Reset retention defaults to twice `max_concurrent_streams` streams (at least
+        50; 8192 if unset) / 5 seconds; duration is in seconds."""
 
     @property
     def is_server(self) -> bool: ...

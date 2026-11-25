@@ -15,7 +15,7 @@
 //! pending buffer live inside the state so encode order == wire order by
 //! construction; verdicts are owned values.
 //!
-//! Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20 (see
+//! Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.21 (see
 //! crates/vendor-h2), paths relative to its `src/`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -47,10 +47,13 @@ use crate::http::HeaderMap;
 
 // ===== constants (h2 proto/mod.rs, proto/streams/recv.rs, hyper profiles) =====
 
-/// h2 `DEFAULT_RESET_STREAM_MAX`: locally-reset ids kept for late frames.
-const RESET_STREAM_MAX: usize = 50;
-/// h2 `DEFAULT_RESET_STREAM_SECS`: how long they are kept.
-const RESET_STREAM_SECS: Duration = Duration::from_secs(1);
+/// h2 proto/mod.rs:41-43: locally-reset ids kept for late frames, when unset: twice the
+/// advertised max concurrent streams (at least 50), else 8192.
+const RESET_STREAM_LIMIT_MULTIPLIER: usize = 2;
+const MIN_DEFAULT_RESET_STREAM_MAX: usize = 50;
+const DEFAULT_RESET_STREAM_MAX: usize = 8192;
+/// h2 proto/mod.rs:46 `DEFAULT_RESET_STREAM_SECS`: how long they are kept.
+const RESET_STREAM_SECS: Duration = Duration::from_secs(5);
 /// h2 `StreamId::MAX` (u32::MAX >> 1): the phase-1 graceful GOAWAY last-id.
 const MAX_STREAM_ID: u32 = u32::MAX >> 1;
 /// Opaque payload of the graceful-shutdown PING (h2 `Ping::SHUTDOWN`).
@@ -124,7 +127,7 @@ pub struct RecvDataVerdict {
     #[pyo3(get)]
     pub handle: Option<Py<PyAny>>,
     /// The payload to deliver (`None`: nothing to deliver — swallowed, or an empty
-    /// budgeted frame).
+    /// non-final frame).
     #[pyo3(get)]
     pub payload: Option<Py<PyBytes>>,
     #[pyo3(get)]
@@ -177,6 +180,18 @@ enum Role {
     Server,
 }
 
+/// Where `recv_lookup` resolves an inbound DATA frame.
+enum RecvTarget {
+    /// A live stream.
+    Live(u32),
+    /// A stream we reset, still stored or in the reset store (h2: in the store,
+    /// `is_local_error`): the frame is ignored, and charged (h2 recv.rs:700-706).
+    Reset,
+    /// Above the last-stream-id of a GOAWAY we sent (h2 streams.rs:613-628): the frame
+    /// is ignored, never charged.
+    AboveGoaway,
+}
+
 /// h2 stream.rs `Stream`: one entry of the store. Stays stored after `Closed`
 /// while it still holds recv-window bytes the reader has not released
 /// (`finished`), exactly as h2 keeps a closed stream in the store while a
@@ -203,6 +218,11 @@ struct StreamEntry {
     /// DATA frames queued in the current turn at the front of `pending_send`;
     /// `Inner::burst_frames` bounds it while other streams wait behind.
     turn_frames: usize,
+    /// Whether this stream can receive one empty DATA frame without END_STREAM
+    /// without accruing a connection-wide strike. The allowance starts available,
+    /// is spent by an eligible empty frame, and is restored when nonempty DATA
+    /// is accepted for delivery. (h2 stream.rs:106-110)
+    allow_empty_data: bool,
 }
 
 impl StreamEntry {
@@ -230,13 +250,14 @@ impl StreamEntry {
             is_pending_capacity: false,
             is_pending_send: false,
             turn_frames: 0,
+            allow_empty_data: true,
         }
     }
 
     /// Why the stream stopped, read off the vendored state — the ONE source of truth
     /// (no shadow fields). While the recv half is open the closure's cause is what
     /// h2's `poll_data` surfaces (`ensure_recv_open`); once the message stood
-    /// (`Closed(ErrorAfterEndStream)`), h2 `ensure_reason` (state.rs L461-480, the
+    /// (`Closed(ErrorAfterEndStream)`), h2 `ensure_reason` (state.rs L472-491, the
     /// `poll_reset` verdict) still reports the RST_STREAM / GOAWAY reason to the
     /// send side, and a non-reason closure (a broken pipe) is a connection error.
     fn stopped(&self) -> Stopped {
@@ -342,8 +363,12 @@ struct Inner {
     /// "no streams" test of the GOAWAY reply.
     num_active: usize,
     /// Ids we locally reset, kept briefly so late frames are swallowed (h2
-    /// `reset_stream_duration`); bounded by `reset_stream_max`, aged out lazily.
+    /// `reset_stream_duration`), with the time of the reset; bounded by
+    /// `reset_stream_max`, aged out lazily. `reset_order` is the same ids in
+    /// insertion order (h2 recv.rs `pending_reset_expired`): expiry and eviction
+    /// pop its front.
     reset_streams: HashMap<u32, Instant>,
+    reset_order: VecDeque<u32>,
     reset_stream_max: usize,
     reset_stream_duration: Duration,
 
@@ -449,7 +474,7 @@ impl Inner {
 
     // ----- lookup classification (h2 streams.rs recv_headers / recv_data top) -----
 
-    /// h2 streams.rs `ensure_not_idle` (client: L1828; server: peer.rs `ensure_can_open`).
+    /// h2 streams.rs `ensure_not_idle` (client: L1836; server: peer.rs `ensure_can_open`).
     fn ensure_not_idle(&self, sid: u32) -> PyResult<()> {
         let client_initiated = StreamId::from(sid).is_client_initiated();
         let idle = match self.role {
@@ -472,25 +497,22 @@ impl Inner {
         self.role == Role::Server && sid > self.max_stream_id
     }
 
-    /// The reset store: `Some(true)` = swallow (recently reset), `Some(false)` /
-    /// `None` = not there (an expired entry is dropped).
-    fn in_reset_store(&mut self, sid: u32) -> bool {
-        if let Some(at) = self.reset_streams.get(&sid) {
-            if at.elapsed() <= self.reset_stream_duration {
-                return true;
-            }
-            self.reset_streams.remove(&sid);
-        }
-        false
+    /// The reset store: `true` = swallow (recently reset). An expired entry reads as
+    /// absent; it stays until `clear_expired_reset_streams` pops it from the front.
+    fn in_reset_store(&self, sid: u32) -> bool {
+        self.reset_streams
+            .get(&sid)
+            .is_some_and(|at| at.elapsed() <= self.reset_stream_duration)
     }
 
-    /// Resolve the target stream for an inbound DATA / (client) HEADERS frame:
-    /// `Ok(Some(id))` = live stream, `Ok(None)` = ignore, `Err` = stream error
-    /// (STREAM_CLOSED -> RST just that stream) or connection error (idle stream).
-    fn recv_lookup(&mut self, sid: u32) -> PyResult<Option<u32>> {
+    /// Resolve the target stream for an inbound DATA frame: a live stream or one of
+    /// the two ignored cases (`RecvTarget`); `Err` = stream error (STREAM_CLOSED ->
+    /// RST just that stream) or connection error (idle stream).
+    fn recv_lookup(&mut self, sid: u32) -> PyResult<RecvTarget> {
         if let Some(e) = self.streams.get(&sid) {
             if e.state.is_local_error() {
-                return Ok(None); // locally reset: swallow late frames "for some time"
+                // locally reset: swallow late frames "for some time"
+                return Ok(RecvTarget::Reset);
             }
             if e.state.is_closed() {
                 // Completed normally but still stored (the recv ledger): give the peer
@@ -498,13 +520,13 @@ impl Inner {
                 self.drop_closed_stored(sid);
                 return Err(stream_err(sid, Reason::STREAM_CLOSED));
             }
-            return Ok(Some(sid));
+            return Ok(RecvTarget::Live(sid));
         }
         if self.in_reset_store(sid) {
-            return Ok(None);
+            return Ok(RecvTarget::Reset);
         }
         if self.above_goaway(sid) {
-            return Ok(None);
+            return Ok(RecvTarget::AboveGoaway);
         }
         self.ensure_not_idle(sid)?;
         Err(stream_err(sid, Reason::STREAM_CLOSED))
@@ -544,7 +566,7 @@ impl Inner {
     /// ran, in the caller's step): the stream leaves the active set, and on the
     /// SERVER the request's recv half goes with it — hyper drops the request's
     /// `RecvStream` once the response is sent: an unread body is RST_STREAM(NO_ERROR)ed
-    /// while the client is still sending (`maybe_cancel`, streams.rs L1700 — the
+    /// while the client is still sending (`maybe_cancel`, streams.rs L1708 — the
     /// nginx-compat rule) and the in-flight body's connection window is returned
     /// (`release_closed_capacity`). Returns the handle to notify when a reset was
     /// sent, the stop its readers must see, and the flags.
@@ -569,7 +591,7 @@ impl Inner {
     }
 
     /// A stream left the active set: the server's phase-2 drain check, and the
-    /// idle-after-peer-GOAWAY reply (h2 streams.rs `drop_stream_ref` L1673-1675 wakes the
+    /// idle-after-peer-GOAWAY reply (h2 streams.rs `drop_stream_ref` L1681-1683 wakes the
     /// connection task so `Connection::poll` re-evaluates `go_away_now(NO_ERROR)`).
     fn on_stream_gone(&mut self) -> u8 {
         let mut flags = 0;
@@ -581,8 +603,8 @@ impl Inner {
 
     /// If the peer has GOAWAY'd us and no streams remain, queue our acknowledging
     /// GOAWAY(NO_ERROR, last-processed-id) exactly once and mark the connection DONE
-    /// (h2 proto/connection.rs `poll` L327-333). Any received GOAWAY counts, whatever
-    /// its last-stream-id: h2 stores every one in `inner.error` (L596); the
+    /// (h2 proto/connection.rs `poll` L351-357). Any received GOAWAY counts, whatever
+    /// its last-stream-id: h2 stores every one in `inner.error` (L628); the
     /// `StreamId::MAX` exclusion of `should_close_on_idle` applies only to a GOAWAY we
     /// sent (go_away.rs L108-114).
     fn maybe_goaway_reply(&mut self) -> u8 {
@@ -636,7 +658,7 @@ impl Inner {
         }
     }
 
-    /// h2 recv.rs `release_closed_capacity` (L500) + `clear_recv_buffer` (L957-974):
+    /// h2 recv.rs `release_closed_capacity` (L505) + `clear_recv_buffer` (L985-1010):
     /// return the connection window and the framing budget consumed by data the app
     /// will never read. Idempotent (`recv_reclaimed`).
     fn reclaim_stream_accounting(&mut self, sid: u32) {
@@ -670,17 +692,46 @@ impl Inner {
     }
 
     // ----- reset store (h2 recv.rs enqueue_reset_expiration / clear_expired_reset_streams) -----
+    //
+    // Invariant: `reset_order` and `reset_streams` always hold exactly the same ids.
+    // Every id pushed is inserted, every id popped is removed, and nothing else
+    // touches either.
 
+    /// h2 recv.rs:1080-1094: pop from the front of the queue while expired.
     fn clear_expired_reset_streams(&mut self) {
-        self.reset_streams
-            .retain(|_, at| at.elapsed() <= self.reset_stream_duration);
+        if !self.reset_order.is_empty() {
+            let now = Instant::now();
+            while let Some(&sid) = self.reset_order.front() {
+                let reset_at = self.reset_streams[&sid];
+                // h2 recv.rs:1089: expired when strictly past the duration.
+                if now.saturating_duration_since(reset_at) <= self.reset_stream_duration {
+                    break;
+                }
+                self.reset_order.pop_front();
+                self.reset_streams.remove(&sid);
+            }
+        }
     }
 
+    /// h2 recv.rs:1058-1078: retain a locally reset id; at the cap, the oldest entry
+    /// is evicted to make room. Expired entries are dropped first: h2 does it at the
+    /// top of each connection poll (proto/connection.rs:388-392); httpunk has no poll
+    /// loop, so it is done here, where the store grows.
     fn enqueue_reset_expiration(&mut self, sid: u32) {
         self.clear_expired_reset_streams();
-        if self.reset_streams.len() >= self.reset_stream_max {
-            return; // over the cap: h2 drops it (transitions immediately) rather than retain
+        // h2 recv.rs:1059-1061 `is_pending_reset_expiration`.
+        if self.reset_streams.contains_key(&sid) {
+            return;
         }
+        // h2 recv.rs:1063-1073.
+        if self.reset_streams.len() >= self.reset_stream_max {
+            let Some(oldest) = self.reset_order.pop_front() else {
+                return; // Retention is disabled.
+            };
+            self.reset_streams.remove(&oldest);
+        }
+        // h2 recv.rs:1075-1077; `reset_at` is set on the push (stream.rs:590-595).
+        self.reset_order.push_back(sid);
         self.reset_streams.insert(sid, Instant::now());
     }
 
@@ -733,9 +784,11 @@ impl Inner {
         Ok((wake, flags))
     }
 
-    /// Our own SETTINGS take effect for receiving (h2 proto/settings.rs ACK branch +
-    /// recv.rs `apply_local_settings`): the decoder's limits and every stream's recv
-    /// window, in one step — `dec` is the decoder locked by the caller (state → decoder).
+    /// Our own SETTINGS take effect for receiving (h2 proto/settings.rs:53-73, the ACK
+    /// branch, and recv.rs:578-657 `apply_local_settings`): the decoder's limits and
+    /// every stream's recv window, in one step — `dec` is the decoder locked by the
+    /// caller (state → decoder). A shrunk window can encode stream WINDOW_UPDATEs into
+    /// `pending`.
     fn apply_local_settings(&mut self, dec: &mut Decoder) -> PyResult<()> {
         let local = *self.settings.local();
         if let Some(v) = local.header_table_size {
@@ -748,12 +801,12 @@ impl Inner {
             dec.set_max_header_list_size(v);
         }
         if let Some(target) = local.initial_window_size {
-            // h2 recv.rs `apply_local_settings` (L583-639): the *local* (recv) window
-            // of every open stream moves by the delta.
+            // h2 recv.rs:587-654 `apply_local_settings`: the *local* (recv) window of
+            // every open stream moves by the delta.
             let old = self.recv_init;
             self.recv_init = target;
             if target != old {
-                for e in self.streams.values_mut() {
+                for (&sid, e) in &mut self.streams {
                     if target > old {
                         e.recv_flow.inc_window(target - old).map_err(map_reason)?;
                         e.recv_flow
@@ -763,6 +816,17 @@ impl Inner {
                         e.recv_flow
                             .dec_recv_window(old - target)
                             .map_err(map_reason)?;
+                        // h2 recv.rs:622-629 (#976): the shrink can make capacity already
+                        // released owed to the peer with no DATA arriving. h2 queues the
+                        // stream and sends the WINDOW_UPDATE at the flush, if it still
+                        // receives (recv.rs:1213-1237); httpunk encodes it here, as
+                        // `release_capacity_inner` does.
+                        if let Some(incr) = e.recv_flow.unclaimed_capacity()
+                            && e.state.is_recv_streaming()
+                        {
+                            let _ = e.recv_flow.inc_window(incr);
+                            codec::encode_window_update(&mut self.pending, sid, incr);
+                        }
                     }
                 }
             }
@@ -991,8 +1055,11 @@ impl Inner {
     }
 
     /// Error a stream on a connection-level failure (h2 `recv_eof` /
-    /// `handle_error`): Closed(BrokenPipe), waiters woken, removed. `reason`: the
-    /// GOAWAY reason when one dropped it. `None` for a closed (already EOF'd) entry.
+    /// `handle_error`, state.rs:298-333): Closed with the failure (the GOAWAY, or a
+    /// broken pipe) as `ErrorAfterEndStream` when the recv half had already ended,
+    /// so a fully received message stands, else as `Error`; waiters woken, removed.
+    /// `reason`: the GOAWAY reason when one dropped it. `None` for a closed (already
+    /// EOF'd) entry.
     fn abort_stream(
         &mut self,
         py: Python<'_>,
@@ -1055,7 +1122,7 @@ impl Inner {
         let mut pending = std::mem::take(&mut self.pending);
         self.encoder.encode_headers(response, &mut pending);
         self.pending = pending;
-        // h2 send.rs:279-295 + prioritize.rs:861-866: the implicit reset follows
+        // h2 send.rs:279-295 + prioritize.rs:852-857: the implicit reset follows
         // the queued HEADERS, unless already closed. Our encoder drains synchronously,
         // so commit the scheduled reset's final state and frame in this same step.
         if !e.state.is_closed() {
@@ -1065,14 +1132,14 @@ impl Inner {
                 Initiator::Library,
             );
             codec::encode_rst_stream(&mut self.pending, sid, u32::from(Reason::PROTOCOL_ERROR));
-            // h2 recv.rs:1030-1045: only local-error streams enter expiration.
+            // h2 recv.rs:1058-1078: only local-error streams enter expiration.
             self.enqueue_reset_expiration(sid);
         }
         Ok(self.close_stream(sid))
     }
 
     fn apply_content_length(&mut self, sid: u32, f: &Headers) -> PyResult<()> {
-        // h2 recv.rs:178-219: validate every content-length, even on HEAD and 1xx.
+        // h2 recv.rs:183-224: validate every content-length, even on HEAD and 1xx.
         // HEAD skips storing the length and the END_STREAM/non-zero check;
         // 204/304 skip only the latter check.
         let Some(e) = self.streams.get_mut(&sid) else {
@@ -1161,7 +1228,7 @@ impl H2Streams {
         if let Some(max) = max_frame_size {
             codec::check_max_frame_size(max)?;
         }
-        // h2 client.rs:1001 accepts a nonnegative Duration; Python durations are seconds.
+        // h2 client.rs:1005 accepts a nonnegative Duration; Python durations are seconds.
         let reset_stream_duration = reset_stream_duration
             .map(|seconds| {
                 Duration::try_from_secs_f64(seconds).map_err(|_| {
@@ -1204,7 +1271,7 @@ impl H2Streams {
             max_frame_size,
             max_header_list_size: Some(max_header_list_size),
         };
-        // h2 server.rs:391-397 / client.rs:1344-1350: the handshake sets our receive
+        // h2 server.rs:391-397 / client.rs:1350-1356: the handshake sets our receive
         // frame-size and header-list limits on the codec before reading any peer frame;
         // the SETTINGS ACK re-applies the same values (proto/settings.rs:58-64).
         // REGRESSION GUARD: the read pump decodes a whole read before dispatching it, so
@@ -1232,8 +1299,17 @@ impl H2Streams {
                 streams: HashMap::new(),
                 num_active: 0,
                 reset_streams: HashMap::new(),
-                // h2 client.rs:663-664, 955, 1001: unset options retain h2's defaults.
-                reset_stream_max: max_concurrent_reset_streams.unwrap_or(RESET_STREAM_MAX),
+                reset_order: VecDeque::new(),
+                // h2 client.rs:663-664, 959-960, 1005-1006: unset options retain h2's
+                // defaults; the cap's is derived from the advertised max concurrent
+                // streams (h2 proto/connection.rs:136-139, 150-157).
+                reset_stream_max: max_concurrent_reset_streams.unwrap_or_else(|| {
+                    max_concurrent_streams.map_or(DEFAULT_RESET_STREAM_MAX, |max| {
+                        (max as usize)
+                            .saturating_mul(RESET_STREAM_LIMIT_MULTIPLIER)
+                            .max(MIN_DEFAULT_RESET_STREAM_MAX)
+                    })
+                }),
                 reset_stream_duration,
                 peer: PeerSettings::new(),
                 settings: Settings::new(local),
@@ -1427,7 +1503,7 @@ impl H2Streams {
             if e.state.is_closed() {
                 // Completed normally but still stored: drop it and classify exactly as
                 // if already forgotten (client: STREAM_CLOSED; server: the decreased-id
-                // connection error below, h2 recv.rs `open` L137-140).
+                // connection error below, h2 recv.rs `open` L142-145).
                 flags |= me.drop_closed_stored(sid);
                 if me.role == Role::Client {
                     return Err(stream_err(sid, Reason::STREAM_CLOSED));
@@ -1463,7 +1539,7 @@ impl H2Streams {
                         me.last_recv_id = sid;
                         if me.num_active >= me.max_concurrent {
                             // Over the limit we advertised: REFUSED_STREAM (h2 recv.rs
-                            // `open` L145-149 -> counts.rs `can_inc_num_recv_streams`).
+                            // `open` L150-154 -> counts.rs `can_inc_num_recv_streams`).
                             return Err(stream_err(sid, Reason::REFUSED_STREAM));
                         }
                         let Some(handle) = spare else {
@@ -1484,11 +1560,11 @@ impl H2Streams {
                         let handle = e.handle.clone_ref(py);
                         me.streams.insert(sid, e);
                         me.num_active += 1;
-                        // h2 recv.rs:167-175: opened streams count toward the GOAWAY
+                        // h2 recv.rs:172-180: opened streams count toward the GOAWAY
                         // last-stream-id, including a request rejected as over-size.
                         me.last_processed_id = sid;
                         me.apply_content_length(sid, frame)?; // may raise a stream error
-                        // h2 recv.rs:221-238: after content-length, before delivery.
+                        // h2 recv.rs:226-243: after content-length, before delivery.
                         if frame.is_over_size {
                             flags |= me.reject_oversize_request(sid)?;
                             return Ok(RecvHeadersVerdict {
@@ -1521,9 +1597,9 @@ impl H2Streams {
             e.state
                 .recv_open(frame.end_stream, informational)
                 .map_err(|err| map_proto_err(&err))?;
-            // h2 recv.rs:178-219 precedes the informational branch at :257.
+            // h2 recv.rs:183-224 precedes the informational branch at :262.
             me.apply_content_length(sid, frame)?;
-            // h2 recv.rs:221-238, streams.rs:578-579: counted library reset,
+            // h2 recv.rs:226-243, streams.rs:579-581: counted library reset,
             // including an over-size informational response.
             if frame.is_over_size {
                 return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
@@ -1531,7 +1607,7 @@ impl H2Streams {
             if informational {
                 return Ok(ignored(sid)); // interim responses are not surfaced
             }
-            // h2 client.rs:1719-1735: every response must carry :status (RFC 9113 §8.3.2).
+            // h2 client.rs:1725-1741: every response must carry :status (RFC 9113 §8.3.2).
             if frame.status.is_none() {
                 return Err(stream_err(sid, Reason::PROTOCOL_ERROR));
             }
@@ -1564,22 +1640,31 @@ impl H2Streams {
         })
     }
 
-    /// h2 streams.rs `recv_data` (L398) -> recv.rs `recv_data` (L651): validate
+    /// h2 streams.rs `recv_data` (L398) -> recv.rs `recv_data` (L667): validate
     /// state, consume the connection + stream recv windows, check content-length,
     /// charge the DATA-framing budget, deliver the payload.
     fn recv_data(&self, py: Python<'_>, frame: &Data) -> PyResult<RecvDataVerdict> {
         let mut me = self.lock();
         let before = me.pending.len();
         // Flow control counts padding: `sz` is the flow-controlled length (h2 recv.rs
-        // L653); content-length counts the payload only.
+        // L673); content-length counts the payload only.
         let sz = frame.flow_controlled_len as u32;
         let payload_len = frame.data.bind(py).len()?;
         let sid = match me.recv_lookup(frame.stream_id) {
-            Ok(Some(sid)) => sid,
-            Ok(None) => {
-                // Swallow + reclaim (h2 `ignore_data`): the peer counted these bytes.
+            Ok(RecvTarget::Live(sid)) => sid,
+            Ok(target) => {
+                // Swallow + reclaim (h2 `ignore_data`, recv.rs:811-825): the peer
+                // counted these bytes.
                 me.consume_conn_recv(sz)?;
                 me.reclaim_conn(sz);
+                // On a stream we reset, a non-final frame is then charged, never
+                // covered by the empty-frame allowance (h2 recv.rs:700-706,
+                // streams.rs:659-669); not above a GOAWAY (streams.rs:613-628). Never
+                // released: the frame is never buffered. So the connection budget only,
+                // not `record_data_frame`, whose per-stream charge is given back.
+                if matches!(target, RecvTarget::Reset) && !frame.end_stream {
+                    me.data_budget.record(payload_len)?;
+                }
                 return Ok(RecvDataVerdict {
                     handle: None,
                     payload: None,
@@ -1594,7 +1679,7 @@ impl H2Streams {
                 return Err(err);
             }
         };
-        // DATA is only valid while the recv half is streaming (h2 recv.rs `recv_data` L663),
+        // DATA is only valid while the recv half is streaming (h2 recv.rs `recv_data` L683),
         // checked BEFORE consuming the window: the connection is torn down.
         if !me.streams[&sid].state.is_recv_streaming() {
             return Err(protocol_err(
@@ -1623,16 +1708,31 @@ impl H2Streams {
         }
         e.recv_unreleased += sz;
         let handle = e.handle.clone_ref(py);
+        // h2 recv.rs:783-796: an empty non-final frame spends the stream's allowance if
+        // it has one, else it is charged; a nonempty frame restores the allowance.
+        // Upstream decides this after the padding auto-release below; the two are
+        // independent, so it is decided here, where the entry is at hand.
+        let charge = if payload_len == 0 && !frame.end_stream {
+            !std::mem::take(&mut e.allow_empty_data)
+        } else {
+            if payload_len != 0 {
+                e.allow_empty_data = true;
+            }
+            true
+        };
         // The app only ever sees the payload and can release only that much:
-        // auto-release the padding overhead now (h2 recv.rs L749-759).
+        // auto-release the padding overhead now (h2 recv.rs L769-779).
         if frame.padding > 0 {
             me.release_capacity_inner(sid, frame.padding as u32, false);
         }
-        // DATA-framing budget (h2 counts.rs:120-147): a final frame is never budgeted;
-        // an empty non-final frame counts against its own cap and is dropped.
+        // DATA-framing budget (h2 streams.rs:659-669, counts.rs:120-138): a final frame
+        // is never budgeted; a non-final one is recorded only when charged. An empty
+        // non-final frame is dropped, charged or not.
         let is_budgeted = !frame.end_stream;
         if is_budgeted {
-            me.record_data_frame(sid, payload_len)?;
+            if charge {
+                me.record_data_frame(sid, payload_len)?;
+            }
             if payload_len == 0 {
                 return Ok(RecvDataVerdict {
                     handle: None,
@@ -1724,12 +1824,12 @@ impl H2Streams {
             me.ensure_not_idle(sid)?;
             return Ok(None);
         }
-        // h2 recv.rs L901-911 (hyper#2877): a peer resetting a stream the app hasn't
+        // h2 recv.rs L929-939 (hyper#2877): a peer resetting a stream the app hasn't
         // accepted yet no longer counts as concurrent, so a separate, smaller cap
         // bounds a HEADERS+RST flood -> GOAWAY(ENHANCE_YOUR_CALM).
         if me.role == Role::Server && me.pending_accept.contains(&sid) {
             if me.remote_reset_pending.len() >= me.max_pending_accept_reset {
-                // h2 proto/streams/recv.rs:917-920.
+                // h2 proto/streams/recv.rs:945-948.
                 return Err(protocol_err_with_debug(
                     Reason::ENHANCE_YOUR_CALM,
                     "too_many_resets",
@@ -1777,7 +1877,8 @@ impl H2Streams {
             me.settings.recv_ack()?;
             let mut dec = self.decoder.lock().unwrap(); // state → decoder: one step for both
             me.apply_local_settings(&mut dec)?;
-            return Ok((false, Vec::new(), 0));
+            // A shrunk window may have queued stream WINDOW_UPDATEs.
+            return Ok((false, Vec::new(), me.wake_flag(before)));
         }
         // ACK first, then apply (h2 `poll_send` orders the ACK before the application).
         codec::encode_settings_ack(&mut me.pending);
@@ -1788,7 +1889,7 @@ impl H2Streams {
     }
 
     /// A PING: answer it (queued PONG), or — its ACK — drive phase 2 of the server's
-    /// graceful shutdown (h2 connection.rs L598-608): the shutdown PING's ack means
+    /// graceful shutdown (h2 connection.rs L630-640): the shutdown PING's ack means
     /// the client has processed everything it sent before our GOAWAY(2^31-1), so the
     /// highest stream we accepted is the true last-processed id; send the final
     /// GOAWAY with it, and end the accept loop if already drained.
@@ -1862,7 +1963,7 @@ impl H2Streams {
         self.lock().maybe_goaway_reply()
     }
 
-    /// h2 proto/connection.rs:457-460 `go_away_now_data`: the last-stream-id
+    /// h2 proto/connection.rs:489-492 `go_away_now_data`: the last-stream-id
     /// is the role's; debug data comes from the library error.
     #[pyo3(signature = (reason, debug_data=None))]
     fn send_goaway(&self, reason: u32, debug_data: Option<&[u8]>) -> u8 {
@@ -2288,11 +2389,12 @@ impl H2Streams {
     /// toward the ENHANCE_YOUR_CALM cap (h2 `max_local_error_reset_streams`, the
     /// Rapid-Reset / malformed-flood defence). A stream we've already forgotten
     /// enters the reset store and draws one RST_STREAM, except a refused request
-    /// (h2 proto/streams/recv.rs:129-149, proto/connection.rs:229-236).
+    /// (h2 proto/streams/recv.rs:134-154, proto/connection.rs:237-244); one still in
+    /// the reset store draws nothing.
     fn reset_on_error(&self, py: Python<'_>, sid: u32, reason: u32) -> PyResult<ResetVerdict> {
         let mut me = self.lock();
         let before = me.pending.len();
-        // h2 proto/streams/counts.rs:167-179, streams.rs:169-178, 1803-1821:
+        // h2 proto/streams/counts.rs:167-179, streams.rs:169-178, 1811-1829:
         // check before incrementing; the reset that trips the cap is not counted.
         if let Some(max) = me.max_local_error_resets
             && me.local_error_resets >= max
@@ -2313,14 +2415,24 @@ impl H2Streams {
                 flags,
             });
         }
-        // h2 proto/connection.rs:229-236: refusals are counted and sent without
+        // h2 proto/connection.rs:237-244: refusals are counted and sent without
         // opening/storing a stream. Later DATA is STREAM_CLOSED (streams.rs:631-641);
-        // later HEADERS fails recv::open's increasing-id check (recv.rs:137-140).
+        // later HEADERS fails recv::open's increasing-id check (recv.rs:142-145).
+        // h2 streams.rs:1041-1081: the unknown stream is opened in the store and
+        // reset, which enqueues it for expiration (streams.rs:1746-1778).
         if reason != u32::from(Reason::REFUSED_STREAM) {
-            me.clear_expired_reset_streams();
-            if me.reset_streams.len() < me.reset_stream_max {
-                me.reset_streams.insert(sid, Instant::now());
+            // h2 streams.rs:1755-1767, 1770-1778: a stream already reset and still
+            // remembered (an expired entry is one h2 has released) is counted
+            // above, but nothing is sent: send.rs:231-238 "Don't double reset";
+            // its expiration is already pending (recv.rs:1059-1061).
+            if me.in_reset_store(sid) {
+                return Ok(ResetVerdict {
+                    handle: None,
+                    stop: None,
+                    flags: me.wake_flag(before),
+                });
             }
+            me.enqueue_reset_expiration(sid);
         }
         codec::encode_rst_stream(&mut me.pending, sid, reason);
         let flags = me.wake_flag(before);
@@ -2333,7 +2445,7 @@ impl H2Streams {
 
     /// The body's `aclose`: a fully-received body needs no RST (h2 guards its
     /// Drop-reset on `!eos`) but still releases every buffered-but-unread byte's
-    /// connection window (`release_closed_capacity`, streams.rs L1682-1687); an
+    /// connection window (`release_closed_capacity`, streams.rs L1690-1695); an
     /// unfinished one is cancelled (RST_STREAM(CANCEL)).
     fn aclose_body(&self, py: Python<'_>, sid: u32) -> ResetVerdict {
         let mut me = self.lock();
@@ -2661,8 +2773,8 @@ impl H2Streams {
 }
 
 impl Inner {
-    /// h2 recv.rs `release_capacity` (L465, stream) + `release_connection_capacity`
-    /// (L442). `stream_side`: also re-advertise the stream window (not for the
+    /// h2 recv.rs `release_capacity` (L470, stream) + `release_connection_capacity`
+    /// (L447). `stream_side`: also re-advertise the stream window (not for the
     /// padding auto-release of a frame that just arrived... it is, in h2 — both go
     /// through `release_capacity`).
     fn release_capacity_inner(&mut self, sid: u32, n: u32, _stream_side: bool) {

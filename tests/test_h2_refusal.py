@@ -12,7 +12,7 @@ from httpunk.h2.server import H2Server
 
 @pytest.mark.tonio
 async def test_refused_requests_count_toward_local_reset_limit():
-    # h2 tests/h2-tests/tests/server.rs:1536 refused_requests_count_toward_local_reset_limit.
+    # h2 tests/h2-tests/tests/server.rs:1594 refused_requests_count_toward_local_reset_limit.
     done = Event()
     async with tcp_pair() as (client, transport):
         server = H2Server(transport, max_concurrent_streams=0, max_local_error_reset_streams=2)

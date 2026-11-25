@@ -20,7 +20,7 @@ Requests arrive as they are opened; a caller may `spawn` a handler per request t
 serve them concurrently (h2 multiplexes). `request.respond` sends the response,
 whose body is flow-control-gated on the client's windows.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20.
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.21.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ class ServerRequest:
     path: str | None  # the :path pseudo-header
     target: str | None  # alias of path, symmetric with the client's Request.target
     headers: HeaderMap
-    version: Version  # always HTTP_2 (h2 stamps it on every request, server.rs L1674)
+    version: Version  # always HTTP_2 (h2 stamps it on every request, server.rs L1680)
 
     __slots__ = ("method", "scheme", "authority", "path", "target", "headers", "version", "_stream", "_conn")
 
@@ -310,7 +310,7 @@ class ServerConnection(H2ConnectionBase):
         return req
 
     async def graceful_shutdown(self):
-        # h2 `Connection::go_away_gracefully` (proto/connection.rs L656): a TWO-PHASE,
+        # h2 `Connection::go_away_gracefully` (proto/connection.rs L688): a TWO-PHASE,
         # non-blocking shutdown. PHASE 1 — GOAWAY(2^31-1, NO_ERROR) + a shutdown PING,
         # keep accepting AND serving (a request the client already put on the wire
         # before it saw our GOAWAY is served, not refused). PHASE 2 fires on the PING's
@@ -324,7 +324,7 @@ class ServerConnection(H2ConnectionBase):
         built on the push primitives so the two paths cannot drift."""
         if trailers is not None:
             trailers = self._headermap(trailers)
-            # Validate BEFORE the response HEADERS go out (h2 send.rs:80-104).
+            # Validate BEFORE the response HEADERS go out (h2 send.rs:80-97).
             self.check_send_headers(trailers)
         end_stream = body is None and trailers is None
         await self._send_response_head(st, status, headers, end_stream=end_stream)

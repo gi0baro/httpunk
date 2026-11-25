@@ -35,6 +35,8 @@ pub(super) const DEFAULT_MAX_FRAME_SIZE: usize = 16384;
 pub(super) const MAX_MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
 /// Largest permitted SETTINGS_INITIAL_WINDOW_SIZE (2^31 - 1, RFC 7540 §6.5.2).
 pub(super) const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
+/// h2 codec/framed_read.rs:24.
+const MAX_FIELDS_HINT: usize = 64;
 
 const FLAG_END_STREAM: u8 = 0x1;
 
@@ -126,7 +128,7 @@ fn classify_hpack(
             Ok(HpackOutcome::NeedMore)
         }
         Err(frame::Error::MalformedMessage) => Ok(HpackOutcome::StreamReset),
-        // h2 codec/framed_read.rs:201-206, 384-389 (HEADERS / CONTINUATION).
+        // h2 codec/framed_read.rs:215-220, 398-403 (HEADERS / CONTINUATION).
         Err(frame::Error::HeaderListWayTooLarge) => Err(protocol_err_with_debug(
             frame::Reason::ENHANCE_YOUR_CALM,
             "decoded header list size over abuse limit",
@@ -174,7 +176,7 @@ fn headers_event(py: Python<'_>, h: frame::Headers) -> PyResult<Py<PyAny>> {
     let end_stream = h.is_end_stream();
     let is_informational = h.is_informational();
     let is_over_size = h.is_over_size();
-    // h2 recv.rs:178-200: parse every content-length with `frame::parse_u64`;
+    // h2 recv.rs:183-205: parse every content-length with `frame::parse_u64`;
     // an unparsable or conflicting value is a stream PROTOCOL_ERROR.
     let mut content_length = None;
     let mut content_length_invalid = false;
@@ -245,16 +247,16 @@ pub struct Headers {
     pub headers: Py<HeaderMap>,
     /// The first parsed `content-length` (`frame::parse_u64`); `None` if absent
     /// or the first value is unparsable. See `content_length_invalid` for validity
-    /// across all values (h2 recv.rs:178-200).
+    /// across all values (h2 recv.rs:183-205).
     #[pyo3(get)]
     pub content_length: Option<u64>,
-    /// An unparsable or conflicting `content-length` (h2 recv.rs:178-200: PROTOCOL_ERROR).
+    /// An unparsable or conflicting `content-length` (h2 recv.rs:183-205: PROTOCOL_ERROR).
     #[pyo3(get)]
     pub content_length_invalid: bool,
     /// A 1xx response head (h2 `frame::Headers::is_informational`).
     #[pyo3(get)]
     pub is_informational: bool,
-    /// Decoded header list reached SETTINGS_MAX_HEADER_LIST_SIZE (h2 recv.rs:221-238).
+    /// Decoded header list reached SETTINGS_MAX_HEADER_LIST_SIZE (h2 recv.rs:226-243).
     #[pyo3(get)]
     pub is_over_size: bool,
 }
@@ -282,12 +284,12 @@ pub struct Data {
     pub data: Py<PyBytes>,
     /// h2 `frame::Data::flow_controlled_len` — payload + padding + the pad-length
     /// byte. Flow control counts padding; `data` (the payload) does not, so the
-    /// driver must account windows on this, not `len(data)` (h2 recv.rs L653).
+    /// driver must account windows on this, not `len(data)` (h2 recv.rs L673).
     #[pyo3(get)]
     pub flow_controlled_len: usize,
     /// The flow-controlled overhead the app never sees: `flow_controlled_len` minus the
     /// payload (the padding + its length byte, 0 when unpadded) — what h2's `recv_data`
-    /// releases back to the windows on the app's behalf (recv.rs L749-759).
+    /// releases back to the windows on the app's behalf (recv.rs L769-779).
     #[pyo3(get)]
     pub padding: usize,
 }
@@ -410,6 +412,10 @@ pub(super) struct Decoder {
     /// `receive_frames` itself); `preface_ok` once it matched.
     expect_preface: bool,
     preface_ok: bool,
+    /// Moving average of the field count of recent header blocks, used to
+    /// size the next block's `HeaderMap` so decoding it doesn't rehash
+    /// (h2 codec/framed_read.rs:42-44).
+    fields_hint: usize,
     partial: Option<Partial>, // a HEADERS block awaiting CONTINUATION frames
 }
 
@@ -427,12 +433,22 @@ impl Decoder {
             preface_buf: None,
             expect_preface,
             preface_ok: !expect_preface,
+            fields_hint: 0,
             partial: None,
         }
     }
 
+    /// h2 codec/framed_read.rs:136-141.
+    #[allow(clippy::manual_div_ceil)] // upstream's expression, kept verbatim
+    fn update_fields_hint(&mut self, len: usize) {
+        // The newest block weighs 1/4. Rounding up keeps a steady count from
+        // decaying, and the cap bounds what one huge block makes later ones reserve.
+        let len = len.min(MAX_FIELDS_HINT);
+        self.fields_hint = (self.fields_hint * 3 + len + 3) / 4;
+    }
+
     /// Feed inbound bytes; return the complete frames now decodable. A server-role
-    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1454-1477:
+    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1460-1483:
     /// a mismatch is a connection PROTOCOL_ERROR).
     pub(super) fn receive_frames(
         &mut self,
@@ -463,7 +479,7 @@ impl Decoder {
                 | usize::from(self.buf[2]);
             // Enforce SETTINGS_MAX_FRAME_SIZE on the *declared* length before
             // buffering the payload (h2: LengthDelimitedCodec `max_frame_length`
-            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:439-444). This both rejects
+            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:457-462). This both rejects
             // frames h2 rejects and prevents buffering an over-size payload.
             if payload_len > self.max_recv_frame_size {
                 return Err(protocol_err(
@@ -488,7 +504,7 @@ impl Decoder {
     }
 
     /// Feed bytes of the client connection preface (RFC 9113 §3.4) — h2 server.rs
-    /// L1454-1477: `None` while the bytes so far match but the 24 are not all in yet,
+    /// L1460-1483: `None` while the bytes so far match but the 24 are not all in yet,
     /// `Some(true)` once the whole preface matched (any bytes past it are already in
     /// the frame buffer), `Some(false)` on a mismatch.
     pub(super) fn feed_preface(&mut self, data: &[u8]) -> Option<bool> {
@@ -1128,18 +1144,20 @@ impl Decoder {
             Kind::Headers => {
                 // Mirrors h2 framed_read.rs `header_block!(Headers, ...)`.
                 frame_buf.advance(HEADER_LEN);
-                let (mut h, mut payload) = match frame::Headers::load(head, frame_buf) {
-                    Ok(res) => res,
-                    // A stream cannot depend on itself: stream error (RFC §5.4.2).
-                    Err(frame::Error::InvalidDependencyId) => {
-                        return Ok(Some(stream_err_event(
-                            py,
-                            head.stream_id(),
-                            frame::Reason::PROTOCOL_ERROR,
-                        )?));
-                    }
-                    Err(e) => return Err(load_err(e)),
-                };
+                // h2 codec/framed_read.rs:189.
+                let (mut h, mut payload) =
+                    match frame::Headers::load(head, frame_buf, self.fields_hint) {
+                        Ok(res) => res,
+                        // A stream cannot depend on itself: stream error (RFC §5.4.2).
+                        Err(frame::Error::InvalidDependencyId) => {
+                            return Ok(Some(stream_err_event(
+                                py,
+                                head.stream_id(),
+                                frame::Reason::PROTOCOL_ERROR,
+                            )?));
+                        }
+                        Err(e) => return Err(load_err(e)),
+                    };
                 let is_end_headers = h.is_end_headers();
                 // Load HPACK incrementally (h2 decodes even when !END_HEADERS, so
                 // the dynamic table stays in sync and over-size is tracked).
@@ -1157,6 +1175,8 @@ impl Decoder {
                     HpackOutcome::Done | HpackOutcome::NeedMore => {}
                 }
                 if is_end_headers {
+                    // h2 codec/framed_read.rs:424-426.
+                    self.update_fields_hint(h.fields().keys_len());
                     headers_event(py, h)?
                 } else {
                     // Defer until the terminating CONTINUATION (END_HEADERS).
@@ -1189,7 +1209,7 @@ impl Decoder {
                 } else {
                     let cnt = partial.count + 1;
                     if cnt > self.max_continuation_frames {
-                        // h2 codec/framed_read.rs:337-340.
+                        // h2 codec/framed_read.rs:351-354.
                         return Err(protocol_err_with_debug(
                             frame::Reason::ENHANCE_YOUR_CALM,
                             "too_many_continuations",
@@ -1233,6 +1253,8 @@ impl Decoder {
                     HpackOutcome::Done | HpackOutcome::NeedMore => {}
                 }
                 if is_end_headers {
+                    // h2 codec/framed_read.rs:424-426.
+                    self.update_fields_hint(partial.frame.fields().keys_len());
                     headers_event(py, partial.frame)?
                 } else {
                     self.partial = Some(partial);

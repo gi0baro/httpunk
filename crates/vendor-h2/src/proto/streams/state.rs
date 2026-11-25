@@ -76,7 +76,8 @@ enum Peer {
 enum Cause {
     EndStream,
     Error(Error),
-    /// The stream was reset after the receive half had already reached EOS.
+    /// The stream was reset, or the connection failed, after the receive half
+    /// had already reached EOS.
     ErrorAfterEndStream(Error),
 
     /// This indicates to the connection that a reset frame must be sent out
@@ -296,27 +297,36 @@ impl State {
 
     /// Handle a connection-level error.
     pub fn handle_error(&mut self, err: &proto::Error) {
+        let recv_end_stream = self.is_recv_end_stream();
         match self.inner {
             Closed(..) => {}
             _ => {
                 tracing::trace!("handle_error; err={:?}", err);
-                self.inner = Closed(Cause::Error(err.clone()));
+                self.inner = Closed(if recv_end_stream {
+                    Cause::ErrorAfterEndStream(err.clone())
+                } else {
+                    Cause::Error(err.clone())
+                });
             }
         }
     }
 
     pub fn recv_eof(&mut self) {
+        let recv_end_stream = self.is_recv_end_stream();
         match self.inner {
             Closed(..) => {}
             ref state => {
                 tracing::trace!("recv_eof; state={:?}", state);
-                self.inner = Closed(Cause::Error(
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "stream closed because of a broken pipe",
-                    )
-                    .into(),
-                ));
+                let error = io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stream closed because of a broken pipe",
+                )
+                .into();
+                self.inner = Closed(if recv_end_stream {
+                    Cause::ErrorAfterEndStream(error)
+                } else {
+                    Cause::Error(error)
+                });
             }
         }
     }

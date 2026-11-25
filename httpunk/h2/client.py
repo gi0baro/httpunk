@@ -9,7 +9,7 @@ public per-connection handle, the Python analogue of hyper's
 `SendRequest` collapsed into one async-context-managed object. Low-level by
 design — no pool, connector, or high-level client.
 
-Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.20.
+Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.21.
 """
 
 from __future__ import annotations
@@ -125,11 +125,11 @@ class Connection(H2ConnectionBase):
         self._slot_evt.set()  # wake open/ready waiters (they re-check the stored condition)
 
     async def connect(self):
-        # h2: client.rs `handshake` (L1250) — over the caller-supplied transport,
+        # h2: client.rs `handshake` (L1256) — over the caller-supplied transport,
         # flush the client preface + our initial SETTINGS, spawn the driver, then
         # wait for the peer's initial SETTINGS before we're ready for requests.
         await self._begin()
-        # DIVERGENCE: client.rs L1381 returns without waiting for peer SETTINGS.
+        # DIVERGENCE: client.rs L1387 returns without waiting for peer SETTINGS.
         # Keep this synchronization so connect/close cannot race the coroutine pump's handshake.
         await self._ready_evt.wait()
         err = self.conn_error()
@@ -279,7 +279,8 @@ class H2Connection(BaseClientConnection):
         the setting. `max_header_list_size` defaults to 16 KB.
         `max_local_error_reset_streams` defaults to 1024; None disables the limit.
         `max_pending_accept_reset_streams`, `max_concurrent_reset_streams`, and
-        `reset_stream_duration` default to None for h2's defaults (20, 50, and 1 s).
+        `reset_stream_duration` default to None for h2's defaults (20; twice
+        `max_concurrent_streams`, at least 50, or 8192 if unset; and 5 s).
         `reset_stream_duration` is a finite, nonnegative number of seconds.
         `max_send_buf_size` (1 MB) caps per-stream request DATA queued for the
         connection's writer; the body sender awaits room as it awaits flow-control
@@ -336,7 +337,7 @@ class H2Connection(BaseClientConnection):
         # bodyless too. A HEAD request's response never has a body regardless of
         # content-length.
         bodyless = request.body is None or (isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0)
-        # Validate trailers BEFORE opening the stream (h2 send.rs:80-104): they are sent by
+        # Validate trailers BEFORE opening the stream (h2 send.rs:80-97): they are sent by
         # the detached background body writer, whose errors are suppressed — a late
         # reject there would silently leave the stream half-open.
         if request.trailers is not None:
@@ -364,5 +365,5 @@ class H2Connection(BaseClientConnection):
             if err is not None:
                 raise fresh_exc(err) from err
             raise ConnectionClosedError("connection closed before response")
-        # h2 stamps every response `Version::HTTP_2` (h2 client.rs L1726).
+        # h2 stamps every response `Version::HTTP_2` (h2 client.rs L1732).
         return Response(stream.status, stream.headers, H2ResponseBody(stream, self._conn), version=Version.HTTP_2)

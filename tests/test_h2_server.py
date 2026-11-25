@@ -177,7 +177,7 @@ async def test_server_request_headers():
             assert resp.status == 204
             assert await resp.read() == b""
         s.cancel()
-    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1674)
+    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1680)
 
     assert seen["scheme"] == "http"
     assert seen["authority"] == f"{host}:{port}"
@@ -231,13 +231,13 @@ async def _too_big_headers(end_stream):
 
 @pytest.mark.tonio
 async def test_too_big_headers_sends_431():
-    # h2 tests/h2-tests/tests/server.rs:1031 too_big_headers_sends_431.
+    # h2 tests/h2-tests/tests/server.rs:1089 too_big_headers_sends_431.
     await _too_big_headers(end_stream=True)
 
 
 @pytest.mark.tonio
 async def test_too_big_headers_sends_reset_after_431_if_not_eos():
-    # h2 tests/h2-tests/tests/server.rs:1067 too_big_headers_sends_reset_after_431_if_not_eos.
+    # h2 tests/h2-tests/tests/server.rs:1125 too_big_headers_sends_reset_after_431_if_not_eos.
     await _too_big_headers(end_stream=False)
 
 
@@ -389,6 +389,51 @@ async def test_server_max_local_error_reset_streams_option():
         await peer.send_request_headers(3, "GET", "http://x/p", bad, end_stream=True)
         ga = await peer.recv(GoAway)
         assert ga is not None and ga.error_code == H2Reason.ENHANCE_YOUR_CALM
+
+
+@pytest.mark.tonio
+async def test_early_response_no_error_resets_do_not_affect_local_limit():
+    # h2 0.4.21 tests/h2-tests/tests/server.rs:696 early_response_no_error_resets_do_not_affect_local_limit.
+    done = Event()
+    accepted = []  # checked here: an assertion inside `serve` would not fail the test
+
+    async def serve(transport):
+        try:
+            # No `date`: upstream's bare h2 server sends a response HEADERS with :status only.
+            async with H2Server(transport, max_local_error_reset_streams=1, auto_date_header=False) as server:
+                for _ in range(3):
+                    req = await server.accept()
+                    accepted.append(req.method)
+                    await req.respond(200, body=b"ok")
+                req = await server.accept()
+                accepted.append(req.method)
+                await req.respond(200)
+                accepted.append(await server.accept())
+        except Exception as exc:
+            accepted.append(exc)
+        finally:
+            done.set()
+
+    async with h2_peer_against(serve) as peer:
+        await peer.handshake()
+        # Leave each request body open so the complete response resets it with NO_ERROR.
+        # Exceed the error limit.
+        for sid in (1, 3, 5):
+            await peer.send_request_headers(sid, "POST", "https://example.com/")
+            head = await peer.expect(Headers, WindowUpdate)
+            assert (head.stream_id, head.status, head.end_stream, list(head.headers.items())) == (sid, 200, False, [])
+            data = await peer.expect(Data, WindowUpdate)
+            assert (data.stream_id, data.data, data.end_stream) == (sid, b"ok", True)
+            rst = await peer.expect(RstStream, WindowUpdate)
+            assert (rst.stream_id, rst.error_code) == (sid, H2Reason.NO_ERROR)
+        # The connection must still accept and complete another request.
+        await peer.send_request_headers(7, "GET", "https://example.com/", end_stream=True)
+        head = await peer.expect(Headers, WindowUpdate)
+        assert (head.stream_id, head.status, head.end_stream, list(head.headers.items())) == (7, 200, True, [])
+        peer.close()
+        await done.wait()
+
+    assert accepted == ["POST", "POST", "POST", "GET", None]
 
 
 @pytest.mark.tonio
@@ -788,7 +833,7 @@ async def test_h2_request_trailers_round_trip():
 @pytest.mark.tonio
 async def test_h2_connection_specific_trailers_rejected():
     """Trailers are a HEADERS block, so connection-specific fields are rejected
-    (RFC 9113 §8.2.2; h2 send.rs:80-104) — BEFORE the stream is opened, so the
+    (RFC 9113 §8.2.2; h2 send.rs:80-97) — BEFORE the stream is opened, so the
     connection stays fully usable and a subsequent valid trailer still sends."""
     listener, host, port = await listen()
     seen = {}
@@ -960,7 +1005,7 @@ async def test_server_closes_after_goaway_reply_no_streams_ever():
 async def test_server_closes_after_goaway_received_mid_request():
     """Peer GOAWAY(last=1) while stream 1 is still in flight, and the peer sends NOTHING
     more. Stream 1 finishing is a local event — h2's `drop_stream_ref` wakes the
-    connection task so the idle check re-runs (streams.rs L1673-1675); httpunk must do the
+    connection task so the idle check re-runs (streams.rs L1681-1683); httpunk must do the
     same from the stream-close path, not only after inbound bytes."""
     done = Event()
     async with h2_peer_against(lambda transport: _serve_and_report(transport, done)) as peer:
@@ -979,8 +1024,8 @@ async def test_server_closes_after_goaway_received_mid_request():
 async def test_server_closes_idle_after_phase1_goaway():
     """A received GOAWAY closes an idle connection whatever its last-stream-id, a
     phase-1 graceful one (2^31-1) included: h2 stores every received GOAWAY in
-    `inner.error` (proto/connection.rs L596) and, once no stream remains, replies
-    GOAWAY(NO_ERROR) and closes (L327-333). `should_close_on_idle`'s `StreamId::MAX`
+    `inner.error` (proto/connection.rs L628) and, once no stream remains, replies
+    GOAWAY(NO_ERROR) and closes (L351-357). `should_close_on_idle`'s `StreamId::MAX`
     exclusion concerns only a GOAWAY the server sent itself (go_away.rs L108-114)."""
     done = Event()
     async with h2_peer_against(lambda transport: _serve_and_report(transport, done)) as peer:

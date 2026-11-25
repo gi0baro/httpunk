@@ -100,7 +100,7 @@ class BaseServer(Generic[_RequestT]):
         try:
             await self._conn.start()
         except BaseException:
-            # h2 server.rs:1500-1519: the handshake owns the flushing codec/IO.
+            # h2 server.rs:1506-1525: the handshake owns the flushing codec/IO.
             self._conn.abort()
             raise
         return self

@@ -121,7 +121,7 @@ impl H2StreamState {
 
     /// Schedule a reset on a stream that is still open — check-and-act under one
     /// acquisition, so a peer's reset landing in between cannot trip the vendored
-    /// `debug_assert!(!self.is_closed())` (state.rs L347). Returns whether it was
+    /// `debug_assert!(!self.is_closed())` (state.rs L358). Returns whether it was
     /// scheduled (`False`: already closed, nothing to reset).
     fn set_scheduled_reset(&self, reason: u32) -> bool {
         let mut st = self.inner.lock().unwrap();
@@ -297,15 +297,15 @@ impl H2FlowControl {
 // `proto/streams/stream.rs` (`ContentLength`) and `proto/streams/counts.rs` (the
 // DATA-frame budget) are not vendored — they are the async stream store and its
 // bookkeeping, rewritten in Python. The two pure pieces of numeric state they own
-// are adapted here (h2 0.4.20 line references), so the driver does no
+// are adapted here (h2 0.4.21 line references), so the driver does no
 // per-frame arithmetic itself.
 
-/// h2 `proto/mod.rs` L38-40 (0.4.20): the DATA-framing budget constants.
+/// h2 `proto/mod.rs` L38-40 (0.4.21): the DATA-framing budget constants.
 pub const DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD: usize = 256;
 pub const DEFAULT_DATA_FRAME_BUDGET: usize = DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 100;
 pub const MAX_RECV_EMPTY_DATA_FRAMES: usize = 100;
 
-/// h2 stream.rs `ContentLength` (L121-125): the declared body length of a message,
+/// h2 stream.rs `ContentLength` (L127-131): the declared body length of a message,
 /// decremented per DATA frame and checked at END_STREAM.
 #[derive(Clone, Copy)]
 pub(super) enum ContentLength {
@@ -325,12 +325,12 @@ impl ContentLength {
         }
     }
 
-    /// h2 `ContentLength::is_head` (stream.rs L595).
+    /// h2 `ContentLength::is_head` (stream.rs L602).
     pub(super) fn is_head(self) -> bool {
         matches!(self, ContentLength::Head)
     }
 
-    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L202-205): a no-op
+    /// Record a parsed `content-length` (h2 recv.rs `recv_headers` L207-210): a no-op
     /// for a HEAD response, whose length h2 validates but does not store.
     pub(super) fn set(&mut self, value: u64) {
         if !matches!(*self, ContentLength::Head) {
@@ -338,7 +338,7 @@ impl ContentLength {
         }
     }
 
-    /// h2 stream.rs `dec_content_length` (L338-351): consume `len` body bytes. `false`
+    /// h2 stream.rs `dec_content_length` (L345-358): consume `len` body bytes. `false`
     /// = more data than declared, or any data on a HEAD response.
     pub(super) fn dec(&mut self, len: u64) -> bool {
         match *self {
@@ -354,7 +354,7 @@ impl ContentLength {
         }
     }
 
-    /// h2 stream.rs `ensure_content_length_zero` (L353-359): `false` = a declared
+    /// h2 stream.rs `ensure_content_length_zero` (L360-366): `false` = a declared
     /// length still unsatisfied at END_STREAM.
     pub(super) fn is_satisfied(self) -> bool {
         !matches!(self, ContentLength::Remaining(n) if n != 0)
@@ -427,14 +427,16 @@ pub(super) struct DataFrameCounts {
 /// BYTES, not frame COUNT: a peer fragmenting
 /// data into tiny frames bloats the buffered chunk queue while staying inside every
 /// window; non-final frames below the threshold consume the overhead they impose,
-/// larger ones earn it back, empty ones count against their own lifetime cap.
+/// larger ones earn it back, empty ones count against their own lifetime cap unless
+/// their stream's empty-frame allowance covers them (the caller decides, h2
+/// recv.rs:783-796).
 #[pyclass(module = "httpunk._httpunk", name = "H2DataFrameBudget", frozen)]
 pub struct H2DataFrameBudget {
     inner: Mutex<DataFrameCounts>,
 }
 
 pub(super) fn budget_exhausted() -> PyErr {
-    // h2 proto/streams/streams.rs:659-662: BudgetExhausted -> GOAWAY with data.
+    // h2 proto/streams/streams.rs:662-668: BudgetExhausted -> GOAWAY with data.
     protocol_err_with_debug(
         Reason::ENHANCE_YOUR_CALM,
         "too_many_data_frames",
@@ -458,8 +460,9 @@ impl DataFrameCounts {
         }
     }
 
-    /// `record_data_frame` for a received NON-FINAL DATA frame (the caller guards:
-    /// a final frame is never budgeted, streams.rs L655-662). Returns the charge taken
+    /// `record_data_frame` for a received NON-FINAL DATA frame whose accounting is
+    /// `Charge` (the caller guards, h2 streams.rs:659-669: a final frame, or an empty
+    /// one the stream's allowance covers, is never recorded). Returns the charge taken
     /// from the budget (0 for an empty or a large frame) — what `release` gives back
     /// once the chunk leaves the buffer. Raises `H2ProtocolError(ENHANCE_YOUR_CALM)`
     /// on exhaustion of the byte budget or the empty-frame cap.
@@ -525,8 +528,9 @@ impl H2DataFrameBudget {
         self.inner.lock().unwrap().available()
     }
 
-    /// Empty non-final DATA frames received over the connection's lifetime (counts.rs
-    /// `num_recv_empty_data_frames`, capped at MAX_RECV_EMPTY_DATA_FRAMES).
+    /// Empty non-final DATA frames charged over the connection's lifetime, those no
+    /// stream allowance covered (counts.rs `num_recv_empty_data_frames`, capped at
+    /// MAX_RECV_EMPTY_DATA_FRAMES).
     #[getter]
     fn empty_frames(&self) -> usize {
         self.inner.lock().unwrap().empty_frames()
