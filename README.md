@@ -1,17 +1,16 @@
-# httpunk
+# HTTPunk
 
-httpunk is a Rust-powered async HTTP library for Python.
+HTTPunk is a Rust-powered async HTTP library for Python.
 It's powered by the [hyper](https://github.com/hyperium/hyper) stack and Rust crates like [http](https://github.com/hyperium/http).
 
-httpunk is deliberately *low-level*: you bring your own connected transport, and
+HTTPunk is deliberately *low-level*: you bring your own connected transport, and
 build requests and read responses directly. It's meant to be a solid, performant
 base for building HTTP clients and servers on top of.
+For a high-level client implementation, you can check out [punkreq](https://github.com/gi0baro/punkreq). 
 
-httpunk's API mirrors hyper's wherever possible.
+HTTPunk's API mirrors hyper's wherever possible.
 
-> **Warning:** httpunk is in an early stage and still work in progress.
-
-> **Note:** httpunk was built with substantial help from LLMs, under human supervision.
+> **Note:** HTTPunk was built with substantial help from LLMs, under human supervision.
 
 ## In a nutshell
 
@@ -67,7 +66,7 @@ asyncio.run(main())
 pip install httpunk
 ```
 
-httpunk supports additional backends beyond `asyncio`, but they require extra dependencies.
+HTTPunk supports additional backends beyond `asyncio`, but they require extra dependencies.
 Enable one via the relevant extra:
 
 ```
@@ -288,7 +287,7 @@ h.raw_items()                # [(b'content-type', b'text/plain'), (b'set-cookie'
 
 ### Errors
 
-httpunk's exceptions all derive from a common `HTTPunkError` root, with one class per
+HTTPunk's exceptions all derive from a common `HTTPunkError` root, with one class per
 public error kind of the upstream crate, so a caller can match on what hyper or h2 would
 have reported. `ConnectionClosedError` is **protocol-neutral** — hyper's `Io` and h2's
 `Io`: the transport failed with work in flight — so it sits directly under the root. The
@@ -534,4 +533,4 @@ asyncio.run(main())
 
 ## License
 
-httpunk is released under the BSD 3-Clause License.
+HTTPunk is released under the BSD 3-Clause License.
