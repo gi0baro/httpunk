@@ -325,11 +325,12 @@ class H2ConnectionBase(H2Streams):
                             self._after(v.flags)
                 # After a peer GOAWAY, once every in-flight stream has finished, queue our
                 # acknowledging GOAWAY(NO_ERROR) and stop serving (h2 `go_away_now`).
+                # Nonzero: the exchange is complete, by this call or earlier in the batch
+                # (whose CONN_DONE was acted on there): read nothing more.
                 flags = self.maybe_goaway_reply()
                 if flags:
                     self._after(flags)
-                    if flags & H2_FLAG_CONN_DONE:
-                        break
+                    break
         except H2Error as exc:
             # A protocol/flow violation we detected: notify the peer with GOAWAY, then
             # tear down (h2 `go_away_now`). Best-effort: the connection is going down.
@@ -562,8 +563,9 @@ class H2ConnectionBase(H2Streams):
     @staticmethod
     def check_send_headers(fields):
         """RFC 9113 §8.2.2 (h2 send.rs `check_headers`): reject connection-specific
-        fields in an outbound HEADERS block — a caller error (`H2UserError`), the
-        connection and stream stay usable."""
+        fields in outbound trailers — a caller error (`H2UserError`), the connection and
+        stream stay usable. Heads never get here: they are stripped instead (hyper
+        `strip_connection_headers`)."""
         H2Codec.check_send_headers(fields)
 
     @staticmethod

@@ -100,8 +100,13 @@ class ServerRequest:
         """Send the whole response: HEADERS (+ body, flow-control-gated) (+ a trailing
         HEADERS frame). `body` is None, `bytes`, or a (sync/async) iterable of `bytes`.
         The pull convenience over `send_response` (h2: `SendResponse::send_response` +
-        hyper's `PipeToSendStream`). `trailers` are validated (RFC 9113 §8.2.2) before
-        anything is sent, so a rejected call leaves the stream untouched.
+        hyper's `PipeToSendStream`). Connection-specific fields are stripped from
+        `headers` (hyper `strip_connection_headers`), not from `trailers`: those are
+        validated (RFC 9113 §8.2.2) before anything is sent, so a rejected call leaves
+        the stream untouched. As hyper's, a body of known size not at its end (`bytes`, or
+        none with `trailers`) declares its length as `content-length` unless `headers`
+        carry one; an empty `bytes` body without `trailers` declares none and, like no
+        body, ends the stream on HEADERS.
 
         Raises `StreamResetError` with the client's reason if it reset the stream (also
         after its own END_STREAM, the cancelled-GET case). With an async body that is
@@ -117,6 +122,8 @@ class ServerRequest:
         body with (`send_data` / `send_trailers` / `send_reset`). `end_stream=True` ends
         the stream on the HEADERS frame (a bodyless response). h2:
         `SendResponse::send_response(response, end_of_stream) -> SendStream`.
+        Connection-specific fields are stripped from `headers` (hyper
+        `strip_connection_headers`).
 
         `detect_eof` is accepted for API symmetry with the HTTP/1 twin and has no effect
         here: a client abandoning the request is a RST_STREAM the connection's pump
@@ -180,8 +187,8 @@ class SendStream:
 
     async def send_trailers(self, trailers: HeadersInput) -> None:
         """End the stream with a trailing HEADERS frame (h2 `SendStream::send_trailers`);
-        connection-specific fields are rejected as for any HEADERS block (RFC 9113
-        §8.2.2, h2 `check_headers`)."""
+        connection-specific fields are rejected (RFC 9113 §8.2.2, h2 `check_headers`):
+        hyper strips them from heads only."""
         self._check_open()
         hdrs = trailers if isinstance(trailers, HeaderMap) else HeaderMap(trailers)
         self._conn.check_send_headers(hdrs)
@@ -326,22 +333,33 @@ class ServerConnection(H2ConnectionBase):
             trailers = self._headermap(trailers)
             # Validate BEFORE the response HEADERS go out (h2 send.rs:80-97).
             self.check_send_headers(trailers)
-        end_stream = body is None and trailers is None
-        await self._send_response_head(st, status, headers, end_stream=end_stream)
+        # hyper proto/h2/server.rs:517-530: END_STREAM rides HEADERS when
+        # `body.is_end_stream()`: no body (`Empty`) or an empty `Full`, trailers none.
+        end_stream = trailers is None and (body is None or (isinstance(body, (bytes, bytearray)) and not body))
+        # hyper proto/h2/server.rs:517-521: the exact size of a body not at its end
+        # (`Empty` / `Full` with trailers pending, a non-empty `Full`) is declared.
+        if isinstance(body, (bytes, bytearray)) and (body or trailers is not None):
+            content_length = len(body)
+        elif body is None and trailers is not None:
+            content_length = 0
+        else:
+            content_length = None
+        await self._send_response_head(st, status, headers, end_stream=end_stream, content_length=content_length)
         if not end_stream:
             await self._send_body(st, body, trailers)
 
-    async def _send_response_head(self, st, status, headers, *, end_stream):
+    async def _send_response_head(self, st, status, headers, *, end_stream, content_length=None):
         # One locked step (h2 `SendResponse::send_response`, state.rs `send_open`):
-        # the RFC 9113 §8.2.2 check, the transition, the HPACK encode and the queue
-        # append — and for a bodyless response the completion: HEADERS closed the send
-        # half, and the request's recv half goes with it (h2 drops the request's
-        # RecvStream once the response is sent: an unread request body is
-        # RST_STREAM(NO_ERROR)ed, the nginx-compat rule, and its in-flight window
-        # returned, `release_closed_capacity`; `handle` = the reader to notify). A stream
-        # the peer reset while the handler was computing surfaces as the stop (hyper's
-        # first `poll_reset` window, proto/h2/server.rs L458).
-        v = self.send_response_head(st.id, status, self._headermap(headers), end_stream)
+        # hyper's connection-header strip and `content-length` (`content_length`: the
+        # exact size of a body not at its end; the push path knows none), the transition,
+        # the HPACK encode and the queue append — and for a bodyless response the
+        # completion: HEADERS closed the send half, and the request's recv half goes
+        # with it (h2 drops the request's RecvStream once the response is sent: an unread
+        # request body is RST_STREAM(NO_ERROR)ed, the nginx-compat rule, and its
+        # in-flight window returned, `release_closed_capacity`; `handle` = the reader to
+        # notify). A stream the peer reset while the handler was computing surfaces as
+        # the stop (hyper's first `poll_reset` window, proto/h2/server.rs L458).
+        v = self.send_response_head(st.id, status, self._headermap(headers), end_stream, content_length)
         stop = v.stopped
         if stop is not None:
             if stop.reason is None and not stop.conn and st.stop is None:

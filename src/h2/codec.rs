@@ -9,7 +9,10 @@
 //! can never be observed; in debug a poisoned lock surfaces as a clean panic.)
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use http::header::{CONTENT_LENGTH, DATE};
+use http::header::{
+    CONNECTION, CONTENT_LENGTH, DATE, Entry, HeaderName, HeaderValue, TE, TRANSFER_ENCODING,
+    UPGRADE,
+};
 use http::{Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -645,18 +648,26 @@ pub(super) struct Codec {
 /// Build a request HEADERS frame (h2 client.rs `Peer::convert_send_message`): the
 /// request-target as `http::Uri` sees it — absolute-form carries its own scheme +
 /// authority; origin-form (a bare path) takes the connection's, which hyper's h2
-/// client fills in the same way (proto/h2/client.rs).
+/// client fills in the same way (proto/h2/client.rs). `content_length`: the body's
+/// exact size, if known (hyper `body.size_hint().exact()`); `fields` arrive stripped.
 pub(super) fn build_request_headers(
     stream_id: u32,
     method: &str,
     target: &str,
-    fields: http::HeaderMap,
+    mut fields: http::HeaderMap,
     end_stream: bool,
     scheme: Option<&str>,
     authority: Option<&str>,
+    content_length: Option<u64>,
 ) -> PyResult<frame::Headers> {
     let method =
         Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
+    // hyper 1.13.0 src/proto/h2/client.rs:758-762, right after the strip.
+    if let Some(len) = content_length
+        && (len != 0 || method_has_defined_payload_semantics(&method))
+    {
+        set_content_length_if_missing(&mut fields, len);
+    }
     let uri: Uri = target.parse().map_err(|e| value_err("invalid url", e))?;
     let uri = if uri.scheme().is_some() && uri.authority().is_some() {
         uri
@@ -686,18 +697,25 @@ pub(super) fn build_request_headers(
 
 /// Build a response HEADERS frame. `auto_date`: hyper's h2 server inserts `Date`
 /// when the app didn't set one (proto/h2/server.rs L484
-/// `entry(DATE).or_insert_with(date::update_and_header_value)`).
+/// `entry(DATE).or_insert_with(date::update_and_header_value)`). `content_length`: the
+/// exact size of a body not at its end (hyper `!body.is_end_stream()` and
+/// `body.size_hint().exact()`); `fields` arrive stripped.
 pub(super) fn build_response_headers(
     stream_id: u32,
     status: u16,
     mut fields: http::HeaderMap,
     end_stream: bool,
     auto_date: bool,
+    content_length: Option<u64>,
 ) -> PyResult<frame::Headers> {
     let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
     let pseudo = frame::Pseudo::response(status);
     if auto_date {
         fields.entry(DATE).or_insert_with(date_header_value);
+    }
+    // hyper 1.13.0 src/proto/h2/server.rs:517-521, after the strip and the `date`.
+    if let Some(len) = content_length {
+        set_content_length_if_missing(&mut fields, len);
     }
     let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
     // A bodyless response carries END_STREAM on HEADERS (e.g. a HEAD response,
@@ -887,7 +905,8 @@ impl H2Codec {
     /// h2 send.rs `check_headers` (RFC 9113 §8.2.2): connection-specific fields in an
     /// outbound HEADERS block, and a `te` other than exactly `trailers`, are
     /// `UserError::MalformedHeaders` (`H2UserError`). A caller error, not a protocol
-    /// one: the connection and stream stay usable.
+    /// one: the connection and stream stay usable. For trailers: heads are stripped
+    /// instead (`strip_connection_headers`).
     #[staticmethod]
     fn check_send_headers(headers: &HeaderMap) -> PyResult<()> {
         headers.with_inner(check_send_fields)
@@ -985,9 +1004,9 @@ impl H2Codec {
         scheme: Option<&str>,
         authority: Option<&str>,
     ) -> PyResult<Py<PyBytes>> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let fields = headers.map_or_default(HeaderMap::snapshot);
         let hframe = build_request_headers(
-            stream_id, method, target, fields, end_stream, scheme, authority,
+            stream_id, method, target, fields, end_stream, scheme, authority, None,
         )?;
         let mut dst = BytesMut::new();
         self.inner
@@ -1008,8 +1027,9 @@ impl H2Codec {
         end_stream: bool,
         auto_date: bool,
     ) -> PyResult<Py<PyBytes>> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
-        let hframe = build_response_headers(stream_id, status, fields, end_stream, auto_date)?;
+        let fields = headers.map_or_default(HeaderMap::snapshot);
+        let hframe =
+            build_response_headers(stream_id, status, fields, end_stream, auto_date, None)?;
         let mut dst = BytesMut::new();
         self.inner
             .lock()
@@ -1103,6 +1123,82 @@ impl H2Codec {
         encode_rst_stream(&mut dst, stream_id, error_code);
         PyBytes::new(py, &dst).unbind()
     }
+}
+
+// hyper 1.13.0 src/proto/h2/mod.rs:32-41.
+// List of connection headers from RFC 9110 Section 7.6.1
+//
+// TE headers are allowed in HTTP/2 requests as long as the value is "trailers", so they're
+// tested separately.
+static CONNECTION_HEADERS: [HeaderName; 4] = [
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    TRANSFER_ENCODING,
+    UPGRADE,
+];
+
+/// hyper 1.13.0 src/proto/h2/mod.rs:43-48.
+pub(super) enum MessageKind {
+    Request,
+    Response,
+}
+
+/// hyper 1.13.0 src/proto/h2/mod.rs:50-94 `strip_connection_headers` (its `warn!`
+/// logging has no counterpart). hyper applies it to the head it hands to h2, the
+/// client's request (proto/h2/client.rs:757) and the server's response
+/// (proto/h2/server.rs:475), so h2's `check_headers` never refuses a head; trailers
+/// are not stripped and stay checked (`check_send_fields`).
+pub(super) fn strip_connection_headers(headers: &mut http::HeaderMap, kind: MessageKind) {
+    for header in &CONNECTION_HEADERS {
+        headers.remove(header);
+    }
+
+    if matches!(kind, MessageKind::Request) {
+        if headers
+            .get(TE)
+            .is_some_and(|te_header| te_header != "trailers")
+        {
+            headers.remove(TE);
+        }
+    } else {
+        headers.remove(TE);
+    }
+
+    if let Entry::Occupied(entry) = headers.entry(CONNECTION) {
+        // A `Connection` header may have a comma-separated list of names of other headers that
+        // are meant for only this specific connection.
+        //
+        // Iterate these names and remove them as headers. Connection-specific headers are
+        // forbidden in HTTP2, as that information has been moved into frame types of the h2
+        // protocol.
+        let (_, values) = entry.remove_entry_mult();
+        let values: Vec<_> = values.collect();
+        for header in values {
+            if let Ok(header_contents) = header.to_str() {
+                for name in header_contents.split(',') {
+                    let name = name.trim();
+                    headers.remove(name);
+                }
+            }
+        }
+    }
+}
+
+/// hyper 1.13.0 src/headers.rs:128-134 (compiled out of the vendored crate with hyper's
+/// `http2` feature).
+fn method_has_defined_payload_semantics(method: &Method) -> bool {
+    !matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::DELETE | Method::CONNECT
+    )
+}
+
+/// hyper 1.13.0 src/headers.rs:136-141 (compiled out of the vendored crate with hyper's
+/// `http2` feature): a `content-length` the caller set is left alone.
+fn set_content_length_if_missing(headers: &mut http::HeaderMap, len: u64) {
+    headers
+        .entry(CONTENT_LENGTH)
+        .or_insert_with(|| HeaderValue::from(len));
 }
 
 /// h2 send.rs `check_headers` over a raw `http::HeaderMap` (see `H2Codec::check_send_headers`).

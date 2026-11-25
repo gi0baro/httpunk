@@ -228,7 +228,7 @@ impl H1Codec {
         let m =
             Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
         let uri: Uri = url.parse().map_err(|e| value_err("invalid url", e))?;
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let fields = headers.map_or_default(HeaderMap::snapshot);
         let body = if chunked {
             Some(None)
         } else {
@@ -509,7 +509,7 @@ impl H1Codec {
         content_length: Option<u64>,
         chunked: bool,
     ) -> PyResult<Py<PyBytes>> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let fields = headers.map_or_default(HeaderMap::snapshot);
         let body = if chunked {
             Some(None)
         } else {

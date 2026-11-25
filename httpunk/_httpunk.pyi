@@ -527,8 +527,9 @@ class H2Codec:
 
     @staticmethod
     def check_send_headers(headers: HeaderMap) -> None:
-        """h2 send.rs `check_headers`: raises `H2UserError(kind="malformed_headers")` for a
-        connection-specific field or a `te` other than exactly `trailers`."""
+        """h2 send.rs `check_headers` (applied to trailers; heads are stripped instead):
+        raises `H2UserError(kind="malformed_headers")` for a connection-specific field or
+        a `te` other than exactly `trailers`."""
 
     @staticmethod
     def method_is_head(method: str) -> bool:
@@ -1049,7 +1050,9 @@ class H2Streams:
     def recv_go_away(self, frame: H2FrameGoAway) -> tuple[list[tuple[object, H2Stopped]], int]:
         """`(aborted, flags)`: the streams above last_stream_id, with their stop."""
 
-    def maybe_goaway_reply(self) -> int: ...
+    def maybe_goaway_reply(self) -> int:
+        """Flags; nonzero once the GOAWAY exchange is complete (now or earlier)."""
+
     def send_goaway(self, reason: int, debug_data: bytes | None = None) -> int: ...
     def fail(self, exc: BaseException | None = ..., message: str = ...) -> list[tuple[object, H2Stopped]]:
         """Record the error (first writer wins; `exc` is a traceback-free copy) and fan
@@ -1078,16 +1081,25 @@ class H2Streams:
         *,
         scheme: str | None = ...,
         authority: str | None = ...,
+        content_length: int | None = None,
     ) -> int | None:
-        """Allocate the id, `send_open`, insert, HPACK-encode + queue the HEADERS. None:
-        the connection failed / GOAWAY'd (the slot is released)."""
+        """Strip the head's connection-specific fields (hyper `strip_connection_headers`,
+        on a snapshot) and declare `content_length`, the body's exact size if known, as
+        hyper does (`content-length` unless set; for an empty body only on a method with
+        defined payload semantics), allocate the id, `send_open`, insert, HPACK-encode +
+        queue the HEADERS. None: the connection failed / GOAWAY'd (the slot is released)."""
 
     # ----- sending -----
     def send_data(self, sid: int, data: bytes, offset: int, end_stream: bool) -> H2SendVerdict: ...
     def send_trailers(self, sid: int, trailers: HeaderMap) -> H2SendVerdict: ...
     def send_response_head(
-        self, sid: int, status: int, headers: HeaderMap | None, end_stream: bool
-    ) -> H2SendVerdict: ...
+        self, sid: int, status: int, headers: HeaderMap | None, end_stream: bool, content_length: int | None = None
+    ) -> H2SendVerdict:
+        """The response HEADERS, connection-specific fields stripped (hyper
+        `strip_connection_headers`, on a snapshot), then `date` (`auto_date_header`) and
+        `content-length` from `content_length` (the exact size of a body not at its end)
+        added unless set."""
+
     def reset_stream(self, sid: int, reason: int, initiator: str = ...) -> H2ResetVerdict: ...
     def reset_on_error(self, sid: int, reason: int) -> H2ResetVerdict:
         """Library reset after a peer violation; counts toward the ENHANCE_YOUR_CALM cap."""

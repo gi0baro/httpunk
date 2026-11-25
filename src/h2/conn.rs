@@ -78,6 +78,10 @@ pub const FLAG_STOP_ACCEPTING: u8 = 8;
 /// The send rotation moved (a turn ended, a stream left, window arrived for a
 /// waiter): ask `next_capacity_wake` which sender's turn it is now.
 pub const FLAG_CAPACITY: u8 = 16;
+/// The read pump's per-batch check only: the GOAWAY exchange completed before the
+/// call (its CONN_DONE went to that caller), so there is nothing to act on, but the
+/// read pump stops.
+const FLAG_GOAWAY_EXCHANGED: u8 = 32;
 
 /// `H2RecvHeadersVerdict.kind` values.
 pub const HEADERS_IGNORED: u8 = 0;
@@ -1958,9 +1962,17 @@ impl H2Streams {
     }
 
     /// The idle-after-peer-GOAWAY reply check the read pump runs after each batch
-    /// (see `Inner::maybe_goaway_reply`).
+    /// (see `Inner::maybe_goaway_reply`). Nonzero once the exchange is complete,
+    /// whether this call completed it or an earlier step did (the last stream went
+    /// away while a frame of the batch was handled, or on another task): the read
+    /// pump stops. h2 proto/connection.rs:351-357 then 371-383: once `go_away_now`
+    /// ran, the connection shuts down and completes, reading nothing more.
     fn maybe_goaway_reply(&self) -> u8 {
-        self.lock().maybe_goaway_reply()
+        let mut me = self.lock();
+        if me.goaway_replied {
+            return FLAG_GOAWAY_EXCHANGED;
+        }
+        me.maybe_goaway_reply()
     }
 
     /// h2 proto/connection.rs:489-492 `go_away_now_data`: the last-stream-id
@@ -2075,7 +2087,9 @@ impl H2Streams {
     /// increasing on the wire. `None`: the connection failed or GOAWAY'd (the slot
     /// is released; the caller raises the stored condition). Raises
     /// `H2ProtocolError(REFUSED_STREAM)` once the id space is exhausted.
-    #[pyo3(signature = (method, target, headers, end_stream, is_head, handle, *, scheme=None, authority=None))]
+    /// `content_length`: the body's exact size, if known, which the head declares as
+    /// hyper's does (proto/h2/client.rs:758-762).
+    #[pyo3(signature = (method, target, headers, end_stream, is_head, handle, *, scheme=None, authority=None, content_length=None))]
     #[allow(clippy::too_many_arguments)]
     fn open_stream(
         &self,
@@ -2087,10 +2101,13 @@ impl H2Streams {
         handle: Py<PyAny>,
         scheme: Option<&str>,
         authority: Option<&str>,
+        content_length: Option<u64>,
     ) -> PyResult<Option<u32>> {
         // Snapshot + parse BEFORE the lock (no nested HeaderMap lock, no failure
-        // half-way through the critical section).
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        // half-way through the critical section). The strip works on the snapshot: the
+        // caller's map is untouched.
+        let mut fields = headers.map_or_default(HeaderMap::snapshot);
+        codec::strip_connection_headers(&mut fields, codec::MessageKind::Request);
         let mut me = self.lock();
         let before = me.pending.len();
         if me.is_dead() {
@@ -2110,7 +2127,14 @@ impl H2Streams {
             ));
         }
         let hframe = match codec::build_request_headers(
-            sid, method, target, fields, end_stream, scheme, authority,
+            sid,
+            method,
+            target,
+            fields,
+            end_stream,
+            scheme,
+            authority,
+            content_length,
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -2314,8 +2338,10 @@ impl H2Streams {
     /// state.rs `send_open`). A stream the peer reset (or the connection dropped)
     /// while the handler was computing is hyper's first `poll_reset` window
     /// (proto/h2/server.rs L458): returns the stop instead (a bare stop for a stream
-    /// closed with no reason to report here).
-    #[pyo3(signature = (sid, status, headers, end_stream))]
+    /// closed with no reason to report here). `content_length`: the exact size of a
+    /// body not at its end, which the head declares as hyper's does
+    /// (proto/h2/server.rs:517-521).
+    #[pyo3(signature = (sid, status, headers, end_stream, content_length=None))]
     fn send_response_head(
         &self,
         py: Python<'_>,
@@ -2323,11 +2349,12 @@ impl H2Streams {
         status: u16,
         headers: Option<&HeaderMap>,
         end_stream: bool,
+        content_length: Option<u64>,
     ) -> PyResult<SendVerdict> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
-        // RFC 9113 §8.2.2 rejection BEFORE the state transition: a rejected call
-        // leaves the stream untouched and still able to send a valid response.
-        codec::check_send_fields(&fields)?;
+        // The strip works on the snapshot (the caller's map is untouched), before the
+        // `date` insertion, as hyper's (proto/h2/server.rs:475-484).
+        let mut fields = headers.map_or_default(HeaderMap::snapshot);
+        codec::strip_connection_headers(&mut fields, codec::MessageKind::Response);
         let mut me = self.lock();
         let before = me.pending.len();
         let auto_date = me.auto_date;
@@ -2346,7 +2373,14 @@ impl H2Streams {
         if e.state.is_closed() {
             return Ok(stopped_send(py, e.stopped()));
         }
-        let hframe = codec::build_response_headers(sid, status, fields, end_stream, auto_date)?;
+        let hframe = codec::build_response_headers(
+            sid,
+            status,
+            fields,
+            end_stream,
+            auto_date,
+            content_length,
+        )?;
         e.state.send_open(end_stream).map_err(map_user_err)?;
         let mut pending = std::mem::take(&mut me.pending);
         me.encoder.encode_headers(hframe, &mut pending);
@@ -2786,9 +2820,10 @@ impl Inner {
         }
         e.recv_unreleased = e.recv_unreleased.saturating_sub(n);
         let _ = e.recv_flow.assign_capacity(n);
-        // No point re-advertising a stream the peer has already finished sending.
+        // Only a stream still receiving data is re-advertised (h2 recv.rs:1213-1224,
+        // `send_stream_window_updates`).
         if let Some(unclaimed) = e.recv_flow.unclaimed_capacity()
-            && !e.state.is_recv_end_stream()
+            && e.state.is_recv_streaming()
         {
             let _ = e.recv_flow.inc_window(unclaimed);
             codec::encode_window_update(&mut self.pending, sid, unclaimed);

@@ -132,9 +132,10 @@ class Connection(H2ConnectionBase):
         # DIVERGENCE: client.rs L1387 returns without waiting for peer SETTINGS.
         # Keep this synchronization so connect/close cannot race the coroutine pump's handshake.
         await self._ready_evt.wait()
-        err = self.conn_error()
-        if err is not None:
-            raise fresh_exc(err) from err
+        # A GOAWAY that arrived before or with the peer's SETTINGS raises as the
+        # `GoAwayError` (the `_raise_if_dead` precedence), not as the closure of the
+        # GOAWAY exchange it completed.
+        self._raise_if_dead()
 
     # ----- opening (h2: client.rs send_request -> streams.rs send_request) -----
 
@@ -151,19 +152,26 @@ class Connection(H2ConnectionBase):
                 return
             await self._slot_evt.wait()
 
-    async def _open_stream(self, method, target, headers, *, end_stream, is_head):
+    async def _open_stream(self, method, target, headers, *, end_stream, is_head, content_length):
         """Gate on MAX_CONCURRENT_STREAMS, then open the stream — id allocation,
         `send_open`, insert, HPACK encode + queue as ONE locked step (ids must be
-        strictly increasing on the wire). h2 streams.rs `send_request` (L265)."""
-        # Reject connection-specific request headers before ANY stream/slot state is
-        # touched (h2 send.rs `send_headers` -> `check_headers`): a caller error.
-        self.check_send_headers(headers)
+        strictly increasing on the wire). h2 streams.rs `send_request` (L265). The head's
+        connection-specific fields are stripped there, then `content_length` (the body's
+        exact size, or None) declared (hyper proto/h2/client.rs:757-762)."""
         self._raise_if_dead()
         await self._acquire_slot()
         st = Stream(self.backend)
         try:
             sid = self.open_stream(
-                method, target, headers, end_stream, is_head, st, scheme=self.scheme, authority=self.authority
+                method,
+                target,
+                headers,
+                end_stream,
+                is_head,
+                st,
+                scheme=self.scheme,
+                authority=self.authority,
+                content_length=content_length,
             )
         except Exception:
             self._slot_evt.set()  # the claimed slot was released inside: wake a waiter
@@ -332,24 +340,36 @@ class H2Connection(BaseClientConnection):
         h2: client.rs `SendRequest::send_request` (L517). Open the stream + send
         HEADERS, stream the body, then await the response head.
         """
-        # A bodyless request carries END_STREAM on HEADERS (h2 `send_request` with
-        # `end_of_stream`), not a trailing empty DATA frame; a statically-empty body is
-        # bodyless too. A HEAD request's response never has a body regardless of
-        # content-length.
-        bodyless = request.body is None or (isinstance(request.body, (bytes, bytearray)) and len(request.body) == 0)
+        # The body's exact size, None for a streamed one (hyper `size_hint().exact()`:
+        # `Empty` is 0, `Full` its length, trailers or not).
+        body = request.body
+        if body is None:
+            content_length = 0
+        elif isinstance(body, (bytes, bytearray)):
+            content_length = len(body)
+        else:
+            content_length = None
         # Validate trailers BEFORE opening the stream (h2 send.rs:80-97): they are sent by
         # the detached background body writer, whose errors are suppressed — a late
         # reject there would silently leave the stream half-open.
         if request.trailers is not None:
             self._conn.check_send_headers(request.trailers)
-        # Trailers ride a trailing HEADERS frame (END_STREAM) AFTER the body.
-        end_stream = bodyless and request.trailers is None
+        # A bodyless request carries END_STREAM on HEADERS (h2 `send_request` with
+        # `end_of_stream`), not a trailing empty DATA frame; a statically-empty body is
+        # bodyless too. Trailers ride a trailing HEADERS frame (END_STREAM) AFTER the body.
+        end_stream = content_length == 0 and request.trailers is None
+        # A HEAD request's response never has a body regardless of content-length.
         is_head = H2Codec.method_is_head(request.method)
         stream = await self._conn._open_stream(
-            request.method, request.target, request.headers, end_stream=end_stream, is_head=is_head
+            request.method,
+            request.target,
+            request.headers,
+            end_stream=end_stream,
+            is_head=is_head,
+            content_length=content_length,
         )
         if not end_stream:
-            self._conn._send_body_background(stream, request.body, request.trailers)
+            self._conn._send_body_background(stream, body, request.trailers)
 
         await stream.headers_evt.wait()
         # h2's `ResponseFuture` resolves the moment the head arrives. Gate on whether the
