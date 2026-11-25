@@ -349,7 +349,7 @@ class H1BodyDecoder:
         """`kind`: "empty" | "length" | "chunked" | "close"; `length` is the
         Content-Length when `kind == "length"`. Trailer limits are the connection's
         `max_headers` and `max_header_size` (hyper conn.rs:318-330); None defaults to
-        100 fields / 16 KB (decode.rs:180-181)."""
+        100 fields / 16 KB (decode.rs:185-186)."""
 
     def feed(self, data: bytes) -> None:
         """Append received body bytes."""
@@ -388,10 +388,10 @@ class H2FrameHeaders:
     path: str | None
     status: int | None
     headers: HeaderMap
-    content_length: int | None  # first parsed value; None if absent or first unparsable (h2 recv.rs:178-200)
-    content_length_invalid: bool  # any unparsable or conflicting value (h2 recv.rs:178-200: stream PROTOCOL_ERROR)
+    content_length: int | None  # first parsed value; None if absent or first unparsable (h2 recv.rs:183-205)
+    content_length_invalid: bool  # any unparsable or conflicting value (h2 recv.rs:183-205: stream PROTOCOL_ERROR)
     is_informational: bool  # a 1xx response head (h2 `Headers::is_informational`)
-    is_over_size: bool  # decoded header list reached the limit (h2 recv.rs:221-238)
+    is_over_size: bool  # decoded header list reached the limit (h2 recv.rs:226-243)
     def __repr__(self) -> str: ...
 
 class H2FrameData:
@@ -513,7 +513,7 @@ class H2Codec:
         end_stream: bool = ...,
         auto_date: bool = ...,
     ) -> bytes:
-        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L477-481)."""
+        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L480-484)."""
 
     def feed_preface(self, data: bytes) -> bool | None:
         """Server side: feed bytes of the client connection preface. None = matches so
@@ -527,8 +527,9 @@ class H2Codec:
 
     @staticmethod
     def check_send_headers(headers: HeaderMap) -> None:
-        """h2 send.rs `check_headers`: raises `H2UserError(kind="malformed_headers")` for a
-        connection-specific field or a `te` other than exactly `trailers`."""
+        """h2 send.rs `check_headers` (applied to trailers; heads are stripped instead):
+        raises `H2UserError(kind="malformed_headers")` for a connection-specific field or
+        a `te` other than exactly `trailers`."""
 
     @staticmethod
     def method_is_head(method: str) -> bool:
@@ -658,14 +659,15 @@ class H2ContentLength:
         """False = a declared length still unsatisfied at END_STREAM."""
 
 class H2DataFrameBudget:
-    """h2 0.4.20 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`,
+    """h2 0.4.21 counts.rs DATA-framing budget (`record_data_frame` / `release_data_frame`,
     counts.rs:120-147). `Budget` tracks spent overhead (counts.rs:4-36); Auto is resolved
     via `set_target_connection_window_size` (counts.rs:112-116)."""
 
     def __init__(self, configured: int | None = ..., connection_window: int | None = ...) -> None: ...
     def record(self, payload_len: int) -> int:
-        """Charge a received non-final DATA frame; returns the charge taken (0 for an
-        empty or large frame). Raises `H2ProtocolError(ENHANCE_YOUR_CALM)` on exhaustion."""
+        """Charge a received non-final DATA frame (an empty one only when its stream's
+        empty-frame allowance is spent); returns the charge taken (0 for an empty or
+        large frame). Raises `H2ProtocolError(ENHANCE_YOUR_CALM)` on exhaustion."""
 
     def release(self, charge: int) -> None:
         """Give a charge back (saturating at the resolved budget)."""
@@ -730,7 +732,7 @@ class H1ServerState:
     def keep_alive_enabled(self) -> bool: ...
     @property
     def peer_http10(self) -> bool:
-        """Last parsed request's version, retained between requests (conn.rs L301, L1132-1161)."""
+        """Last parsed request's version, retained between requests (conn.rs L301, L1135-1164)."""
 
     @property
     def shutdown_requested(self) -> bool: ...
@@ -963,7 +965,7 @@ class H2RecvHeadersVerdict:
 
 class H2RecvDataVerdict:
     handle: object | None
-    payload: bytes | None  # None: nothing to deliver (swallowed, or an empty budgeted frame)
+    payload: bytes | None  # None: nothing to deliver (swallowed, or an empty non-final frame)
     budgeted: bool
     eof: bool
     flags: int
@@ -1009,7 +1011,8 @@ class H2Streams:
     ) -> None:
         """`role`: "client" | "server". Validates the RFC ranges at construction.
         `header_table_size`: None = not advertised; applied on SETTINGS ACK.
-        Reset retention defaults to 50 streams / 1 second; duration is in seconds."""
+        Reset retention defaults to twice `max_concurrent_streams` streams (at least
+        50; 8192 if unset) / 5 seconds; duration is in seconds."""
 
     @property
     def is_server(self) -> bool: ...
@@ -1047,7 +1050,9 @@ class H2Streams:
     def recv_go_away(self, frame: H2FrameGoAway) -> tuple[list[tuple[object, H2Stopped]], int]:
         """`(aborted, flags)`: the streams above last_stream_id, with their stop."""
 
-    def maybe_goaway_reply(self) -> int: ...
+    def maybe_goaway_reply(self) -> int:
+        """Flags; nonzero once the GOAWAY exchange is complete (now or earlier)."""
+
     def send_goaway(self, reason: int, debug_data: bytes | None = None) -> int: ...
     def fail(self, exc: BaseException | None = ..., message: str = ...) -> list[tuple[object, H2Stopped]]:
         """Record the error (first writer wins; `exc` is a traceback-free copy) and fan
@@ -1076,16 +1081,25 @@ class H2Streams:
         *,
         scheme: str | None = ...,
         authority: str | None = ...,
+        content_length: int | None = None,
     ) -> int | None:
-        """Allocate the id, `send_open`, insert, HPACK-encode + queue the HEADERS. None:
-        the connection failed / GOAWAY'd (the slot is released)."""
+        """Strip the head's connection-specific fields (hyper `strip_connection_headers`,
+        on a snapshot) and declare `content_length`, the body's exact size if known, as
+        hyper does (`content-length` unless set; for an empty body only on a method with
+        defined payload semantics), allocate the id, `send_open`, insert, HPACK-encode +
+        queue the HEADERS. None: the connection failed / GOAWAY'd (the slot is released)."""
 
     # ----- sending -----
     def send_data(self, sid: int, data: bytes, offset: int, end_stream: bool) -> H2SendVerdict: ...
     def send_trailers(self, sid: int, trailers: HeaderMap) -> H2SendVerdict: ...
     def send_response_head(
-        self, sid: int, status: int, headers: HeaderMap | None, end_stream: bool
-    ) -> H2SendVerdict: ...
+        self, sid: int, status: int, headers: HeaderMap | None, end_stream: bool, content_length: int | None = None
+    ) -> H2SendVerdict:
+        """The response HEADERS, connection-specific fields stripped (hyper
+        `strip_connection_headers`, on a snapshot), then `date` (`auto_date_header`) and
+        `content-length` from `content_length` (the exact size of a body not at its end)
+        added unless set."""
+
     def reset_stream(self, sid: int, reason: int, initiator: str = ...) -> H2ResetVerdict: ...
     def reset_on_error(self, sid: int, reason: int) -> H2ResetVerdict:
         """Library reset after a peer violation; counts toward the ENHANCE_YOUR_CALM cap."""

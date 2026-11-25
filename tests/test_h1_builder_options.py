@@ -32,7 +32,7 @@ async def test_h1_connection_is_not_ready_while_a_request_is_in_flight():
 
 
 def test_client_max_buf_size_informational_read_ahead():
-    # Derived from hyper role.rs:1039-1230 and io.rs:204-240: consuming a 1xx
+    # Derived from hyper role.rs:1043-1222 and io.rs:204-240: consuming a 1xx
     # frees buffer space for the final head; bytes after that head remain body.
     codec = H1Codec(max_buf_size=8192)
     codec.serialize_request("GET", "/")
@@ -120,7 +120,7 @@ class _SplitHeadStream:
 @pytest.mark.tonio
 @pytest.mark.parametrize("split", [False, True], ids=["max_buf_size", "max_buf_size_split_header_boundary"])
 async def test_max_buf_size(split):
-    # hyper tests/server.rs:2730,2757: max_buf_size / max_buf_size_split_header_boundary.
+    # hyper tests/server.rs:2805,2832: max_buf_size / max_buf_size_split_header_boundary.
     async with tcp_pair() as (peer, stream):
         first = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX: " + b"a" * 7000
         rest = b"a" * 5000 + b"\r\n\r\n"

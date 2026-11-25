@@ -135,7 +135,12 @@ impl Decoder {
             Length(0)
                 | Chunked {
                     state: ChunkedState::End,
-                    ..
+                    chunk_len: _,
+                    extensions_cnt: _,
+                    trailers_buf: _,
+                    trailers_cnt: _,
+                    h1_max_headers: _,
+                    h1_max_header_size: _,
                 }
                 | Eof(true)
         )
@@ -247,9 +252,8 @@ impl fmt::Debug for Decoder {
 
 macro_rules! byte (
     ($rdr:ident, $cx:expr) => ({
-        let buf = ready!($rdr.read_mem($cx, 1))?;
-        if !buf.is_empty() {
-            buf[0]
+        if let Some(b) = ready!($rdr.read_byte($cx))? {
+            b
         } else {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof,
                                       "unexpected EOF during chunk size line")));
@@ -297,7 +301,7 @@ impl ChunkedState {
         ChunkedState::Start
     }
     fn step<R: MemRead>(
-        &self,
+        self,
         cx: &mut Context<'_>,
         body: &mut R,
         StepArgs {
@@ -314,7 +318,7 @@ impl ChunkedState {
             Body, BodyCr, BodyLf, End, EndCr, EndLf, Extension, Size, SizeLf, SizeLws, Start,
             Trailer, TrailerLf,
         };
-        match *self {
+        match self {
             Start => ChunkedState::read_start(cx, body, chunk_size),
             Size => ChunkedState::read_size(cx, body, chunk_size),
             SizeLws => ChunkedState::read_size_lws(cx, body),
@@ -543,6 +547,10 @@ impl ChunkedState {
 
         match byte {
             b'\r' => Poll::Ready(Ok(ChunkedState::TrailerLf)),
+            b'\n' => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid trailer line ending",
+            ))),
             _ => Poll::Ready(Ok(ChunkedState::Trailer)),
         }
     }
@@ -595,6 +603,10 @@ impl ChunkedState {
                 }
                 Poll::Ready(Ok(ChunkedState::EndLf))
             }
+            b'\n' => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid trailer line ending",
+            ))),
             byte => {
                 match trailers_buf {
                     None => {

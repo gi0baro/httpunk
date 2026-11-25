@@ -256,25 +256,40 @@ def h2_client_against(script, **conn_kwargs):
 @contextlib.asynccontextmanager
 async def _peer_against(serve, connect):
     listener, host, port = await listen()
+    failure = []
 
     async def run():
-        await serve(await listener.accept())
+        transport = await listener.accept()
+        try:
+            await serve(transport)
+        except CancelledError:
+            raise
+        except BaseException as exc:  # includes pytest's outcome exceptions
+            failure.append(exc)
+            transport.close()  # the peer sees EOF instead of waiting on a dead server
 
     async with scope() as s:
         s.spawn(run())
         peer = await connect(host, port)
         try:
             yield peer
+        except BaseException as exc:
+            if failure:
+                raise failure[0] from exc
+            raise
         finally:
             peer.close()
             s.cancel()
+    if failure:
+        raise failure[0]
 
 
 def h1_peer_against(serve):
     """A raw client transport connected to a server task running `serve(transport)`. On
     exit the transport closes and the task is cancelled: a failure while the connection
     is open would otherwise leave the server parked in a read only our EOF can end, and
-    the scope join waiting on it forever."""
+    the scope join waiting on it forever. A task failure before then closes its transport
+    (the client sees EOF) and is what gets raised."""
     return _peer_against(serve, TonioBackend().connect_tcp)
 
 

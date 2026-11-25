@@ -141,7 +141,7 @@ def test_close_delimited_reads_until_eof():
 
 def test_length_body_truncated_at_eof_is_body_error_unexpected_eof():
     """The transport closes before a Content-Length body is complete: hyper's decoder
-    returns `io::Error(UnexpectedEof, IncompleteBody)` (decode.rs L159-165) and the
+    returns `io::Error(UnexpectedEof, IncompleteBody)` (decode.rs L164-170) and the
     dispatcher surfaces it as `Error::new_body` — the same `Kind::Body` as a framing
     error, told apart by the io kind of the cause. Mirrored as `H1BodyError` with
     `args[0] == "unexpected_eof"`."""
@@ -157,8 +157,8 @@ def test_length_body_truncated_at_eof_is_body_error_unexpected_eof():
 
 
 def test_chunked_body_truncated_at_eof_is_body_error_unexpected_eof():
-    """A chunked body cut before its terminator: EOF inside a chunk (decode.rs L489-498,
-    `IncompleteBody`) or inside the size line (L258-259, "unexpected EOF during chunk size
+    """A chunked body cut before its terminator: EOF inside a chunk (decode.rs L493-502,
+    `IncompleteBody`) or inside the size line (L262-263, "unexpected EOF during chunk size
     line") are both `UnexpectedEof`."""
     dec = H1BodyDecoder("chunked")
     dec.feed(b"5\r\nhel")

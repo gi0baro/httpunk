@@ -160,7 +160,7 @@ def test_response_1xx_status_is_user_error_unsupported_status_code():
 
 def test_response_content_length_and_transfer_encoding_is_user_error_unexpected_header():
     """Both `content-length` and `transfer-encoding` on a response: hyper `Server::encode`
-    cancels with `User::UnexpectedHeader` (role.rs L815-820) and rewinds `dst`."""
+    cancels with `User::UnexpectedHeader` (role.rs L818-823) and rewinds `dst`."""
     codec = H1Codec()
     codec.receive_request_head(b"GET / HTTP/1.1\r\n\r\n")
     hdrs = HeaderMap([("content-length", "5"), ("transfer-encoding", "chunked")])

@@ -94,7 +94,7 @@ struct Current {
     decoder: Option<Py<H1BodyDecoder>>,
     expect_continue: bool,
     /// Last parsed version, initially HTTP/1.1 (conn.rs L85, L301). Kept by
-    /// `ready_for_next`, like hyper's `State::idle` (conn.rs L1132-1161), so an
+    /// `ready_for_next`, like hyper's `State::idle` (conn.rs L1135-1164), so an
     /// automatic parse-error response uses the previous request's version too.
     http10: bool,
     /// The request was keep-alive (hyper `wants_keep_alive`'s request half).

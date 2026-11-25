@@ -22,6 +22,7 @@ pub fn get_lib_version() -> &'static str {
 }
 
 #[pymodule(gil_used = false)]
+#[allow(clippy::used_underscore_items)] // the Python module's name
 fn _httpunk(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
     module.add("__version__", get_lib_version())?;
 

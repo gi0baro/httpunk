@@ -50,7 +50,7 @@ _READ_SIZE = 65536
 
 
 def _version_of(head):
-    """The parsed head's version as the public `Version` (hyper role.rs L1081-1085)."""
+    """The parsed head's version as the public `Version` (hyper role.rs L1084-1088)."""
     return Version.HTTP_10 if head.http10 else Version.HTTP_11
 
 
@@ -82,7 +82,7 @@ class Connection(H1Framing, H1ClientState):
     Unlike h2 (which multiplexes and needs a background read-pump), HTTP/1 is
     strictly one request/response at a time. But hyper's `Dispatcher` does not
     collapse to strict send-then-read: its `poll_loop` interleaves reads and
-    writes each turn (dispatch.rs L172-211), so a response head can arrive while
+    writes each turn (dispatch.rs L191-230), so a response head can arrive while
     the request body is still being written. `send_request` therefore writes
     head+body in a spawned task and reads the response head concurrently; if the
     response arrives first (a server answering an upload early — 413/401/redirect),
@@ -95,11 +95,11 @@ class Connection(H1Framing, H1ClientState):
     - Low-level like `client::conn::http1`: the caller supplies the `Host` header
       (we never auto-add one). (h2 differs: `:authority` is derived from the URI.)
     - 1xx-informational responses are skipped by the vendored `Client::parse`
-      (role.rs L1037), so they never surface here.
+      (role.rs L1040), so they never surface here.
     - A 101 upgrade / 2xx-to-CONNECT hands the raw transport to the caller as an
       `H1Upgraded` (`resp.upgraded`); the driver detaches (hyper `on_upgrade`).
     - `Expect: 100-continue` is a non-gap for the client: hyper hard-codes
-      `expect_continue: false` (role.rs L1193). A request's own `Connection: close`
+      `expect_continue: false` (role.rs L1203). A request's own `Connection: close`
       disables reuse up front (conn.rs `encode_head` -> `connection_any_close`,
       1.12.0), ANDed with the response's keep-alive (conn.rs L300).
     - While reusable-idle, a watcher task holds read interest — the re-expression
@@ -236,7 +236,7 @@ class Connection(H1Framing, H1ClientState):
         only via data, EOF, or transport close (cancellation would leave the socket's
         read registration armed for a dead task). This is also hyper's structure:
         the same poll loop owns the read across the idle->busy transition
-        (dispatch.rs L225-296 `poll_read` -> `poll_read_keep_alive` while idle, the
+        (dispatch.rs L244-315 `poll_read` -> `poll_read_keep_alive` while idle, the
         response read once busy), so there is no reader handoff to cancel.
 
         The state dispatches the completed read (`watcher_completed`):
@@ -285,7 +285,7 @@ class Connection(H1Framing, H1ClientState):
     async def send_request(self, method, url, headers, body, trailers=None):
         # hyper: client/conn/http1.rs `SendRequest::send_request` (L230) — writes
         # the head+body, reads the response. The caller must have supplied `Host`
-        # (L207); we do not add it. `Conn` is busy for the duration (conn.rs L299),
+        # (L204); we do not add it. `Conn` is busy for the duration (conn.rs L299),
         # modeled by the slot. Everything after the claim runs inside the try: no
         # failure can leak the slot.
         await self._acquire()
@@ -330,7 +330,7 @@ class Connection(H1Framing, H1ClientState):
                 content_length=content_length,
                 chunked=chunked,
             )
-            # hyper's `poll_loop` turn (dispatch.rs L166-215): `poll_read`, `poll_write`,
+            # hyper's `poll_loop` turn (dispatch.rs L185-234): `poll_read`, `poll_write`,
             # `poll_flush`, then the ONE task yields for readable OR writable. The same
             # turn here, from this task, by what it waits for:
             #
@@ -474,7 +474,7 @@ class Connection(H1Framing, H1ClientState):
 
     async def _read_head(self, codec, write_error, done):
         # hyper: conn.rs `can_read_head` (L180) + `read_head` -> role.rs
-        # `Client::parse` (L1037), which loops past 1xx informational responses.
+        # `Client::parse` (L1040), which loops past 1xx informational responses.
         # `done`: the armed idle watcher's done event (`begin_send`), None if none.
         data = None
         if done is not None:
@@ -523,7 +523,7 @@ class Connection(H1Framing, H1ClientState):
                 if write_error:
                     raise fresh_exc(write_error[0]) from write_error[0]
                 # hyper: an EOF while parsing -> `IncompleteMessage` (io.rs L224-227;
-                # conn.rs `on_read_head_error` L339-367) — the HTTP state expected a response.
+                # conn.rs `on_read_head_error` L339-363) — the HTTP state expected a response.
                 raise H1IncompleteMessageError("connection closed before message completed: no response head")
             head = codec.receive_head(data)
             # The codec caps a still-incomplete head at max_header_size and
@@ -539,7 +539,7 @@ class Connection(H1Framing, H1ClientState):
         request). hyper's client fails the connection via `require_empty_read` ->
         `new_unexpected_message` (conn.rs L465-468 buffered, L486-490 read) and
         the errored connection task then winds down, dropping its io
-        (dispatch.rs `poll_catch` L123-141) — so record the error AND close, for
+        (dispatch.rs `poll_catch` L128-160) — so record the error AND close, for
         every caller (the idle watcher, the send-time guard, the past-body
         leftover check in share.py). The next `send_request`/`wait_idle` raises
         the recorded error."""
@@ -553,7 +553,7 @@ class Connection(H1Framing, H1ClientState):
         """Free the in-flight slot once the caller has finished the response. Reuse
         the connection only if the response allowed keep-alive AND the request body
         was fully sent — hyper reuses only once both the read and write halves reach
-        `KeepAlive` (conn.rs L1100-1119). If the writer is still running (the server
+        `KeepAlive` (conn.rs L1103-1122). If the writer is still running (the server
         answered early and the caller didn't wait out the upload), the request is
         incomplete on the wire, so cancel it and close; otherwise join it (instant).
 
@@ -716,7 +716,7 @@ class H1Connection(BaseClientConnection):
         ``request_unsent = True`` on the exception: nothing reached the wire, so
         the request — any body, streamed included — is safe to retry. The mirror
         of hyper handing the request back in `TrySendError { message: Some }`
-        (client/conn/http1.rs L261-281; proto/h1/dispatch.rs L723-739). Absent
+        (client/conn/http1.rs L261-281; proto/h1/dispatch.rs L742-758). Absent
         (falsy) once the write may have begun.
         """
         return self._conn.send_request(request.method, request.target, request.headers, request.body, request.trailers)

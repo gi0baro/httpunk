@@ -27,7 +27,7 @@ the accept loop are the caller's job. Usage:
             body = await request.read()
             await request.respond(200, headers={"content-type": "text/plain"}, body=b"hi")
 
-Cross-reference: hyper 1.12.0 `proto/h1/{role,conn,dispatch}.rs` (server path) and
+Cross-reference: hyper 1.13.0 `proto/h1/{role,conn,dispatch}.rs` (server path) and
 `client/conn`/`server/conn`.
 """
 
@@ -442,7 +442,7 @@ class ServerConnection(H1Framing, H1ServerState):
             )
         )
         # hyper `http1::Builder::keep_alive(false)` -> `disable_keep_alive()` on a Busy (not yet
-        # idle) connection = `KA::Disabled` (http1.rs L483-485, conn.rs L903-910): the first response
+        # idle) connection = `KA::Disabled` (http1.rs L481-483, conn.rs L906-913): the first response
         # is encoded `Connection: close` and the connection closes after it. `half_close`
         # (hyper `http1::Builder::half_close`, default False) disables the mid-message watcher.
         return H1ServerState.__new__(cls, codec, transport, keep_alive=keep_alive, half_close=half_close)
@@ -712,7 +712,7 @@ class ServerConnection(H1Framing, H1ServerState):
             # A client that read the whole response may close at once, and the caller's
             # verdict reads `done` the moment that FIN wakes it: set late, a fully written
             # response fails as abandoned (hyper moves to `Writing::KeepAlive` in the call
-            # that buffers the final bytes, proto/h1/conn.rs:767-771). The `finally` sets it
+            # that buffers the final bytes, proto/h1/conn.rs:769-773). The `finally` sets it
             # for the cancel and error paths; a finished pump is joined by the scope exit.
             done.set()
         except Exception as exc:
@@ -746,13 +746,13 @@ class ServerConnection(H1Framing, H1ServerState):
         non-keep-alive response was sent, or a parse error). Drains any unread body
         of the previous request first so the wire is positioned at the next head.
 
-        hyper: the server `Dispatcher::poll_loop` (dispatch.rs L166) →
-        `poll_read_head` (dispatch.rs L301) → `Server::parse`; the drain mirrors
-        `poll_drain_or_close_read` (conn.rs L876-893)."""
+        hyper: the server `Dispatcher::poll_loop` (dispatch.rs L185) →
+        `poll_read_head` (dispatch.rs L320) → `Server::parse`; the drain mirrors
+        `poll_drain_or_close_read` (conn.rs L879-896)."""
         code, obj = self.begin_read()
         if code == H1_NEXT_RAISE:
             # hyper serializes structurally (the dispatcher won't read the next head
-            # until the response is fully written, dispatch.rs L634-640 /
+            # until the response is fully written, dispatch.rs L653-659 /
             # `try_keep_alive`). Surface the out-of-order use — no response, or a
             # push-style body still open — rather than mis-pairing responses.
             raise RuntimeError("respond to the current request (and finish its body) before reading the next")
@@ -814,7 +814,7 @@ class ServerConnection(H1Framing, H1ServerState):
     def _drain_unread_body(self):
         """Discard an unread request body so the next request parses cleanly, but
         only if it's cheap — a 1:1 mirror of hyper `poll_drain_or_close_read`
-        (conn.rs L876-893), which does EXACTLY ONE `poll_read_body` (`let _ =
+        (conn.rs L879-896), which does EXACTLY ONE `poll_read_body` (`let _ =
         self.poll_read_body(cx)`, then close unless the body reached KeepAlive). Pull a
         single frame: decode one from the already-buffered bytes, or — only if the
         buffer held nothing decodable yet (need-more, not end) — do ONE non-blocking
@@ -922,8 +922,8 @@ class ServerConnection(H1Framing, H1ServerState):
         `take_error` surfaces it."""
         try:
             # hyper closes reading before `on_error` (conn.rs L339-345), retaining the
-            # last parsed version (L301, State::idle L1132-1161): enforce_version
-            # (L701-727) sends HTTP/1.0 without Connection, or HTTP/1.1 + close.
+            # last parsed version (L301, State::idle L1135-1164): enforce_version
+            # (L701-731) sends HTTP/1.0 without Connection, or HTTP/1.1 + close.
             head = codec.serialize_response(status, None, keep_alive=False, http10=self.peer_http10)
             await transport.send_all(codec.serialize_head_and_body(head))  # one write (coalesced)
         except BaseException:  # noqa: S110 - best-effort: if we can't write the 400, just close

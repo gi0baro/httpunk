@@ -120,7 +120,7 @@ async def test_server_builder_header_table_size(size):
 
 @pytest.mark.tonio
 async def test_rst_stream_expires():
-    # h2 tests/h2-tests/tests/stream_states.rs:986 rst_stream_expires.
+    # h2 tests/h2-tests/tests/stream_states.rs:1031 rst_stream_expires.
     # Upstream resets with a 10 ms duration and sleeps 15 ms; a zero duration expires
     # the entry once the clock moves, which the PING round trip guarantees: no sleep.
     finished = Event()
@@ -153,7 +153,7 @@ async def test_rst_stream_expires():
 
 @pytest.mark.tonio
 async def test_rst_stream_max():
-    # h2 tests/h2-tests/tests/stream_states.rs:1037 rst_stream_max.
+    # h2 0.4.21 tests/h2-tests/tests/stream_states.rs:1082 rst_stream_max.
     first_sent = Event()
     finished = Event()
 
@@ -172,12 +172,12 @@ async def test_rst_stream_max():
         )
         await _expect_reset(peer, 1, H2Reason.CANCEL)
         await _expect_reset(peer, 3, H2Reason.CANCEL)
-        # Older streams trump newer streams: 1 is still being ignored.
-        await peer.send_data(1, bytes(16), end_stream=True)
-        await peer.ping_pong()
-        # 3 has been evicted, so it gets a reset.
+        # The most recently reset stream still has its grace period.
         await peer.send_data(3, bytes(16), end_stream=True)
-        await _expect_reset(peer, 3, H2Reason.STREAM_CLOSED)
+        await peer.ping_pong()
+        # The oldest reset stream has lost its grace period.
+        await peer.send_data(1, bytes(16), end_stream=True)
+        await _expect_reset(peer, 1, H2Reason.STREAM_CLOSED)
         finished.set()
 
     options = {"authority": "example.com", "max_concurrent_reset_streams": 1, **_H2_DEFAULT_WINDOWS}

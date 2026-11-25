@@ -229,7 +229,7 @@ class Http2Builder:
 
     def data_frame_budget(self, budget: int | None) -> Http2Builder:
         """DATA-framing budget; `None` = h2's Auto: half the target connection window,
-        at least 25,600 bytes (h2 server.rs:1064-1067). Upstream updates Auto via
+        at least 25,600 bytes (h2 server.rs:1070-1073). Upstream updates Auto via
         counts.rs:112-116; httpunk sets the target only at handshake."""
         # DIVERGENCE: h2's data_frame_budget is surfaced by neither hyper nor
         # hyper-util; httpunk keeps this option by the maintainer's choice.

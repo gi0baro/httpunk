@@ -11,7 +11,7 @@ like h2). Only the transport-ownership + body-framing/send + teardown leaves are
 genuinely shared, and they live here. All byte work is the Rust sans-IO core
 (`H1Codec` head parse/encode + body encode, `H1BodyDecoder` body decode).
 
-Cross-reference: hyperium/hyper 1.12.0 `src/proto/h1/{conn,dispatch,role}.rs`.
+Cross-reference: hyperium/hyper 1.13.0 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
 from .._common import aiter_body
@@ -51,7 +51,7 @@ class H1Framing:
     def _body_plan(body, max_buf_size):
         """The body's shape, classified ONCE for the whole write path — `(content_length,
         chunked, kind, coalesce)`. The framing inputs are hyper's `set_length`: None /
-        empty bytes -> no body (role.rs L1343-1349), non-empty bytes -> Content-Length,
+        empty bytes -> no body (role.rs L1353-1359), non-empty bytes -> Content-Length,
         an iterable -> chunked; the request and response rules are the same, so this is
         shared. `kind` is the write path (`BODY_*`: an async iterable must be pumped in
         its own task, a sync one is written inline) and `coalesce` the head+body write

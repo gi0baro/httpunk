@@ -7,7 +7,7 @@ and multiplexing.
 import contextlib
 
 import pytest
-from _net import h2_peer_against, listen, open_h2
+from _net import _client_against, h2_client_against, h2_peer_against, listen, open_h2
 from tonio.colored import Event, scope, sleep
 
 from httpunk import H2Reason, Version
@@ -177,7 +177,7 @@ async def test_server_request_headers():
             assert resp.status == 204
             assert await resp.read() == b""
         s.cancel()
-    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1674)
+    assert seen["version"] is Version.HTTP_2  # h2 stamps HTTP_2 on every request (h2 server.rs L1680)
 
     assert seen["scheme"] == "http"
     assert seen["authority"] == f"{host}:{port}"
@@ -231,13 +231,13 @@ async def _too_big_headers(end_stream):
 
 @pytest.mark.tonio
 async def test_too_big_headers_sends_431():
-    # h2 tests/h2-tests/tests/server.rs:1031 too_big_headers_sends_431.
+    # h2 tests/h2-tests/tests/server.rs:1089 too_big_headers_sends_431.
     await _too_big_headers(end_stream=True)
 
 
 @pytest.mark.tonio
 async def test_too_big_headers_sends_reset_after_431_if_not_eos():
-    # h2 tests/h2-tests/tests/server.rs:1067 too_big_headers_sends_reset_after_431_if_not_eos.
+    # h2 tests/h2-tests/tests/server.rs:1125 too_big_headers_sends_reset_after_431_if_not_eos.
     await _too_big_headers(end_stream=False)
 
 
@@ -392,8 +392,59 @@ async def test_server_max_local_error_reset_streams_option():
 
 
 @pytest.mark.tonio
+async def test_early_response_no_error_resets_do_not_affect_local_limit():
+    # h2 0.4.21 tests/h2-tests/tests/server.rs:696 early_response_no_error_resets_do_not_affect_local_limit.
+    done = Event()
+    accepted = []  # what `serve` accepted, in order, or the error it ended on: checked once it is done
+
+    async def serve(transport):
+        try:
+            # No `date`: upstream's bare h2 server sends a response HEADERS with :status only.
+            # The `content-length` of the known-size body is hyper's (proto/h2/server.rs:517-521).
+            async with H2Server(transport, max_local_error_reset_streams=1, auto_date_header=False) as server:
+                for _ in range(3):
+                    req = await server.accept()
+                    accepted.append(req.method)
+                    await req.respond(200, body=b"ok")
+                req = await server.accept()
+                accepted.append(req.method)
+                await req.respond(200)
+                accepted.append(await server.accept())
+        except Exception as exc:
+            accepted.append(exc)
+        finally:
+            done.set()
+
+    async with h2_peer_against(serve) as peer:
+        await peer.handshake()
+        # Leave each request body open so the complete response resets it with NO_ERROR.
+        # Exceed the error limit.
+        for sid in (1, 3, 5):
+            await peer.send_request_headers(sid, "POST", "https://example.com/")
+            head = await peer.expect(Headers, WindowUpdate)
+            assert (head.stream_id, head.status, head.end_stream, list(head.headers.items())) == (
+                sid,
+                200,
+                False,
+                [("content-length", b"2")],
+            )
+            data = await peer.expect(Data, WindowUpdate)
+            assert (data.stream_id, data.data, data.end_stream) == (sid, b"ok", True)
+            rst = await peer.expect(RstStream, WindowUpdate)
+            assert (rst.stream_id, rst.error_code) == (sid, H2Reason.NO_ERROR)
+        # The connection must still accept and complete another request.
+        await peer.send_request_headers(7, "GET", "https://example.com/", end_stream=True)
+        head = await peer.expect(Headers, WindowUpdate)
+        assert (head.stream_id, head.status, head.end_stream, list(head.headers.items())) == (7, 200, True, [])
+        peer.close()
+        await done.wait()
+
+    assert accepted == ["POST", "POST", "POST", "GET", None]
+
+
+@pytest.mark.tonio
 async def test_server_response_date_header_option():
-    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L483),
+    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L484),
     gated by `auto_date_header`; an app-supplied `Date` is kept."""
     listener, host, port = await listen()
 
@@ -564,7 +615,7 @@ async def test_server_respond_with_trailers():
 async def test_server_reset_received_after_end_stream_then_respond_fails_with_reason():
     """A RST_STREAM arriving after the request's END_STREAM (a GET the client cancels)
     is observable via `reset_received()` with the peer's reason, and a later `respond()`
-    fails with that same reason — hyper's first `poll_reset` window (proto/h2/server.rs L456)."""
+    fails with that same reason — hyper's first `poll_reset` window (proto/h2/server.rs L458)."""
     seen, done = [], Event()
 
     async def serve(transport):
@@ -587,7 +638,7 @@ async def test_server_reset_received_after_end_stream_then_respond_fails_with_re
 
 @pytest.mark.tonio
 async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_chunk():
-    """hyper's second `poll_reset` window (`PipeToSendStream::poll`, proto/h2/mod.rs L148):
+    """hyper's second `poll_reset` window (`PipeToSendStream::poll`, proto/h2/mod.rs L152):
     a reset arriving while the response body is parked on the app's NEXT chunk fails
     `respond()` at once with the peer's reason — the app is not left parked forever."""
     seen, done = [], Event()
@@ -788,7 +839,7 @@ async def test_h2_request_trailers_round_trip():
 @pytest.mark.tonio
 async def test_h2_connection_specific_trailers_rejected():
     """Trailers are a HEADERS block, so connection-specific fields are rejected
-    (RFC 9113 §8.2.2; h2 send.rs:80-104) — BEFORE the stream is opened, so the
+    (RFC 9113 §8.2.2; h2 send.rs:80-97) — BEFORE the stream is opened, so the
     connection stays fully usable and a subsequent valid trailer still sends."""
     listener, host, port = await listen()
     seen = {}
@@ -817,55 +868,179 @@ async def test_h2_connection_specific_trailers_rejected():
     assert seen["trailers"].get("x-checksum") == b"abc"
 
 
-@pytest.mark.tonio
-async def test_h2_connection_specific_request_headers_rejected():
-    """Regular request HEADERS get the same RFC 9113 §8.2.2 rejection as
-    trailers (h2 send.rs `send_headers` -> `check_headers`) — before any
-    stream/slot state is touched, so the connection stays fully usable."""
-    listener, host, port = await listen()
-
-    async def server():
-        transport = await listener.accept()
-        async with H2Server(transport) as srv:
-            async for req in srv:
-                await req.read()
-                await req.respond(200, body=b"ok")
-
-    async with scope() as s:
-        s.spawn(server())
-        async with open_h2(host, port) as conn:
-            with pytest.raises(H2UserError):
-                await conn.request("GET", "/", headers={"connection": "keep-alive"})
-            with pytest.raises(H2UserError):  # `te` may only carry "trailers"
-                await conn.request("GET", "/", headers={"te": "gzip"})
-            resp = await conn.request("GET", "/", headers={"te": "trailers"})  # the one legal `te`
-            assert await resp.read() == b"ok"
-        s.cancel()
+# Connection-specific fields (RFC 9113 §8.2.2) set on a head, all stripped.
+_CONNECTION_SPECIFIC = {
+    "connection": "x-hop",
+    "x-hop": "1",
+    "keep-alive": "timeout=5",
+    "proxy-connection": "keep-alive",
+    "transfer-encoding": "chunked",
+    "upgrade": "h2c",
+}
 
 
 @pytest.mark.tonio
-async def test_h2_connection_specific_response_headers_rejected():
-    """The server's response HEADERS get the same §8.2.2 rejection — before the
-    state transition, so the handler can still send a valid response on the
-    same stream after a rejected attempt."""
-    listener, host, port = await listen()
+async def test_h2_connection_specific_request_headers_stripped():
+    """The client strips connection-specific fields from the request head (hyper
+    proto/h2/client.rs:757, `strip_connection_headers`): they never reach the wire and
+    the request goes out; a `te` other than exactly `trailers` is dropped, `te: trailers`
+    is kept. The caller's `HeaderMap` is left as it was."""
+    seen = []
 
-    async def server():
-        transport = await listener.accept()
-        async with H2Server(transport) as srv:
-            async for req in srv:
-                await req.read()
-                with pytest.raises(H2UserError):
-                    await req.respond(200, headers={"connection": "close"}, body=b"nope")
-                await req.respond(200, body=b"ok")  # stream untouched -> still respondable
+    async def script(peer):
+        for _ in range(2):
+            req = await peer.request()
+            seen.append(req.headers.headers.items())
+            await peer.send_response_headers(req.stream_id, 200, end_stream=True)
 
-    async with scope() as s:
-        s.spawn(server())
-        async with open_h2(host, port) as conn:
-            resp = await conn.request("GET", "/")
-            assert resp.status == 200
-            assert await resp.read() == b"ok"
-        s.cancel()
+    headers = HeaderMap({**_CONNECTION_SPECIFIC, "te": "gzip", "x-keep": "1"})
+    async with h2_client_against(script) as conn:
+        assert (await conn.request("GET", "/", headers=headers)).status == 200
+        assert (await conn.request("GET", "/", headers={"te": "trailers"})).status == 200
+
+    assert seen == [[("x-keep", b"1")], [("te", b"trailers")]]
+    assert len(headers) == len(_CONNECTION_SPECIFIC) + 2
+
+
+@pytest.mark.tonio
+async def test_h2_connection_specific_response_headers_stripped():
+    """The server strips connection-specific fields from the response head (hyper
+    proto/h2/server.rs:475, `strip_connection_headers`), `te` whatever its value: they
+    never reach the wire and the response goes out."""
+
+    async def serve(transport):
+        async with H2Server(transport, auto_date_header=False) as server:
+            async for req in server:
+                await req.respond(200, headers={**_CONNECTION_SPECIFIC, "te": "trailers", "x-keep": "1"}, body=b"ok")
+
+    async with h2_peer_against(serve) as peer:
+        await peer.send_request_headers(1, "GET", "http://x/", HeaderMap(), end_stream=True)
+        head = await peer.recv(Headers)
+        data = await peer.recv(Data)
+
+    assert head is not None and head.status == 200
+    assert head.headers.items() == [("x-keep", b"1"), ("content-length", b"2")]
+    assert data is not None and (data.data, data.end_stream) == (b"ok", True)
+
+
+@pytest.mark.tonio
+async def test_strip_connection_headers_multiple_values():
+    # hyper src/proto/h2/mod.rs:340 strip_connection_headers_multiple_values (v1.13.0),
+    # through the client's request head (`MessageKind::Request`).
+    seen = []
+
+    async def script(peer):
+        req = await peer.request()
+        seen.append(req.headers.headers)
+        await peer.send_response_headers(req.stream_id, 200, end_stream=True)
+
+    headers = HeaderMap(
+        [
+            ("connection", "x-a"),
+            ("connection", "x-b, x-c"),
+            ("x-a", "1"),
+            ("x-b", "2"),
+            ("x-c", "3"),
+            ("x-d", "4"),
+        ]
+    )
+    async with h2_client_against(script) as conn:
+        await conn.request("GET", "/", headers=headers)
+
+    (fields,) = seen
+    assert len(fields) == 1
+    assert "x-d" in fields
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize(
+    ("method", "path", "req_headers", "req_body", "expect_req_headers", "resp_headers", "resp_body"),
+    [
+        pytest.param(
+            "GET", "/", {}, None, {}, {"connection": "close"}, b"hello world", id="get_strip_connection_header"
+        ),
+        pytest.param(
+            "GET",
+            "/",
+            {},
+            None,
+            {},
+            {"keep-alive": "timeout=5, max=1000"},
+            b"hello world",
+            id="get_strip_keep_alive_header",
+        ),
+        pytest.param("GET", "/", {}, None, {}, {"upgrade": "h2c"}, b"hello world", id="get_strip_upgrade_header"),
+        pytest.param(
+            "GET", "/", {"te": "trailers"}, None, {"te": b"trailers"}, {}, None, id="get_allow_te_trailers_header"
+        ),
+        pytest.param("GET", "/", {}, None, {}, {"transfer-encoding": "chunked"}, b"hello world", id="get_body_chunked"),
+        pytest.param(
+            "POST", "/post_chunked", {"transfer-encoding": "chunked"}, b"hello world", {}, {}, None, id="post_chunked"
+        ),
+    ],
+)
+async def test_h2_strip_connection_headers_end_to_end(
+    method, path, req_headers, req_body, expect_req_headers, resp_headers, resp_body
+):
+    # hyper tests/integration.rs: get_strip_connection_header, get_strip_keep_alive_header,
+    # get_strip_upgrade_header, get_allow_te_trailers_header, get_body_chunked, post_chunked
+    # (v1.13.0), their HTTP/2 run (`client_version: 2`, `proxy: false`).
+    async def serve(transport):
+        async with H2Server(transport) as server:
+            async for req in server:
+                assert (req.method, req.path, await req.read()) == (method, path, req_body or b"")
+                assert {name: req.headers.get(name) for name in expect_req_headers} == expect_req_headers
+                await req.respond(200, headers=resp_headers, body=resp_body)
+
+    async with _client_against(open_h2, serve, {}) as conn:
+        resp = await conn.request(method, path, headers=req_headers, body=req_body)
+        assert resp.status == 200
+        assert await resp.read() == (resp_body or b"")
+        assert not any(name in resp.headers for name in resp_headers)
+
+
+@pytest.mark.tonio
+async def test_h2_post_outgoing_length():
+    # hyper tests/integration.rs: post_outgoing_length (v1.13.0), its HTTP/2 run
+    # (`client_version: 2`, `proxy: false`).
+    async def serve(transport):
+        async with H2Server(transport) as server:
+            async for req in server:
+                assert (req.method, req.path, req.headers.get("content-length"), await req.read()) == (
+                    "POST",
+                    "/hello",
+                    b"13",
+                    b"hello, world!",
+                )
+                await req.respond(200)
+
+    async with _client_against(open_h2, serve, {}) as conn:
+        assert (await conn.request("POST", "/hello", body=b"hello, world!")).status == 200
+
+
+@pytest.mark.tonio
+@pytest.mark.parametrize(
+    ("reply_headers", "reply_body", "content_length"),
+    [
+        pytest.param(None, b"Hello, World!", b"13", id="http2_auto_response_with_known_length"),
+        pytest.param(
+            {"content-length": "10"}, b"Hello, World!", b"10", id="http2_auto_response_with_conflicting_lengths"
+        ),
+        pytest.param(None, None, None, id="http2_implicit_empty_size_hint"),
+    ],
+)
+async def test_h2_auto_response_content_length(reply_headers, reply_body, content_length):
+    # hyper tests/server.rs: http2_auto_response_with_known_length,
+    # http2_auto_response_with_conflicting_lengths, http2_implicit_empty_size_hint
+    # (v1.13.0). Their `size_hint().exact()` assertions have no counterpart: httpunk's
+    # response body exposes no size hint.
+    async def serve(transport):
+        async with H2Server(transport) as server:
+            async for req in server:
+                await req.respond(200, headers=reply_headers, body=reply_body)
+
+    async with _client_against(open_h2, serve, {}) as conn:
+        assert (await conn.request("GET", "/")).headers.get("content-length") == content_length
 
 
 @pytest.mark.tonio
@@ -960,7 +1135,7 @@ async def test_server_closes_after_goaway_reply_no_streams_ever():
 async def test_server_closes_after_goaway_received_mid_request():
     """Peer GOAWAY(last=1) while stream 1 is still in flight, and the peer sends NOTHING
     more. Stream 1 finishing is a local event — h2's `drop_stream_ref` wakes the
-    connection task so the idle check re-runs (streams.rs L1673-1675); httpunk must do the
+    connection task so the idle check re-runs (streams.rs L1681-1683); httpunk must do the
     same from the stream-close path, not only after inbound bytes."""
     done = Event()
     async with h2_peer_against(lambda transport: _serve_and_report(transport, done)) as peer:
@@ -979,8 +1154,8 @@ async def test_server_closes_after_goaway_received_mid_request():
 async def test_server_closes_idle_after_phase1_goaway():
     """A received GOAWAY closes an idle connection whatever its last-stream-id, a
     phase-1 graceful one (2^31-1) included: h2 stores every received GOAWAY in
-    `inner.error` (proto/connection.rs L596) and, once no stream remains, replies
-    GOAWAY(NO_ERROR) and closes (L327-333). `should_close_on_idle`'s `StreamId::MAX`
+    `inner.error` (proto/connection.rs L628) and, once no stream remains, replies
+    GOAWAY(NO_ERROR) and closes (L351-357). `should_close_on_idle`'s `StreamId::MAX`
     exclusion concerns only a GOAWAY the server sent itself (go_away.rs L108-114)."""
     done = Event()
     async with h2_peer_against(lambda transport: _serve_and_report(transport, done)) as peer:

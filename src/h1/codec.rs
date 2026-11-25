@@ -113,8 +113,8 @@ pub struct H1Codec {
     /// Head bytes including the start/status line, also the chunked trailer byte
     /// limit (hyper server/conn/http1.rs:346-358, client/conn/http1.rs:506-518).
     max_header_size: Option<usize>,
-    /// One config for both roles, as in hyper conn.rs:953; each parser reads its
-    /// own flags (role.rs:176,1057).
+    /// One config for both roles, as in hyper conn.rs:956; each parser reads its
+    /// own flags (role.rs:176,1060).
     parser_config: ParserConfig,
     title_case_headers: bool,
     date_header: bool,
@@ -228,7 +228,7 @@ impl H1Codec {
         let m =
             Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
         let uri: Uri = url.parse().map_err(|e| value_err("invalid url", e))?;
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let fields = headers.map_or_default(HeaderMap::snapshot);
         let body = if chunked {
             Some(None)
         } else {
@@ -307,7 +307,7 @@ impl H1Codec {
     /// Only the fields the message's own `Trailer` header declared are emitted; the
     /// rest are dropped by hyper's `encode_trailers`, and a non-chunked body gets the
     /// bare terminator. On the server, trailers go out only if the request declared
-    /// `TE: trailers` (conn.rs `write_trailers` L757: "trailers not allowed to be
+    /// `TE: trailers` (conn.rs `write_trailers` L759: "trailers not allowed to be
     /// sent"), the body then ending as usual (`end_body`).
     fn serialize_trailers(&self, py: Python<'_>, trailers: &HeaderMap) -> PyResult<Py<PyBytes>> {
         let mut st = self.inner.lock().unwrap();
@@ -509,7 +509,7 @@ impl H1Codec {
         content_length: Option<u64>,
         chunked: bool,
     ) -> PyResult<Py<PyBytes>> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let fields = headers.map_or_default(HeaderMap::snapshot);
         let body = if chunked {
             Some(None)
         } else {

@@ -339,7 +339,7 @@ async def test_early_response_during_upload():
 async def test_early_response_does_not_truncate_upload():
     """A keep-alive server answers before reading the body but keeps draining it: the
     client must finish writing the request body — hyper's poll_loop does NOT truncate
-    the upload at head-arrival (dispatch.rs L172-211), it keeps writing. The
+    the upload at head-arrival (dispatch.rs L191-230), it keeps writing. The
     response body is withheld until the whole request has been drained, so the client
     cannot release the slot (and cancel the writer) until the upload has completed;
     the old behavior cancelled the writer at head-arrival, so the server's drain would
@@ -580,7 +580,7 @@ async def test_idle_fin_closes_connection_promptly():
     with NO send: `closed` flips promptly, no error is recorded (hyper's clean idle
     close — "found EOF on idle connection, closing", conn.rs L472-484), the transport
     is really closed (no CLOSE_WAIT parking — the task drops its io, dispatch.rs
-    L152-160), and the next send_request raises `ConnectionClosedError` carrying
+    L171-179), and the next send_request raises `ConnectionClosedError` carrying
     `request_unsent` (hyper's TrySendError give-back, client/conn/http1.rs L261-281)."""
     r1_read = Event()
 
@@ -611,7 +611,7 @@ async def test_idle_stray_bytes_poison_promptly():
     they ARRIVE (no send needed): the connection is poisoned AND closed immediately
     (hyper `new_unexpected_message`, conn.rs L486-490 — the errored task drops its
     io), and the next send_request raises the recorded error with `request_unsent`
-    set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L723-739)."""
+    set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L742-758)."""
     r1_read = Event()
 
     async def serve(stream):
@@ -681,7 +681,7 @@ async def test_body_iterable_error_fails_promptly():
 @pytest.mark.tonio
 async def test_server_close_before_response_head_is_incomplete_message():
     """EOF while the response head is expected: hyper reports `IncompleteMessage` from
-    parsing (io.rs L224-227, conn.rs L339-367) — a sibling of the io
+    parsing (io.rs L224-227, conn.rs L339-363) — a sibling of the io
     error kind, so `H1IncompleteMessageError`, not `ConnectionClosedError`."""
 
     async def serve(stream):

@@ -6,7 +6,7 @@
 #
 # Usage:
 #   scripts/vendor-hyper.sh                    # vendor the pinned version
-#   HYPER_VERSION=1.12.0 scripts/vendor-hyper.sh
+#   HYPER_VERSION=1.13.0 scripts/vendor-hyper.sh
 #
 # Like vendor-h2.sh, the copy is kept byte-identical to upstream so `git diff`
 # between two vendored versions shows only genuine upstream changes. The only
@@ -23,7 +23,7 @@
 #     structural shims: drop the unvendored conn/dispatch/h2/upgrade wiring)
 set -euo pipefail
 
-HYPER_VERSION="${HYPER_VERSION:-1.12.0}"
+HYPER_VERSION="${HYPER_VERSION:-1.13.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DST="$ROOT/crates/vendor-hyper/src"
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"

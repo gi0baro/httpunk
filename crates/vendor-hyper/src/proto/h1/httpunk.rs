@@ -58,7 +58,7 @@ pub fn too_large_error() -> crate::Error {
 }
 
 /// What hyper's server does with a head parse failure — conn.rs `on_parse_error`
-/// (L836-853): a buffer holding the h2 preface becomes `Parse::VersionH2` (no
+/// (L839-856): a buffer holding the h2 preface becomes `Parse::VersionH2` (no
 /// response, the connection just closes); otherwise `Server::on_error` picks the
 /// automatic response status (400 / 414 / 431, role.rs `on_error`), `None` when
 /// hyper answers nothing. Returns the error to raise and that status.
@@ -70,11 +70,15 @@ pub fn server_parse_failure(read_buf: &[u8], e: crate::Error) -> (crate::Error, 
     (e, status)
 }
 
-/// conn.rs `fix_keep_alive` / `enforce_version` (L672-727): preserve the caller's
+/// conn.rs `fix_keep_alive` / `enforce_version` (L672-731): preserve the caller's
 /// Connection tokens, checking every line before appending keep-alive or close.
 /// `remote_http10` is `state.version == HTTP_10`; `wants_keep_alive` is
 /// `state.wants_keep_alive()` (`KA::Disabled` when false).
-fn enforce_version<S>(head: &mut MessageHead<S>, remote_http10: bool, wants_keep_alive: bool) {
+fn enforce_version<T: Http1Transaction>(
+    head: &mut MessageHead<T::Outgoing>,
+    remote_http10: bool,
+    wants_keep_alive: bool,
+) {
     if remote_http10 {
         // hyper's outgoing HTTP_10 arm (conn.rs L683) is unreachable: both facade
         // encoders build HTTP_11 heads and take the peer's version via `http10`.
@@ -95,7 +99,9 @@ fn enforce_version<S>(head: &mut MessageHead<S>, remote_http10: bool, wants_keep
             }
         }
         head.version = Version::HTTP_10;
-    } else if !wants_keep_alive {
+    } else if !T::is_switching_protocols(head) && !wants_keep_alive {
+        // conn.rs L710-712: a 101 hands off the connection to another protocol, so
+        // disabled keep-alive adds no close option to the upgrade response.
         match head.headers.entry(CONNECTION) {
             Entry::Occupied(mut e) => {
                 if !e.iter().any(connection_close) {
@@ -336,7 +342,7 @@ impl BodyEncoder {
     /// The connection must close once this message is written — hyper
     /// `Encoder::is_last`: set by `Server::encode` for `Encode.keep_alive == false`, a
     /// response `Connection: close`, a 101, or a 2xx to CONNECT (role.rs L404-419,
-    /// L847-850). conn.rs `try_keep_alive` closes on it.
+    /// L850-853). conn.rs `try_keep_alive` closes on it.
     pub fn is_last(&self) -> bool {
         self.0.is_last()
     }
@@ -393,7 +399,7 @@ impl BodyEncoder {
         trailers: HeaderMap,
         title_case_headers: bool,
     ) -> Result<BodyTail, crate::Error> {
-        // hyper conn.rs:766: trailers use the connection's casing option too.
+        // hyper conn.rs:768: trailers use the connection's casing option too.
         match self.0.encode_trailers::<Bytes>(trailers, title_case_headers) {
             Some(buf) => Ok(BodyTail::Trailers(buf)),
             None => self.end(),
@@ -428,9 +434,9 @@ pub fn encode_request(
     title_case_headers: bool,
     dst: &mut Vec<u8>,
 ) -> Result<BodyEncoder, crate::Error> {
-    // The request-target is serialized *as given* (hyper role.rs L1232 writes
+    // The request-target is serialized *as given* (hyper role.rs L1242 writes
     // `msg.head.subject.1` via its `Display`, "not enforced or validated" —
-    // client/conn/http1.rs L211-219): a path-and-query `Uri` yields origin-form
+    // client/conn/http1.rs L211-215): a path-and-query `Uri` yields origin-form
     // (`GET /path`), an absolute `Uri` yields absolute-form (`GET http://…`, for
     // proxies), and an authority `Uri` yields authority-form (`CONNECT host:port`).
     // The caller chooses the form via the target they pass; we do not reduce it.
@@ -445,7 +451,7 @@ pub fn encode_request(
         extensions: http::Extensions::new(),
     };
     let wants_keep_alive = !crate::headers::connection_any_close(&head.headers);
-    enforce_version(&mut head, http10, wants_keep_alive);
+    enforce_version::<Client>(&mut head, http10, wants_keep_alive);
     let body_len = match body {
         None => None,
         Some(Some(n)) => Some(BodyLength::Known(n)),
@@ -459,7 +465,7 @@ pub fn encode_request(
         // the `server` feature is on); `Client::encode` ignores them.
         keep_alive: true,
         req_method: &mut req_method,
-        // hyper conn.rs:644, role.rs:1253: the client uses the same casing option.
+        // hyper conn.rs:644, role.rs:1263: the client uses the same casing option.
         title_case_headers,
         date_header: false,
     };
@@ -467,7 +473,7 @@ pub fn encode_request(
     // across messages): cleared here, written once; on error hyper rewinds it.
     dst.clear();
     // `Client::encode` reads the request's own `Trailer` header to allow-list the
-    // chunked trailer fields the body may emit (role.rs L1440-1453); undeclared
+    // chunked trailer fields the body may emit (role.rs L1451-1464); undeclared
     // fields are dropped by `encode_trailers`, as on the server.
     let encoder = Client::encode(enc, dst)?;
     Ok(BodyEncoder(encoder))
@@ -477,7 +483,7 @@ pub fn encode_request(
 /// `Ok(Some(_))` the head has been consumed from `buf` (leftover = body bytes).
 /// `req_method` is the method of the request this responds to (bodyless-ness of
 /// some responses — e.g. to HEAD — depends on it). `max_header_size` caps the
-/// complete head in role.rs:1064-1068 (including the status line).
+/// complete head in role.rs:1067-1071 (including the status line).
 /// Config and count limit are forwarded as in conn.rs:247-249.
 pub fn parse_response(
     buf: &mut BytesMut,
@@ -567,10 +573,10 @@ pub fn parse_request(
 /// side; hyper role.rs `Server::encode` L390). `body`: `None` = no body;
 /// `Some(Some(n))` = `Content-Length: n`; `Some(None)` = `Transfer-Encoding:
 /// chunked`. `req_method` is the method of the request being answered (a response
-/// to HEAD, or 204/304, carries no body — `Server::can_have_body` L524-536
+/// to HEAD, or 204/304, carries no body — `Server::can_have_body` L527-539
 /// uses it). `keep_alive` decides whether `Connection: close` is written.
 /// `http10` sets the response version to HTTP/1.0 (status line + no-chunked
-/// gating — an unknown-length 1.0 body is close-delimited, role.rs L930-934); the
+/// gating — an unknown-length 1.0 body is close-delimited, role.rs L933-937); the
 /// driver derives it from the request. `date_header` writes the `Date` header like
 /// hyper's server (common/date.rs; `http1::Builder::auto_date_header`, default on);
 /// `title_case_headers` is `http1::Builder::title_case_headers`.
@@ -595,7 +601,7 @@ pub fn encode_response(
         headers,
         extensions: http::Extensions::new(),
     };
-    enforce_version(&mut head, http10, keep_alive);
+    enforce_version::<Server>(&mut head, http10, keep_alive);
     let body_len = match body {
         None => None,
         Some(Some(n)) => Some(BodyLength::Known(n)),
@@ -611,8 +617,8 @@ pub fn encode_response(
         date_header,
     };
     // Refresh the per-thread `Date` cache HERE. hyper refreshes it on each dispatcher
-    // poll (dispatch.rs L148 -> `Server::update_date`, role.rs L518), and `Server::encode`
-    // merely copies it (role.rs L988). Under a work-stealing runtime (tonio), the head
+    // poll (dispatch.rs L167 -> `Server::update_date`, role.rs L521), and `Server::encode`
+    // merely copies it (role.rs L991). Under a work-stealing runtime (tonio), the head
     // is parsed on one OS thread and the response encoded on another whose cache was
     // last refreshed by ITS last response — arbitrarily long ago on a quiet server.
     // `update()` is one clock read, so pay it per response and never emit a stale Date.
@@ -632,7 +638,7 @@ pub fn encode_response(
 
 /// The current `Date` header value, from hyper's per-thread once-a-second cache
 /// (common/date.rs `update` + `extend`) — so the h2 server's `Date` (hyper
-/// proto/h2/server.rs L481 `or_insert_with(date::update_and_header_value)`) is the
+/// proto/h2/server.rs L484 `or_insert_with(date::update_and_header_value)`) is the
 /// same bytes the h1 encoder writes.
 pub fn date_header_value() -> HeaderValue {
     // hyper's h2 server path (proto/h2/server.rs `date::update_and_header_value`):
@@ -645,7 +651,8 @@ pub fn date_header_value() -> HeaderValue {
 /// (written Poll-first over hyper's async `MemRead`) can be driven sans-IO:
 /// data present -> `Ready(bytes)`; empty and not yet EOF -> `Pending` (which the
 /// facade reads as "need more"); empty at EOF -> `Ready(empty)` (hyper's decoder
-/// treats an empty read as end-of-transport).
+/// treats an empty read as end-of-transport). `read_byte` keeps the same three
+/// cases: `Ready(Some(byte))`, `Pending`, `Ready(None)`.
 struct SyncMemRead {
     buf: BytesMut,
     eof: bool,
@@ -658,6 +665,20 @@ impl MemRead for SyncMemRead {
             Poll::Ready(Ok(self.buf.split_to(n).freeze()))
         } else if self.eof {
             Poll::Ready(Ok(Bytes::new()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    // io.rs:377-384 (`Buffered::read_byte`): index and advance instead of
+    // `read_mem`'s `split_to(1).freeze()`.
+    fn read_byte(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<Option<u8>>> {
+        if !self.buf.is_empty() {
+            let b = self.buf[0];
+            self.buf.advance(1);
+            Poll::Ready(Ok(Some(b)))
+        } else if self.eof {
+            Poll::Ready(Ok(None))
         } else {
             Poll::Pending
         }
@@ -679,7 +700,7 @@ pub struct BodyDecoder {
 impl BodyDecoder {
     /// `kind`: "empty" | "length" | "chunked" | "close"; `length` is the
     /// Content-Length for "length". Trailer limits come from the connection's
-    /// options (conn.rs:318-330; decode.rs:180-181 defaults to 100 / 16 KB).
+    /// options (conn.rs:318-330; decode.rs:185-186 defaults to 100 / 16 KB).
     pub fn new(
         kind: &str,
         length: u64,

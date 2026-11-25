@@ -9,7 +9,10 @@
 //! can never be observed; in debug a poisoned lock surfaces as a clean panic.)
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use http::header::{CONTENT_LENGTH, DATE};
+use http::header::{
+    CONNECTION, CONTENT_LENGTH, DATE, Entry, HeaderName, HeaderValue, TE, TRANSFER_ENCODING,
+    UPGRADE,
+};
 use http::{Method, StatusCode, Uri};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -35,6 +38,8 @@ pub(super) const DEFAULT_MAX_FRAME_SIZE: usize = 16384;
 pub(super) const MAX_MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
 /// Largest permitted SETTINGS_INITIAL_WINDOW_SIZE (2^31 - 1, RFC 7540 §6.5.2).
 pub(super) const MAX_WINDOW_SIZE: u32 = (1 << 31) - 1;
+/// h2 codec/framed_read.rs:24.
+const MAX_FIELDS_HINT: usize = 64;
 
 const FLAG_END_STREAM: u8 = 0x1;
 
@@ -126,7 +131,7 @@ fn classify_hpack(
             Ok(HpackOutcome::NeedMore)
         }
         Err(frame::Error::MalformedMessage) => Ok(HpackOutcome::StreamReset),
-        // h2 codec/framed_read.rs:201-206, 384-389 (HEADERS / CONTINUATION).
+        // h2 codec/framed_read.rs:215-220, 398-403 (HEADERS / CONTINUATION).
         Err(frame::Error::HeaderListWayTooLarge) => Err(protocol_err_with_debug(
             frame::Reason::ENHANCE_YOUR_CALM,
             "decoded header list size over abuse limit",
@@ -174,7 +179,7 @@ fn headers_event(py: Python<'_>, h: frame::Headers) -> PyResult<Py<PyAny>> {
     let end_stream = h.is_end_stream();
     let is_informational = h.is_informational();
     let is_over_size = h.is_over_size();
-    // h2 recv.rs:178-200: parse every content-length with `frame::parse_u64`;
+    // h2 recv.rs:183-205: parse every content-length with `frame::parse_u64`;
     // an unparsable or conflicting value is a stream PROTOCOL_ERROR.
     let mut content_length = None;
     let mut content_length_invalid = false;
@@ -245,16 +250,16 @@ pub struct Headers {
     pub headers: Py<HeaderMap>,
     /// The first parsed `content-length` (`frame::parse_u64`); `None` if absent
     /// or the first value is unparsable. See `content_length_invalid` for validity
-    /// across all values (h2 recv.rs:178-200).
+    /// across all values (h2 recv.rs:183-205).
     #[pyo3(get)]
     pub content_length: Option<u64>,
-    /// An unparsable or conflicting `content-length` (h2 recv.rs:178-200: PROTOCOL_ERROR).
+    /// An unparsable or conflicting `content-length` (h2 recv.rs:183-205: PROTOCOL_ERROR).
     #[pyo3(get)]
     pub content_length_invalid: bool,
     /// A 1xx response head (h2 `frame::Headers::is_informational`).
     #[pyo3(get)]
     pub is_informational: bool,
-    /// Decoded header list reached SETTINGS_MAX_HEADER_LIST_SIZE (h2 recv.rs:221-238).
+    /// Decoded header list reached SETTINGS_MAX_HEADER_LIST_SIZE (h2 recv.rs:226-243).
     #[pyo3(get)]
     pub is_over_size: bool,
 }
@@ -282,12 +287,12 @@ pub struct Data {
     pub data: Py<PyBytes>,
     /// h2 `frame::Data::flow_controlled_len` — payload + padding + the pad-length
     /// byte. Flow control counts padding; `data` (the payload) does not, so the
-    /// driver must account windows on this, not `len(data)` (h2 recv.rs L653).
+    /// driver must account windows on this, not `len(data)` (h2 recv.rs L673).
     #[pyo3(get)]
     pub flow_controlled_len: usize,
     /// The flow-controlled overhead the app never sees: `flow_controlled_len` minus the
     /// payload (the padding + its length byte, 0 when unpadded) — what h2's `recv_data`
-    /// releases back to the windows on the app's behalf (recv.rs L749-759).
+    /// releases back to the windows on the app's behalf (recv.rs L769-779).
     #[pyo3(get)]
     pub padding: usize,
 }
@@ -410,6 +415,10 @@ pub(super) struct Decoder {
     /// `receive_frames` itself); `preface_ok` once it matched.
     expect_preface: bool,
     preface_ok: bool,
+    /// Moving average of the field count of recent header blocks, used to
+    /// size the next block's `HeaderMap` so decoding it doesn't rehash
+    /// (h2 codec/framed_read.rs:42-44).
+    fields_hint: usize,
     partial: Option<Partial>, // a HEADERS block awaiting CONTINUATION frames
 }
 
@@ -427,12 +436,22 @@ impl Decoder {
             preface_buf: None,
             expect_preface,
             preface_ok: !expect_preface,
+            fields_hint: 0,
             partial: None,
         }
     }
 
+    /// h2 codec/framed_read.rs:136-141.
+    #[allow(clippy::manual_div_ceil)] // upstream's expression, kept verbatim
+    fn update_fields_hint(&mut self, len: usize) {
+        // The newest block weighs 1/4. Rounding up keeps a steady count from
+        // decaying, and the cap bounds what one huge block makes later ones reserve.
+        let len = len.min(MAX_FIELDS_HINT);
+        self.fields_hint = (self.fields_hint * 3 + len + 3) / 4;
+    }
+
     /// Feed inbound bytes; return the complete frames now decodable. A server-role
-    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1454-1477:
+    /// decoder consumes the client's 24-byte preface first (h2 server.rs L1460-1483:
     /// a mismatch is a connection PROTOCOL_ERROR).
     pub(super) fn receive_frames(
         &mut self,
@@ -463,7 +482,7 @@ impl Decoder {
                 | usize::from(self.buf[2]);
             // Enforce SETTINGS_MAX_FRAME_SIZE on the *declared* length before
             // buffering the payload (h2: LengthDelimitedCodec `max_frame_length`
-            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:439-444). This both rejects
+            // -> GOAWAY(FRAME_SIZE_ERROR); framed_read.rs:457-462). This both rejects
             // frames h2 rejects and prevents buffering an over-size payload.
             if payload_len > self.max_recv_frame_size {
                 return Err(protocol_err(
@@ -488,7 +507,7 @@ impl Decoder {
     }
 
     /// Feed bytes of the client connection preface (RFC 9113 §3.4) — h2 server.rs
-    /// L1454-1477: `None` while the bytes so far match but the 24 are not all in yet,
+    /// L1460-1483: `None` while the bytes so far match but the 24 are not all in yet,
     /// `Some(true)` once the whole preface matched (any bytes past it are already in
     /// the frame buffer), `Some(false)` on a mismatch.
     pub(super) fn feed_preface(&mut self, data: &[u8]) -> Option<bool> {
@@ -629,18 +648,26 @@ pub(super) struct Codec {
 /// Build a request HEADERS frame (h2 client.rs `Peer::convert_send_message`): the
 /// request-target as `http::Uri` sees it — absolute-form carries its own scheme +
 /// authority; origin-form (a bare path) takes the connection's, which hyper's h2
-/// client fills in the same way (proto/h2/client.rs).
+/// client fills in the same way (proto/h2/client.rs). `content_length`: the body's
+/// exact size, if known (hyper `body.size_hint().exact()`); `fields` arrive stripped.
 pub(super) fn build_request_headers(
     stream_id: u32,
     method: &str,
     target: &str,
-    fields: http::HeaderMap,
+    mut fields: http::HeaderMap,
     end_stream: bool,
     scheme: Option<&str>,
     authority: Option<&str>,
+    content_length: Option<u64>,
 ) -> PyResult<frame::Headers> {
     let method =
         Method::from_bytes(method.as_bytes()).map_err(|e| value_err("invalid method", e))?;
+    // hyper 1.13.0 src/proto/h2/client.rs:758-762, right after the strip.
+    if let Some(len) = content_length
+        && (len != 0 || method_has_defined_payload_semantics(&method))
+    {
+        set_content_length_if_missing(&mut fields, len);
+    }
     let uri: Uri = target.parse().map_err(|e| value_err("invalid url", e))?;
     let uri = if uri.scheme().is_some() && uri.authority().is_some() {
         uri
@@ -669,19 +696,26 @@ pub(super) fn build_request_headers(
 }
 
 /// Build a response HEADERS frame. `auto_date`: hyper's h2 server inserts `Date`
-/// when the app didn't set one (proto/h2/server.rs L483
-/// `entry(DATE).or_insert_with(date::update_and_header_value)`).
+/// when the app didn't set one (proto/h2/server.rs L484
+/// `entry(DATE).or_insert_with(date::update_and_header_value)`). `content_length`: the
+/// exact size of a body not at its end (hyper `!body.is_end_stream()` and
+/// `body.size_hint().exact()`); `fields` arrive stripped.
 pub(super) fn build_response_headers(
     stream_id: u32,
     status: u16,
     mut fields: http::HeaderMap,
     end_stream: bool,
     auto_date: bool,
+    content_length: Option<u64>,
 ) -> PyResult<frame::Headers> {
     let status = StatusCode::from_u16(status).map_err(|e| value_err("invalid status", e))?;
     let pseudo = frame::Pseudo::response(status);
     if auto_date {
         fields.entry(DATE).or_insert_with(date_header_value);
+    }
+    // hyper 1.13.0 src/proto/h2/server.rs:517-521, after the strip and the `date`.
+    if let Some(len) = content_length {
+        set_content_length_if_missing(&mut fields, len);
     }
     let mut hframe = frame::Headers::new(frame::StreamId::from(stream_id), pseudo, fields);
     // A bodyless response carries END_STREAM on HEADERS (e.g. a HEAD response,
@@ -871,7 +905,8 @@ impl H2Codec {
     /// h2 send.rs `check_headers` (RFC 9113 §8.2.2): connection-specific fields in an
     /// outbound HEADERS block, and a `te` other than exactly `trailers`, are
     /// `UserError::MalformedHeaders` (`H2UserError`). A caller error, not a protocol
-    /// one: the connection and stream stay usable.
+    /// one: the connection and stream stay usable. For trailers: heads are stripped
+    /// instead (`strip_connection_headers`).
     #[staticmethod]
     fn check_send_headers(headers: &HeaderMap) -> PyResult<()> {
         headers.with_inner(check_send_fields)
@@ -969,9 +1004,9 @@ impl H2Codec {
         scheme: Option<&str>,
         authority: Option<&str>,
     ) -> PyResult<Py<PyBytes>> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
+        let fields = headers.map_or_default(HeaderMap::snapshot);
         let hframe = build_request_headers(
-            stream_id, method, target, fields, end_stream, scheme, authority,
+            stream_id, method, target, fields, end_stream, scheme, authority, None,
         )?;
         let mut dst = BytesMut::new();
         self.inner
@@ -992,8 +1027,9 @@ impl H2Codec {
         end_stream: bool,
         auto_date: bool,
     ) -> PyResult<Py<PyBytes>> {
-        let fields = headers.map(HeaderMap::snapshot).unwrap_or_default();
-        let hframe = build_response_headers(stream_id, status, fields, end_stream, auto_date)?;
+        let fields = headers.map_or_default(HeaderMap::snapshot);
+        let hframe =
+            build_response_headers(stream_id, status, fields, end_stream, auto_date, None)?;
         let mut dst = BytesMut::new();
         self.inner
             .lock()
@@ -1089,6 +1125,82 @@ impl H2Codec {
     }
 }
 
+// hyper 1.13.0 src/proto/h2/mod.rs:32-41.
+// List of connection headers from RFC 9110 Section 7.6.1
+//
+// TE headers are allowed in HTTP/2 requests as long as the value is "trailers", so they're
+// tested separately.
+static CONNECTION_HEADERS: [HeaderName; 4] = [
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    TRANSFER_ENCODING,
+    UPGRADE,
+];
+
+/// hyper 1.13.0 src/proto/h2/mod.rs:43-48.
+pub(super) enum MessageKind {
+    Request,
+    Response,
+}
+
+/// hyper 1.13.0 src/proto/h2/mod.rs:50-94 `strip_connection_headers` (its `warn!`
+/// logging has no counterpart). hyper applies it to the head it hands to h2, the
+/// client's request (proto/h2/client.rs:757) and the server's response
+/// (proto/h2/server.rs:475), so h2's `check_headers` never refuses a head; trailers
+/// are not stripped and stay checked (`check_send_fields`).
+pub(super) fn strip_connection_headers(headers: &mut http::HeaderMap, kind: MessageKind) {
+    for header in &CONNECTION_HEADERS {
+        headers.remove(header);
+    }
+
+    if matches!(kind, MessageKind::Request) {
+        if headers
+            .get(TE)
+            .is_some_and(|te_header| te_header != "trailers")
+        {
+            headers.remove(TE);
+        }
+    } else {
+        headers.remove(TE);
+    }
+
+    if let Entry::Occupied(entry) = headers.entry(CONNECTION) {
+        // A `Connection` header may have a comma-separated list of names of other headers that
+        // are meant for only this specific connection.
+        //
+        // Iterate these names and remove them as headers. Connection-specific headers are
+        // forbidden in HTTP2, as that information has been moved into frame types of the h2
+        // protocol.
+        let (_, values) = entry.remove_entry_mult();
+        let values: Vec<_> = values.collect();
+        for header in values {
+            if let Ok(header_contents) = header.to_str() {
+                for name in header_contents.split(',') {
+                    let name = name.trim();
+                    headers.remove(name);
+                }
+            }
+        }
+    }
+}
+
+/// hyper 1.13.0 src/headers.rs:128-134 (compiled out of the vendored crate with hyper's
+/// `http2` feature).
+fn method_has_defined_payload_semantics(method: &Method) -> bool {
+    !matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::DELETE | Method::CONNECT
+    )
+}
+
+/// hyper 1.13.0 src/headers.rs:136-141 (compiled out of the vendored crate with hyper's
+/// `http2` feature): a `content-length` the caller set is left alone.
+fn set_content_length_if_missing(headers: &mut http::HeaderMap, len: u64) {
+    headers
+        .entry(CONTENT_LENGTH)
+        .or_insert_with(|| HeaderValue::from(len));
+}
+
 /// h2 send.rs `check_headers` over a raw `http::HeaderMap` (see `H2Codec::check_send_headers`).
 pub(super) fn check_send_fields(fields: &http::HeaderMap) -> PyResult<()> {
     if fields.contains_key(http::header::CONNECTION)
@@ -1128,18 +1240,20 @@ impl Decoder {
             Kind::Headers => {
                 // Mirrors h2 framed_read.rs `header_block!(Headers, ...)`.
                 frame_buf.advance(HEADER_LEN);
-                let (mut h, mut payload) = match frame::Headers::load(head, frame_buf) {
-                    Ok(res) => res,
-                    // A stream cannot depend on itself: stream error (RFC §5.4.2).
-                    Err(frame::Error::InvalidDependencyId) => {
-                        return Ok(Some(stream_err_event(
-                            py,
-                            head.stream_id(),
-                            frame::Reason::PROTOCOL_ERROR,
-                        )?));
-                    }
-                    Err(e) => return Err(load_err(e)),
-                };
+                // h2 codec/framed_read.rs:189.
+                let (mut h, mut payload) =
+                    match frame::Headers::load(head, frame_buf, self.fields_hint) {
+                        Ok(res) => res,
+                        // A stream cannot depend on itself: stream error (RFC §5.4.2).
+                        Err(frame::Error::InvalidDependencyId) => {
+                            return Ok(Some(stream_err_event(
+                                py,
+                                head.stream_id(),
+                                frame::Reason::PROTOCOL_ERROR,
+                            )?));
+                        }
+                        Err(e) => return Err(load_err(e)),
+                    };
                 let is_end_headers = h.is_end_headers();
                 // Load HPACK incrementally (h2 decodes even when !END_HEADERS, so
                 // the dynamic table stays in sync and over-size is tracked).
@@ -1157,6 +1271,8 @@ impl Decoder {
                     HpackOutcome::Done | HpackOutcome::NeedMore => {}
                 }
                 if is_end_headers {
+                    // h2 codec/framed_read.rs:424-426.
+                    self.update_fields_hint(h.fields().keys_len());
                     headers_event(py, h)?
                 } else {
                     // Defer until the terminating CONTINUATION (END_HEADERS).
@@ -1189,7 +1305,7 @@ impl Decoder {
                 } else {
                     let cnt = partial.count + 1;
                     if cnt > self.max_continuation_frames {
-                        // h2 codec/framed_read.rs:337-340.
+                        // h2 codec/framed_read.rs:351-354.
                         return Err(protocol_err_with_debug(
                             frame::Reason::ENHANCE_YOUR_CALM,
                             "too_many_continuations",
@@ -1233,6 +1349,8 @@ impl Decoder {
                     HpackOutcome::Done | HpackOutcome::NeedMore => {}
                 }
                 if is_end_headers {
+                    // h2 codec/framed_read.rs:424-426.
+                    self.update_fields_hint(partial.frame.fields().keys_len());
                     headers_event(py, partial.frame)?
                 } else {
                     self.partial = Some(partial);
