@@ -69,7 +69,7 @@ class BaseClientConnection:
         try:
             await self._conn.connect()
         except BaseException:
-            # hyper client/conn/http1.rs:586, http2.rs:579: the handshake owns
+            # hyper client/conn/http1.rs:586, http2.rs:584: the handshake owns
             # the IO; failing or dropping it drops the IO without poll_shutdown.
             self._conn.abort()
             raise

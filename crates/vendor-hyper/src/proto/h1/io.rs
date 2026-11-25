@@ -10,4 +10,9 @@ use bytes::Bytes;
 
 pub trait MemRead {
     fn read_mem(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>>;
+
+    /// Reads one byte, `None` on EOF.
+    fn read_byte(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<u8>>> {
+        self.read_mem(cx, 1).map_ok(|b| b.first().copied())
+    }
 }

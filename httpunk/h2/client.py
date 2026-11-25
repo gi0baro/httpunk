@@ -231,11 +231,11 @@ class Connection(H2ConnectionBase):
                 self._writers_evt.set()
 
 
-# DIVERGENCE: hyper client/conn/http2.rs:365 offers initial_max_send_streams, but
+# DIVERGENCE: hyper client/conn/http2.rs:370 offers initial_max_send_streams, but
 # connect() waits for peer SETTINGS (see Connection.connect), so an assumed initial
 # concurrency limit is never observable and is not offered.
 # DIVERGENCE: initial_window_size keeps its public API name; hyper's corresponding
-# option is initial_stream_window_size (client/conn/http2.rs:334).
+# option is initial_stream_window_size (client/conn/http2.rs:339).
 class H2Connection(BaseClientConnection):
     """An HTTP/2 client connection over a caller-supplied, already-connected
     `transport` (BYO transport, like hyper's `client::conn::http2::handshake(io)`;
@@ -269,7 +269,7 @@ class H2Connection(BaseClientConnection):
         max_concurrent_reset_streams: int | None = None,
         reset_stream_duration: float | None = None,
     ) -> None:
-        """Options mirror hyper client/conn/http2.rs:334-555 (defaults from
+        """Options mirror hyper client/conn/http2.rs:339-560 (defaults from
         proto/h2/client.rs:83-104). `initial_window_size` (2 MB) and
         `initial_connection_window_size` (5 MB) accept None for the hyper default;
         both must be at most 2**31 - 1. `header_table_size` and

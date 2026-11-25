@@ -242,7 +242,7 @@ class ServerConnection(H2ConnectionBase):
             # hyper `http2::Builder::max_send_buf_size` (proto/h2/server.rs DEFAULT_MAX_SEND_BUF_SIZE, 400 KB).
             max_send_buf_size=max_send_buf_size if max_send_buf_size is not None else _MAX_SEND_BUF_SIZE,
             max_concurrent_streams=max_concurrent_streams,
-            # hyper server/conn/http2.rs:270; proto/h2/server.rs:72: None = not advertised.
+            # hyper server/conn/http2.rs:275; proto/h2/server.rs:72: None = not advertised.
             header_table_size=header_table_size,
             # hyper `max_pending_accept_reset_streams`: None = h2's default (20).
             max_pending_accept_reset_streams=(
@@ -340,7 +340,7 @@ class ServerConnection(H2ConnectionBase):
         # RST_STREAM(NO_ERROR)ed, the nginx-compat rule, and its in-flight window
         # returned, `release_closed_capacity`; `handle` = the reader to notify). A stream
         # the peer reset while the handler was computing surfaces as the stop (hyper's
-        # first `poll_reset` window, proto/h2/server.rs L456).
+        # first `poll_reset` window, proto/h2/server.rs L458).
         v = self.send_response_head(st.id, status, self._headermap(headers), end_stream)
         stop = v.stopped
         if stop is not None:
@@ -354,7 +354,7 @@ class ServerConnection(H2ConnectionBase):
 
 
 # DIVERGENCE: initial_window_size keeps its public API name; hyper's corresponding
-# option is initial_stream_window_size (server/conn/http2.rs:157).
+# option is initial_stream_window_size (server/conn/http2.rs:162).
 class H2Server(BaseServer[ServerRequest]):
     """An HTTP/2 server connection over a caller-supplied, already-accepted
     `transport` (BYO transport, like hyper's `server::conn::http2`; accepting the
@@ -401,7 +401,7 @@ class H2Server(BaseServer[ServerRequest]):
         (1024; None = NO limit), `auto_date_header`, `max_send_buf_size` (400 KB: per-stream
         cap on response DATA queued for the connection's writer — the sender awaits room,
         as it awaits flow-control window); `header_table_size` (None = not advertised;
-        hyper server/conn/http2.rs:270); plus h2's own `data_frame_budget` (None = Auto)."""
+        hyper server/conn/http2.rs:275); plus h2's own `data_frame_budget` (None = Auto)."""
         self._conn = ServerConnection(
             transport,
             backend=backend,

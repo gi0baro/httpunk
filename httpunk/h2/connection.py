@@ -480,7 +480,7 @@ class H2ConnectionBase(H2Streams):
             # REGRESSION GUARD: `done` marks the final frame queued, not the generator close
             # below: a reset landing in between would otherwise fail a finished response
             # (hyper's `PipeToSendStream` is done in the poll that queues the final frame,
-            # proto/h2/mod.rs:183-184,241-242,252). The `finally` still sets it for the
+            # proto/h2/mod.rs:187-188,245-246,256). The `finally` still sets it for the
             # cancel and error paths; a finished pump is joined by the scope exit.
             done.set()
         except Exception as exc:

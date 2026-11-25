@@ -7,7 +7,7 @@ auto-`Date` header.
 import asyncio
 
 import pytest
-from _net import h1_client_against, h1_peer_against, listen, read_head
+from _net import h1_client_against, h1_peer_against, listen, read_head, read_to_eof
 from _transport import StubStream
 from tonio.colored import Event, scope, sleep
 
@@ -651,6 +651,44 @@ async def test_server_upgrade_tunnel():
 
 
 @pytest.mark.tonio
+async def test_upgrades_new():
+    # hyper tests/server.rs: upgrades_new (v1.13.0).
+    read_101 = Event()
+    done = Event()
+    upgraded = []
+
+    async def serve(transport):
+        try:
+            async with H1Server(transport) as server:
+                req = await server.accept()
+                await req.respond(101, headers={"upgrade": "foobar", "connection": "upgrade"})
+                # wait so that we don't write until other side saw 101 response
+                await read_101.wait()
+                io, read_buf = req.upgraded.downcast()
+                await io.send_all(b"foo=bar")
+                upgraded.append((read_buf, await read_to_eof(io)))
+        finally:
+            done.set()
+
+    async with h1_peer_against(serve) as transport:
+        await transport.send_all(
+            b"GET / HTTP/1.1\r\nUpgrade: foobar\r\nConnection: close, Upgrade\r\n\r\neagerly optimistic"
+        )
+        response = await read_head(transport)
+        assert response.startswith(b"HTTP/1.1 101 Switching Protocols\r\n")
+        assert b"content-length" not in response
+        assert b"\r\nconnection: upgrade\r\n" in response, response
+        assert b"close" not in response, response
+        read_101.set()
+
+        assert await _read_until(transport, b"foo=bar") == b"foo=bar"
+        await transport.send_all(b"bar=foo")
+        transport.close()  # upstream's client thread ends here, dropping its socket
+        await done.wait()
+    assert upgraded == [(b"eagerly optimistic", b"bar=foo")]
+
+
+@pytest.mark.tonio
 async def test_server_bodyless_response_does_not_drain_body():
     """A body handed to a bodyless response (HEAD / 204) is never polled — no bytes
     on the wire AND the iterable's side effects don't fire (hyper write_head's
@@ -958,7 +996,7 @@ async def test_server_push_send_reset_truncates_body_and_closes():
 
 @pytest.mark.tonio
 async def test_server_push_http10_without_content_length_is_close_delimited():
-    """HTTP/1.0 + unknown length = close-delimited (hyper role.rs L930-934): raw body
+    """HTTP/1.0 + unknown length = close-delimited (hyper role.rs L933-937): raw body
     bytes, no chunking, and the connection closes after the body."""
 
     async def serve(transport):
@@ -1308,7 +1346,7 @@ async def test_server_detach_refuses_while_watcher_parked_but_allows_upgrade_req
 async def test_h2_preface_closes_silently_without_response():
     """An h1 server that receives the HTTP/2 prior-knowledge preface closes silently
     (a version error) instead of writing a 400 — hyper `on_parse_error`/`has_h2_prefix`
-    (conn.rs L836-839)."""
+    (conn.rs L839-842)."""
     stub = _StubTransport(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
     conn = ServerConnection(stub)
     await conn.start()
@@ -1333,7 +1371,7 @@ async def test_body_io_after_close_raises_clean_error():
 @pytest.mark.tonio
 async def test_h1_request_trailers_round_trip():
     """Request trailers are hyper's: `Client::encode` allow-lists the fields the request's
-    own `Trailer` header declares (role.rs L1440-1453) and a chunked (streamed) body
+    own `Trailer` header declares (role.rs L1451-1464) and a chunked (streamed) body
     carries them after the data; the H1Server decodes them into `req.trailers`. A
     known-length `bytes` body is `Content-Length`-framed and drops them, silently."""
     seen = {}

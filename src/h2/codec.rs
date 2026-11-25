@@ -669,7 +669,7 @@ pub(super) fn build_request_headers(
 }
 
 /// Build a response HEADERS frame. `auto_date`: hyper's h2 server inserts `Date`
-/// when the app didn't set one (proto/h2/server.rs L483
+/// when the app didn't set one (proto/h2/server.rs L484
 /// `entry(DATE).or_insert_with(date::update_and_header_value)`).
 pub(super) fn build_response_headers(
     stream_id: u32,

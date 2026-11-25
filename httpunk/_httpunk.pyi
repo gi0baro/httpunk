@@ -349,7 +349,7 @@ class H1BodyDecoder:
         """`kind`: "empty" | "length" | "chunked" | "close"; `length` is the
         Content-Length when `kind == "length"`. Trailer limits are the connection's
         `max_headers` and `max_header_size` (hyper conn.rs:318-330); None defaults to
-        100 fields / 16 KB (decode.rs:180-181)."""
+        100 fields / 16 KB (decode.rs:185-186)."""
 
     def feed(self, data: bytes) -> None:
         """Append received body bytes."""
@@ -513,7 +513,7 @@ class H2Codec:
         end_stream: bool = ...,
         auto_date: bool = ...,
     ) -> bytes:
-        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L477-481)."""
+        """`auto_date`: insert `date` when absent (hyper proto/h2/server.rs L480-484)."""
 
     def feed_preface(self, data: bytes) -> bool | None:
         """Server side: feed bytes of the client connection preface. None = matches so
@@ -730,7 +730,7 @@ class H1ServerState:
     def keep_alive_enabled(self) -> bool: ...
     @property
     def peer_http10(self) -> bool:
-        """Last parsed request's version, retained between requests (conn.rs L301, L1132-1161)."""
+        """Last parsed request's version, retained between requests (conn.rs L301, L1135-1164)."""
 
     @property
     def shutdown_requested(self) -> bool: ...

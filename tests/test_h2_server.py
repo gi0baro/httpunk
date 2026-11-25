@@ -393,7 +393,7 @@ async def test_server_max_local_error_reset_streams_option():
 
 @pytest.mark.tonio
 async def test_server_response_date_header_option():
-    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L483),
+    """hyper's h2 server inserts `Date` when the app set none (proto/h2/server.rs L484),
     gated by `auto_date_header`; an app-supplied `Date` is kept."""
     listener, host, port = await listen()
 
@@ -564,7 +564,7 @@ async def test_server_respond_with_trailers():
 async def test_server_reset_received_after_end_stream_then_respond_fails_with_reason():
     """A RST_STREAM arriving after the request's END_STREAM (a GET the client cancels)
     is observable via `reset_received()` with the peer's reason, and a later `respond()`
-    fails with that same reason — hyper's first `poll_reset` window (proto/h2/server.rs L456)."""
+    fails with that same reason — hyper's first `poll_reset` window (proto/h2/server.rs L458)."""
     seen, done = [], Event()
 
     async def serve(transport):
@@ -587,7 +587,7 @@ async def test_server_reset_received_after_end_stream_then_respond_fails_with_re
 
 @pytest.mark.tonio
 async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_chunk():
-    """hyper's second `poll_reset` window (`PipeToSendStream::poll`, proto/h2/mod.rs L148):
+    """hyper's second `poll_reset` window (`PipeToSendStream::poll`, proto/h2/mod.rs L152):
     a reset arriving while the response body is parked on the app's NEXT chunk fails
     `respond()` at once with the peer's reason — the app is not left parked forever."""
     seen, done = [], Event()

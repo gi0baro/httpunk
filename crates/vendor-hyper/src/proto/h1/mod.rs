@@ -39,6 +39,10 @@ pub trait Http1Transaction {
 
     fn on_error(err: &crate::Error) -> Option<MessageHead<Self::Outgoing>>;
 
+    fn is_switching_protocols(_head: &MessageHead<Self::Outgoing>) -> bool {
+        false
+    }
+
     fn is_client() -> bool {
         !Self::is_server()
     }
@@ -110,7 +114,7 @@ impl Wants {
         Wants(self.0 | other.0)
     }
 
-    fn contains(&self, other: Wants) -> bool {
+    fn contains(self, other: Wants) -> bool {
         (self.0 & other.0) == other.0
     }
 }

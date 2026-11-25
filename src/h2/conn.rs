@@ -2212,7 +2212,7 @@ impl H2Streams {
     /// Server: send the response HEADERS (h2 server.rs `SendResponse::send_response`;
     /// state.rs `send_open`). A stream the peer reset (or the connection dropped)
     /// while the handler was computing is hyper's first `poll_reset` window
-    /// (proto/h2/server.rs L456): returns the stop instead (a bare stop for a stream
+    /// (proto/h2/server.rs L458): returns the stop instead (a bare stop for a stream
     /// closed with no reason to report here).
     #[pyo3(signature = (sid, status, headers, end_stream))]
     fn send_response_head(

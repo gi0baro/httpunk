@@ -3,8 +3,10 @@ typed exceptions (all subclasses of HTTPunkError — the protocol violations und
 H2Error, connection-closed under ConnectionClosedError), driven by a server that
 emits those frames."""
 
+import contextlib
+
 import pytest
-from _net import H2Peer, h2_client_against, listen, read_to_eof
+from _net import H2Peer, _client_against, h2_client_against, listen, open_h2, read_to_eof
 from tonio.colored import Event, scope, sleep
 
 from httpunk import (
@@ -15,6 +17,7 @@ from httpunk import (
     H2FlowControlError,
     H2ProtocolError,
     H2Reason,
+    H2UserError,
     HTTPunkError,
     StreamResetError,
 )
@@ -92,6 +95,50 @@ async def test_connection_closed_raises():
     async with h2_client_against(server) as conn:
         with pytest.raises(HTTPunkError):  # ConnectionClosedError (or a reset surfaced as such)
             await conn.request("GET", "/")
+
+
+@pytest.mark.tonio
+async def test_pending_open_fails_with_connection_error_on_close():
+    # hyper tests/client.rs: h2_pending_open_fails_with_connection_error_on_close (v1.13.0).
+    first_open, parked = Event(), Event()
+
+    class SlotWaitProbe:
+        # Stands in for the connection's slot event: `parked` fires once a request
+        # waits for a stream slot, where upstream's server sleeps 200 ms instead.
+        def __init__(self, event):
+            self.event = event
+
+        def set(self):
+            self.event.set()
+
+        def clear(self):
+            self.event.clear()
+
+        def wait(self):
+            parked.set()
+            return self.event.wait()
+
+    # `h2_client_against` sends no server SETTINGS: the limit must be in the initial
+    # ones, which `connect()` waits for, as upstream's server builder sends it.
+    async def serve(transport):
+        peer = await H2Peer.server(transport, max_concurrent_streams=1)
+        await peer.request()  # the first request: its stream is held open
+        first_open.set()
+        await parked.wait()
+        peer.close()
+
+    async def first(conn):
+        with contextlib.suppress(HTTPunkError):  # its outcome is ignored
+            await conn.request("GET", "/")
+
+    async with _client_against(open_h2, serve, {}) as conn, scope() as s:
+        conn._conn._slot_evt = SlotWaitProbe(conn._conn._slot_evt)
+        s.spawn(first(conn))
+        await first_open.wait()
+        with pytest.raises(ConnectionClosedError) as exc:
+            await conn.request("GET", "/")
+
+    assert not isinstance(exc.value, H2UserError)
 
 
 @pytest.mark.tonio
