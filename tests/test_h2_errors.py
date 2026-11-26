@@ -175,13 +175,17 @@ async def test_cancel_sends_rst_stream():
 @pytest.mark.tonio
 async def test_h2_pipe_task_cancelled_on_response_future_drop():
     # hyper tests/client.rs:3470 h2_pipe_task_cancelled_on_response_future_drop (v1.13.0).
+    got_rst = Event()
+
     async def serve(transport):
         peer = await H2Peer.server(transport, initial_window_size=0)
         assert await peer.recv(RstStream) is not None
+        got_rst.set()
 
     async with _client_against(open_h2, serve, {}) as conn:
         _, completed = await timeout(conn.request("POST", "/", body=b"x" * 50), _RESPONSE_WAIT)
-    assert not completed
+        assert not completed
+        await got_rst.wait()  # the connection stays open until the server saw the reset
 
 
 @pytest.mark.tonio

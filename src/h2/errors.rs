@@ -45,6 +45,12 @@ create_exception!(
     H2Error,
     "Flow-control window over/underflow. args = (reason: int,)."
 );
+create_exception!(
+    _httpunk,
+    H2KeepAliveTimeoutError,
+    H2Error,
+    "The keep-alive PING was not answered in time (hyper `KeepAliveTimedOut`)."
+);
 
 pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -53,6 +59,10 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("H2StreamError", py.get_type::<H2StreamError>())?;
     m.add("H2UserError", py.get_type::<H2UserError>())?;
     m.add("H2FlowControlError", py.get_type::<H2FlowControlError>())?;
+    m.add(
+        "H2KeepAliveTimeoutError",
+        py.get_type::<H2KeepAliveTimeoutError>(),
+    )?;
     Ok(())
 }
 

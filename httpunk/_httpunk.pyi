@@ -47,6 +47,9 @@ class H2UserError(H2Error):
 class H2FlowControlError(H2Error):
     """Flow-control window over/underflow. args = (reason: int,)."""
 
+class H2KeepAliveTimeoutError(H2Error):
+    """The keep-alive PING was not answered in time (hyper `KeepAliveTimedOut`)."""
+
 class ConnectionClosedError(HTTPunkError):
     """The transport failed (reset / IO error) with work still in flight — hyper's
     `Kind::Io`, h2's `Error::Io`: a transport failure, not a protocol violation (so
@@ -1011,11 +1014,16 @@ class H2Streams:
         header_table_size: int | None = ...,
         max_concurrent_reset_streams: int | None = ...,
         reset_stream_duration: float | None = ...,
+        keep_alive_interval: float | None = ...,
+        keep_alive_timeout: float = ...,
+        keep_alive_while_idle: bool = ...,
     ) -> None:
         """`role`: "client" | "server". Validates the RFC ranges at construction.
         `header_table_size`: None = not advertised; applied on SETTINGS ACK.
         Reset retention defaults to twice `max_concurrent_streams` streams (at least
-        50; 8192 if unset) / 5 seconds; duration is in seconds."""
+        50; 8192 if unset) / 5 seconds; duration is in seconds. `keep_alive_interval`
+        (seconds, None = off), `keep_alive_timeout` (seconds, 20) and
+        `keep_alive_while_idle` configure the client keep-alive."""
 
     @property
     def is_server(self) -> bool: ...
@@ -1025,9 +1033,10 @@ class H2Streams:
         """Queue the connection preface (client) + our initial SETTINGS + the initial
         WINDOW_UPDATE(0); the caller flushes, then starts the pumps."""
 
-    def store_task_handles(self, read: object, pump: object) -> None: ...
+    def store_task_handles(self, read: object, pump: object, keep_alive: object | None = None) -> None: ...
     def take_read_handle(self) -> object | None: ...
     def take_pump_handle(self) -> object | None: ...
+    def take_keep_alive_handle(self) -> object | None: ...
 
     # ----- inbound (each frame: one locked step) -----
     def receive(self, data: bytes) -> list[H2Frame]:
@@ -1118,6 +1127,14 @@ class H2Streams:
     def release_capacity(self, sid: int, n: int) -> int: ...
     def release_data_frame(self, sid: int, payload_len: int) -> None: ...
     def accepted(self, sid: int) -> None: ...
+
+    # ----- the keep-alive (client) -----
+    def keep_alive_poll(self) -> tuple[bool, float | None, int]:
+        """`(timed_out, wait, flags)`: one keep-alive step; `wait` = seconds to sleep
+        before asking again, None = stop (timed out, or the connection is over)."""
+
+    def ensure_not_timed_out(self) -> None:
+        """Raises `H2KeepAliveTimeoutError` once the keep-alive timed out."""
 
     # ----- the write pump -----
     def stop_pump(self) -> None: ...

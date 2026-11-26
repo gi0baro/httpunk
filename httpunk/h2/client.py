@@ -43,6 +43,7 @@ _MAX_HEADER_LIST_SIZE = 16 * 1024
 _MAX_SEND_BUF_SIZE = 1024 * 1024  # hyper proto/h2/client.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
 _LOCAL_ERROR_RESET_MAX = 1024  # hyper proto/h2/client.rs:98
 _REMOTE_RESET_MAX = 20  # h2 proto/mod.rs:34
+_KEEP_ALIVE_TIMEOUT = 20.0  # hyper proto/h2/client.rs:93
 
 
 class Connection(H2ConnectionBase):
@@ -67,6 +68,9 @@ class Connection(H2ConnectionBase):
         max_pending_accept_reset_streams=None,
         max_concurrent_reset_streams=None,
         reset_stream_duration=None,
+        keep_alive_interval=None,
+        keep_alive_timeout=_KEEP_ALIVE_TIMEOUT,
+        keep_alive_while_idle=False,
     ):
         # The Rust state takes the role + the hyper profile; the async members are
         # added in `__init__`. We advertise SETTINGS_ENABLE_PUSH=0 + our window/frame/
@@ -95,10 +99,13 @@ class Connection(H2ConnectionBase):
             max_send_buf_size=max_send_buf_size if max_send_buf_size is not None else _MAX_SEND_BUF_SIZE,
             data_frame_budget=data_frame_budget,
             enable_push=False,
+            keep_alive_interval=keep_alive_interval,
+            keep_alive_timeout=keep_alive_timeout,
+            keep_alive_while_idle=keep_alive_while_idle,
         )
 
-    def __init__(self, transport, *, authority=None, scheme="http", backend=None, **_options):
-        super().__init__(transport, backend=backend)
+    def __init__(self, transport, *, authority=None, scheme="http", backend=None, keep_alive_interval=None, **_options):
+        super().__init__(transport, backend=backend, keep_alive=keep_alive_interval is not None)
         # `authority`/`scheme` build the :authority/:scheme pseudo-headers for a
         # bare-path request (h2 takes :scheme from the request URI; `util.connect`
         # passes "https" for a TLS-dialed connection).
@@ -122,6 +129,12 @@ class Connection(H2ConnectionBase):
     def _on_conn_done(self):
         self._ready_evt.set()  # unblock connect() if the handshake never completed
         self._slot_evt.set()  # wake open/ready waiters (they re-check the stored condition)
+
+    def _on_keep_alive_timeout(self):
+        # hyper proto/h2/client.rs:245-248: the connection future completes and drops
+        # h2's connection, IO included: nothing is flushed, no GOAWAY
+        # (h2 proto/connection.rs:713-722).
+        self.abort()
 
     async def connect(self):
         # h2: client.rs `handshake` (L1256) — over the caller-supplied transport,
@@ -276,6 +289,9 @@ class H2Connection(BaseClientConnection):
         max_pending_accept_reset_streams: int | None = None,
         max_concurrent_reset_streams: int | None = None,
         reset_stream_duration: float | None = None,
+        keep_alive_interval: float | None = None,
+        keep_alive_timeout: float = _KEEP_ALIVE_TIMEOUT,
+        keep_alive_while_idle: bool = False,
     ) -> None:
         """Options mirror hyper client/conn/http2.rs:339-560 (defaults from
         proto/h2/client.rs:83-104). `initial_window_size` (2 MB) and
@@ -292,7 +308,14 @@ class H2Connection(BaseClientConnection):
         `reset_stream_duration` is a finite, nonnegative number of seconds.
         `max_send_buf_size` (1 MB) caps per-stream request DATA queued for the
         connection's writer; the body sender awaits room as it awaits flow-control
-        window. `data_frame_budget` is h2's own option (None = Auto)."""
+        window. `data_frame_budget` is h2's own option (None = Auto).
+        `keep_alive_interval` (seconds, None = off) sends a PING after that long
+        without reading a response head, a body chunk or a pong; the connection is
+        dropped when the PING is not answered within `keep_alive_timeout` (20 s), and
+        a request still waiting for its response head raises
+        `H2KeepAliveTimeoutError`. Unless `keep_alive_while_idle`, no PING is sent
+        while no request is in progress. Both are finite, nonnegative seconds, and at
+        least 1 s: a shorter value is raised to it."""
         self._conn = Connection(
             transport,
             authority=authority,
@@ -310,6 +333,9 @@ class H2Connection(BaseClientConnection):
             max_pending_accept_reset_streams=max_pending_accept_reset_streams,
             max_concurrent_reset_streams=max_concurrent_reset_streams,
             reset_stream_duration=reset_stream_duration,
+            keep_alive_interval=keep_alive_interval,
+            keep_alive_timeout=keep_alive_timeout,
+            keep_alive_while_idle=keep_alive_while_idle,
         )
 
     def ready(self) -> Awaitable[None]:
@@ -385,6 +411,12 @@ class H2Connection(BaseClientConnection):
         # subsequent stream/connection error surfaces when the body is read).
         # REGRESSION GUARD: do not re-add a post-head `if conn.error: raise` here.
         if stream.status is None:  # woken by a reset/failure, not a real response head
+            # hyper proto/h2/client.rs:669.
+            # DIVERGENCE: hyper checks the keep-alive once more where its dispatch task
+            # finds the connection gone (client.rs:711), which reaches the caller as the
+            # result of the connection future; httpunk's client has no such future, so
+            # that check has no counterpart (maintainer's decision).
+            self._conn.ensure_not_timed_out()
             stop = stream.stop
             if stop is not None:
                 raise self._conn._stopped_error(stream, stop)

@@ -65,7 +65,7 @@ class H2ConnectionBase(H2Streams):
     subclasses build the Rust base in `__new__` (its constructor takes the role and
     the hyper profile) and add their own async members in `__init__`."""
 
-    def __init__(self, transport, *, backend=None):
+    def __init__(self, transport, *, backend=None, keep_alive=False):
         # `transport` is a caller-supplied, already-connected byte stream (BYO
         # transport, like hyper's `client`/`server` conn). Immutable after init: the
         # pumps read it, `close()` closes it — never reassigned.
@@ -83,6 +83,8 @@ class H2ConnectionBase(H2Streams):
         # the pending buffer (`H2_FLAG_WAKE`); cleared by the pump BEFORE it takes the
         # buffer (a wake for bytes appended after the take survives the clear).
         self._write_evt = self.backend.event()
+        # Ends the keep-alive timer (`_keep_alive`); None without keep-alive.
+        self._keep_alive_evt = self.backend.timed_event() if keep_alive else None
 
     # ----- role hooks (async glue only) -----
 
@@ -100,6 +102,9 @@ class H2ConnectionBase(H2Streams):
 
     def _signal_ready(self):
         """Client: the peer's initial SETTINGS landed."""
+
+    def _on_keep_alive_timeout(self):
+        """Client: the keep-alive PING went unanswered."""
 
     # ----- verdict acts -----
 
@@ -217,7 +222,10 @@ class H2ConnectionBase(H2Streams):
         # in the state and are taken exactly once (a double `close()` cannot double-await).
         pump = self.backend.spawn_without_results(self._write_pump())
         read = self.backend.spawn_without_results(self._read_pump())
-        self.store_task_handles(read, pump)
+        keep_alive = None
+        if self._keep_alive_evt is not None:
+            keep_alive = self.backend.spawn_without_results(self._keep_alive())
+        self.store_task_handles(read, pump, keep_alive)
 
     async def _flush(self):
         """Write everything committed to the pending buffer, under the send lock (so
@@ -239,6 +247,8 @@ class H2ConnectionBase(H2Streams):
         self._fail(None)  # preserve a failure already recorded by the read pump
         self.stop_pump()
         self._write_evt.set()
+        if self._keep_alive_evt is not None:
+            self._keep_alive_evt.set()
 
     async def close(self):
         # Stop the write pump by SIGNAL, flush-then-exit, and JOIN — never cancel it
@@ -252,7 +262,12 @@ class H2ConnectionBase(H2Streams):
         # request-body writers: every stream is stopped by now, so each one wakes and
         # exits — hyper's connection task likewise ends only after the last
         # `PipeToSendStream` dropped its `conn_drop_ref`; the writers are never
-        # cancelled, here or there.
+        # cancelled, here or there. The keep-alive timer goes first, so it cannot drop
+        # the connection under the drain.
+        handle = self.take_keep_alive_handle()
+        if handle is not None:
+            self._keep_alive_evt.set()
+            await handle
         self.stop_pump()
         self._write_evt.set()
         handle = self.take_pump_handle()
@@ -267,6 +282,31 @@ class H2ConnectionBase(H2Streams):
         self._fail(None)  # no-op when the pump already failed everyone
         if not self.release_writers():
             await self._writers_evt.wait()
+
+    # ----- the keep-alive timer (hyper proto/h2/ping.rs `Ponger`) -----
+
+    async def _keep_alive(self):
+        """Each wake asks the state ONE question (`keep_alive_poll`), which does what
+        is due in that same step (schedule, PING, timeout) and answers how long to
+        sleep. Parks on `_keep_alive_evt` with that timeout; `close()` and `abort()`
+        set it. Never cancelled, joined by `close()`."""
+        # DIVERGENCE: hyper polls its ponger beside the connection, woken by its `Sleep`
+        # and by every connection event (proto/h2/client.rs:238-253); neither backend
+        # can poll a timer beside the pumps, so this one task per connection keeps the
+        # clock, and nothing else wakes it: the state answers with a sleep that never
+        # ends past the next instant hyper's `Sleep` could fire (runtime-forced).
+        stopped = self._keep_alive_evt
+        while True:
+            timed_out, wait, flags = self.keep_alive_poll()
+            if flags:
+                self._after(flags)
+            if timed_out:
+                self._on_keep_alive_timeout()
+            if wait is None:
+                return
+            await stopped.wait(wait)
+            if stopped.is_set():
+                return
 
     # ----- the write pump (h2 `poll_complete` draining its frame queue) -----
 

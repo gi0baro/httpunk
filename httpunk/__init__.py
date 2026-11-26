@@ -12,6 +12,7 @@ from .exceptions import (
     H1UserError as H1UserError,
     H2Error as H2Error,
     H2FlowControlError as H2FlowControlError,
+    H2KeepAliveTimeoutError as H2KeepAliveTimeoutError,
     H2ProtocolError as H2ProtocolError,
     H2Reason as H2Reason,
     H2StreamError as H2StreamError,

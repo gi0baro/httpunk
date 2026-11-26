@@ -5,6 +5,7 @@
 mod codec;
 mod conn;
 mod errors;
+mod ping;
 mod reason;
 mod settings;
 mod streams;

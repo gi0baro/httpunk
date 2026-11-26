@@ -11,8 +11,9 @@ import ssl
 import pytest
 import trustme
 
-from httpunk import H1Connection, H2Connection, HTTPunkError
+from httpunk import H1Connection, H2Connection, H2KeepAliveTimeoutError, HTTPunkError
 from httpunk._backend.asyncio import AsyncioBackend, _AsyncioStream
+from httpunk._httpunk import H2Codec
 from httpunk.h1.server import H1Server
 from httpunk.h2.connection import PREFACE
 from httpunk.h2.server import H2Server
@@ -693,3 +694,36 @@ async def test_h2_server_handshake_cancel_during_initial_flush_aborts_transport(
         assert server._conn.take_read_handle() is None
         await _assert_eof(peer)
         peer.close()
+
+
+_KEEP_ALIVE = 1.0  # seconds: the keep-alive interval and its timeout, the shortest httpunk keeps
+
+
+@pytest.mark.asyncio
+async def test_h2_keep_alive_timeout_drops_connection():
+    """The keep-alive timer on asyncio: it fires against a silent server, drops the
+    socket abortively from its own task, the pending request raises
+    `H2KeepAliveTimeoutError`, and the owner's `close()` still completes."""
+    async with asyncio.timeout(_HANG_GUARD):  # a regression hangs: fail it instead
+        backend = AsyncioBackend()
+        host, port, accept, listener = await _listen()
+
+        async def silent():
+            stream = await accept()
+            listener.close()
+            await stream.send_all(H2Codec("server").serialize_settings())
+            await _assert_eof(stream)
+            stream.close()
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(silent())
+            transport = await backend.connect_tcp(host, port)
+            async with H2Connection(
+                transport,
+                authority=f"{host}:{port}",
+                backend=backend,
+                keep_alive_interval=_KEEP_ALIVE,
+                keep_alive_timeout=_KEEP_ALIVE,
+            ) as conn:
+                with pytest.raises(H2KeepAliveTimeoutError):
+                    await conn.request("GET", "/")

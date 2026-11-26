@@ -39,9 +39,10 @@ use super::codec::{
     SettingsValues, WindowUpdate,
 };
 use super::errors::{
-    H2ProtocolError, H2StreamError, h2_reason, map_proto_err, map_reason, map_user_err,
-    protocol_err_with_debug,
+    H2KeepAliveTimeoutError, H2ProtocolError, H2StreamError, h2_reason, map_proto_err, map_reason,
+    map_user_err, protocol_err_with_debug,
 };
+use super::ping::{KeepAlive, MaybePing};
 use super::settings::{PeerSettings, Settings};
 use super::streams::{ContentLength, DataFrameCounts, parse_initiator};
 use crate::errors::ConnectionClosedError;
@@ -56,6 +57,8 @@ const MIN_DEFAULT_RESET_STREAM_MAX: usize = 50;
 const DEFAULT_RESET_STREAM_MAX: usize = 8192;
 /// h2 proto/mod.rs:46 `DEFAULT_RESET_STREAM_SECS`: how long they are kept.
 const RESET_STREAM_SECS: Duration = Duration::from_secs(5);
+/// hyper proto/h2/client.rs:93.
+const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: f64 = 20.0;
 /// h2 `StreamId::MAX` (u32::MAX >> 1): the phase-1 graceful GOAWAY last-id.
 const MAX_STREAM_ID: u32 = u32::MAX >> 1;
 const DEFAULT_INITIAL_WINDOW_SIZE: u32 = frame::DEFAULT_INITIAL_WINDOW_SIZE;
@@ -375,6 +378,7 @@ struct Inner {
     /// Bare task handles (`spawn_without_results`), taken exactly once by `close()`.
     read_handle: Option<Py<PyAny>>,
     pump_handle: Option<Py<PyAny>>,
+    keep_alive_handle: Option<Py<PyAny>>,
     /// Client: background request-body writers alive (hyper client.rs: each
     /// `PipeToSendStream` handed to the executor holds a `conn_drop_ref` clone, and
     /// the connection task ends only after the last one is dropped). `draining`:
@@ -437,6 +441,11 @@ struct Inner {
     goaway_replied: bool,
     error: Option<ConnError>,
     user_ping: UserPing,
+    /// `None` when `keep_alive_interval` is not set, and once it timed out (hyper
+    /// ping.rs:314).
+    keep_alive: Option<KeepAlive>,
+    /// hyper ping.rs:136 `Shared::is_keep_alive_timed_out`.
+    is_keep_alive_timed_out: bool,
     local_error_resets: usize,
     max_local_error_resets: Option<usize>,
     data_budget: DataFrameCounts,
@@ -480,6 +489,12 @@ fn protocol_err(reason: Reason, msg: &str) -> PyErr {
 /// h2 ping_pong.rs:289-291.
 fn broken_pipe() -> PyErr {
     map_proto_err(&ProtoError::from(io::ErrorKind::BrokenPipe))
+}
+
+/// A duration option in seconds (h2 and hyper take a `Duration`).
+fn duration_option(name: &str, seconds: f64) -> PyResult<Duration> {
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| PyValueError::new_err(format!("{name} must be finite and nonnegative")))
 }
 
 impl Inner {
@@ -543,6 +558,65 @@ impl Inner {
         }
         self.user_ping = UserPing::Empty;
         Ok(true)
+    }
+
+    // ----- the keep-alive (hyper proto/h2/ping.rs `Ponger`; see ping.rs) -----
+
+    /// hyper ping.rs:326-328 `Ponger::is_idle`.
+    ///
+    /// DIVERGENCE: hyper counts the live clones of its `Recorder`, which a request and
+    /// its response body hold until they are dropped. Python has no deterministic drop,
+    /// so a request is in progress while this state holds its stream: until it is
+    /// closed and its consumer took every received byte, or it is reset or aborted
+    /// (runtime-forced).
+    fn keep_alive_is_idle(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    /// hyper ping.rs:350-354 `Shared::update_last_read_at`.
+    fn update_last_read_at(&mut self) {
+        if let Some(ka) = &mut self.keep_alive {
+            ka.update_last_read_at(Instant::now());
+        }
+    }
+
+    /// hyper ping.rs:271-274, and 292-293 after a pong: `maybe_schedule` then
+    /// `maybe_ping`, again while `maybe_ping` asks to be polled again (ping.rs:469).
+    fn keep_alive_schedule(&mut self, now: Instant) {
+        let is_idle = self.keep_alive_is_idle();
+        loop {
+            let Some(ka) = &mut self.keep_alive else {
+                return;
+            };
+            ka.maybe_schedule(is_idle);
+            match ka.maybe_ping(now, is_idle) {
+                MaybePing::No => return,
+                MaybePing::Again => {}
+                MaybePing::Send => break,
+            }
+        }
+        // hyper ping.rs:334-344 `Shared::send_ping`.
+        if self.send_user_ping().is_ok()
+            && let Some(ka) = &mut self.keep_alive
+        {
+            ka.set_ping_sent();
+        }
+    }
+
+    /// hyper ping.rs:281-294: the pong of the keep-alive PING arrived, and the ponger
+    /// takes it.
+    fn keep_alive_ponged(&mut self) {
+        let Some(ka) = &mut self.keep_alive else {
+            return;
+        };
+        if !ka.is_ping_sent() {
+            return;
+        }
+        let now = Instant::now();
+        ka.ponged(now);
+        if matches!(self.poll_user_pong(), Ok(true)) {
+            self.keep_alive_schedule(now);
+        }
     }
 
     // ----- lookup classification (h2 streams.rs recv_headers / recv_data top) -----
@@ -1268,7 +1342,9 @@ impl H2Streams {
                         max_pending_accept_reset_streams=20, max_local_error_reset_streams=Some(1024),
                         data_frame_budget=None, auto_date_header=true, enable_push=None,
                         header_table_size=None, max_concurrent_reset_streams=None,
-                        reset_stream_duration=None))]
+                        reset_stream_duration=None, keep_alive_interval=None,
+                        keep_alive_timeout=DEFAULT_KEEP_ALIVE_TIMEOUT_SECS,
+                        keep_alive_while_idle=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         role: &str,
@@ -1286,6 +1362,9 @@ impl H2Streams {
         header_table_size: Option<u32>,
         max_concurrent_reset_streams: Option<usize>,
         reset_stream_duration: Option<f64>,
+        keep_alive_interval: Option<f64>,
+        keep_alive_timeout: f64,
+        keep_alive_while_idle: bool,
     ) -> PyResult<Self> {
         let role = match role {
             "client" => Role::Client,
@@ -1303,13 +1382,14 @@ impl H2Streams {
         }
         // h2 client.rs:1005 accepts a nonnegative Duration; Python durations are seconds.
         let reset_stream_duration = reset_stream_duration
-            .map(|seconds| {
-                Duration::try_from_secs_f64(seconds).map_err(|_| {
-                    PyValueError::new_err("reset_stream_duration must be finite and nonnegative")
-                })
-            })
+            .map(|seconds| duration_option("reset_stream_duration", seconds))
             .transpose()?
             .unwrap_or(RESET_STREAM_SECS);
+        let keep_alive_timeout = duration_option("keep_alive_timeout", keep_alive_timeout)?;
+        let keep_alive = keep_alive_interval
+            .map(|seconds| duration_option("keep_alive_interval", seconds))
+            .transpose()?
+            .map(|interval| KeepAlive::new(interval, keep_alive_timeout, keep_alive_while_idle));
         if initial_window_size > codec::MAX_WINDOW_SIZE
             || connection_window > codec::MAX_WINDOW_SIZE
         {
@@ -1367,6 +1447,7 @@ impl H2Streams {
                 inflight_credit: Vec::new(),
                 read_handle: None,
                 pump_handle: None,
+                keep_alive_handle: None,
                 writers: 0,
                 draining: false,
                 streams: HashMap::new(),
@@ -1399,6 +1480,8 @@ impl H2Streams {
                 goaway_replied: false,
                 error: None,
                 user_ping: UserPing::Empty,
+                keep_alive,
+                is_keep_alive_timed_out: false,
                 local_error_resets: 0,
                 max_local_error_resets: max_local_error_reset_streams,
                 // h2 counts.rs:106-115: initialize the budget, then resolve Auto
@@ -1439,6 +1522,9 @@ impl H2Streams {
             if let Some(h) = &me.pump_handle {
                 visit.call(h)?;
             }
+            if let Some(h) = &me.keep_alive_handle {
+                visit.call(h)?;
+            }
         }
         Ok(())
     }
@@ -1452,7 +1538,8 @@ impl H2Streams {
             let err = me.error.take();
             let rh = me.read_handle.take();
             let ph = me.pump_handle.take();
-            (streams, err, rh, ph)
+            let kh = me.keep_alive_handle.take();
+            (streams, err, rh, ph, kh)
         };
         drop(taken);
     }
@@ -1483,15 +1570,24 @@ impl H2Streams {
         if delta > 0 {
             me.reclaim_conn(delta);
         }
+        if let Some(ka) = &mut me.keep_alive {
+            ka.start(Instant::now());
+        }
         Ok(())
     }
 
-    /// Store the two bare task handles (`spawn_without_results`); taken exactly once
-    /// by `take_*` (`close()`), so a double `close()` cannot double-await them.
-    fn store_task_handles(&self, read: Py<PyAny>, pump: Py<PyAny>) {
+    /// Store the bare task handles (`spawn_without_results`); taken exactly once by
+    /// `take_*` (`close()`), so a double `close()` cannot double-await them.
+    /// `keep_alive`: the keep-alive timer, when `keep_alive_interval` is set.
+    #[pyo3(signature = (read, pump, keep_alive=None))]
+    fn store_task_handles(&self, read: Py<PyAny>, pump: Py<PyAny>, keep_alive: Option<Py<PyAny>>) {
         let old = {
             let mut me = self.lock();
-            (me.read_handle.replace(read), me.pump_handle.replace(pump))
+            (
+                me.read_handle.replace(read),
+                me.pump_handle.replace(pump),
+                std::mem::replace(&mut me.keep_alive_handle, keep_alive),
+            )
         };
         drop(old);
     }
@@ -1502,6 +1598,10 @@ impl H2Streams {
 
     fn take_pump_handle(&self) -> Option<Py<PyAny>> {
         self.lock().pump_handle.take()
+    }
+
+    fn take_keep_alive_handle(&self) -> Option<Py<PyAny>> {
+        self.lock().keep_alive_handle.take()
     }
 
     // ----- background request-body writers (hyper client.rs `conn_drop_ref`) -----
@@ -1688,6 +1788,7 @@ impl H2Streams {
             if frame.end_stream {
                 flags |= me.close_stream(sid); // recv_open already closed the recv half
             }
+            me.update_last_read_at(); // hyper proto/h2/client.rs:629
             return Ok(RecvHeadersVerdict {
                 kind: HEADERS_HEAD,
                 handle: Some(handle),
@@ -1984,8 +2085,9 @@ impl H2Streams {
         {
             if data == frame::Ping::USER && me.user_ping == UserPing::PendingPong {
                 me.user_ping = UserPing::ReceivedPong;
+                me.keep_alive_ponged();
             }
-            return Ok(0);
+            return Ok(me.wake_flag(before));
         }
         me.shutdown_final = true;
         me.max_stream_id = me.last_processed_id;
@@ -2232,6 +2334,14 @@ impl H2Streams {
         e.state.send_open(end_stream).map_err(map_user_err)?;
         me.streams.insert(sid, e);
         me.num_active += 1;
+        // hyper polls its ponger with the connection once the request is queued
+        // (ping.rs:271-274), and h2 writes a pending PING before stream frames
+        // (proto/connection.rs:226-232, 417): a PING that is due goes out ahead of the
+        // HEADERS, so the first request after a long idle period pings at once
+        // (ping.rs:462-480).
+        if me.keep_alive.is_some() {
+            me.keep_alive_schedule(Instant::now());
+        }
         let mut pending = std::mem::take(&mut me.pending);
         me.encoder.encode_headers(hframe, &mut pending);
         me.pending = pending;
@@ -2645,6 +2755,13 @@ impl H2Streams {
     fn release_capacity(&self, sid: u32, n: u32) -> u8 {
         let mut me = self.lock();
         let before = me.pending.len();
+        // hyper body/incoming.rs:190: a chunk handed to the consumer.
+        // DIVERGENCE: hyper stamps once more when the consumer reaches the end of the
+        // body (body/incoming.rs:213); nothing calls the state at that moment, so
+        // httpunk does not. A keep-alive PING can go out earlier than hyper's, by at
+        // most the time between the consumer taking the last chunk and reaching the
+        // end (maintainer's decision).
+        me.update_last_read_at();
         me.release_capacity_inner(sid, n, true);
         me.wake_flag(before)
     }
@@ -2673,6 +2790,43 @@ impl H2Streams {
         let mut me = self.lock();
         me.pending_accept.remove(&sid);
         me.remote_reset_pending.remove(&sid);
+    }
+
+    // ===== the keep-alive (client; hyper proto/h2/ping.rs) =====
+
+    /// The keep-alive timer's question: hyper ping.rs:266-324 `Ponger::poll`,
+    /// keep-alive parts, in one step. Returns `(timed_out, wait, flags)`: `timed_out`,
+    /// the PING went unanswered and the connection must be dropped; `wait`, the seconds
+    /// to sleep before asking again (`None`: timed out, or the connection is over).
+    fn keep_alive_poll(&self) -> (bool, Option<f64>, u8) {
+        let mut me = self.lock();
+        if me.error.is_some() {
+            return (false, None, 0);
+        }
+        let before = me.pending.len();
+        let now = Instant::now();
+        me.keep_alive_schedule(now);
+        let Some(ka) = &me.keep_alive else {
+            return (false, None, 0);
+        };
+        // The pong is taken where it arrives (`recv_ping`): a PING still marked sent is
+        // unanswered, hyper's `Poll::Pending` arm (ping.rs:311-318).
+        if ka.is_ping_sent() && ka.maybe_timeout(now).is_err() {
+            // ping.rs:314-316: the keep-alive is dropped with the flag set.
+            me.keep_alive = None;
+            me.is_keep_alive_timed_out = true;
+            return (true, None, me.wake_flag(before));
+        }
+        let wait = ka.next_poll(now).as_secs_f64();
+        (false, Some(wait), me.wake_flag(before))
+    }
+
+    /// hyper ping.rs:250-260 `Recorder::ensure_not_timed_out`.
+    fn ensure_not_timed_out(&self) -> PyResult<()> {
+        if self.lock().is_keep_alive_timed_out {
+            return Err(H2KeepAliveTimeoutError::new_err("keep-alive timed out"));
+        }
+        Ok(())
     }
 
     // ===== the write pump =====

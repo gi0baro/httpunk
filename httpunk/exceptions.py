@@ -9,20 +9,21 @@ crate's (`H2Error` sub-base); both families are defined in Rust, where the
 codecs / state machines raise them (`src/h1/errors.rs`, `src/h2/errors.rs`):
 
     HTTPunkError
-    ├── ConnectionClosedError       transport closed / IO error with work in flight (hyper `Io`, h2 `Io`; Rust)
-    ├── H1Error                     base for HTTP/1 errors (hyper `Error` kinds; Rust)
-    │   ├── H1ParseError            malformed message head (hyper `Parse`; `kind` = the variant)
-    │   ├── H1BodyError             malformed or truncated body (hyper `Body`; `io_kind` = the io cause)
+    ├── ConnectionClosedError         transport closed / IO error with work in flight (hyper `Io`, h2 `Io`; Rust)
+    ├── H1Error                       base for HTTP/1 errors (hyper `Error` kinds; Rust)
+    │   ├── H1ParseError              malformed message head (hyper `Parse`; `kind` = the variant)
+    │   ├── H1BodyError               malformed or truncated body (hyper `Body`; `io_kind` = the io cause)
     │   ├── H1IncompleteMessageError  EOF while a message was still expected (hyper `IncompleteMessage`)
     │   ├── H1UnexpectedMessageError  bytes on an idle client connection (hyper `UnexpectedMessage`)
-    │   └── H1UserError             local misuse hyper reports on the wire path (hyper `User`; `kind`)
-    └── H2Error                     base for HTTP/2 protocol errors (Rust)
-        ├── H2ProtocolError         connection-level protocol violation (-> GOAWAY; Rust)
-        ├── H2StreamError           stream-level protocol violation (-> RST_STREAM; Rust)
-        ├── H2UserError             local API misuse (from the Rust state machine)
-        ├── H2FlowControlError      flow-control window over/underflow (Rust)
-        ├── GoAwayError             peer sent GOAWAY
-        └── StreamResetError        peer sent RST_STREAM for a stream
+    │   └── H1UserError               local misuse hyper reports on the wire path (hyper `User`; `kind`)
+    └── H2Error                       base for HTTP/2 protocol errors (Rust)
+        ├── H2ProtocolError           connection-level protocol violation (-> GOAWAY; Rust)
+        ├── H2StreamError             stream-level protocol violation (-> RST_STREAM; Rust)
+        ├── H2UserError               local API misuse (from the Rust state machine)
+        ├── H2FlowControlError        flow-control window over/underflow (Rust)
+        ├── H2KeepAliveTimeoutError   keep-alive PING unanswered (hyper `KeepAliveTimedOut`; Rust)
+        ├── GoAwayError               peer sent GOAWAY
+        └── StreamResetError          peer sent RST_STREAM for a stream
 
 `error_code` attributes are `H2Reason` members for known codes (a Rust-defined enum
 whose members compare equal to, hash like, and convert to their int code), or a
@@ -63,6 +64,7 @@ from ._httpunk import (
     H1UserError as H1UserError,
     H2Error as H2Error,
     H2FlowControlError as H2FlowControlError,
+    H2KeepAliveTimeoutError as H2KeepAliveTimeoutError,
     H2ProtocolError as H2ProtocolError,
     H2Reason as H2Reason,
     H2StreamError as H2StreamError,
