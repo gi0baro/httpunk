@@ -1,4 +1,4 @@
-//! The client's HTTP/2 keep-alive: hyper proto/h2/ping.rs (1.13.0) `KeepAlive` and the
+//! The HTTP/2 keep-alive: hyper proto/h2/ping.rs (1.13.0) `KeepAlive` and the
 //! keep-alive half of its `Shared`, run synchronously inside the connection state
 //! (`conn.rs`). hyper's `Sleep` is the instant it fires (`sleep`): polling it is
 //! `now < sleep`, `timer.reset` is an assignment. The PING is h2's user PING, which

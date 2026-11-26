@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import BaseServer, read_all
 from .._httpunk import H2Streams
-from ..exceptions import ConnectionClosedError, H2Reason, _reason
+from ..exceptions import ConnectionClosedError, H2KeepAliveTimeoutError, H2Reason, _reason
 from ..http import HeaderMap
 from ..types import Version
 from .connection import H2ConnectionBase
@@ -53,6 +53,7 @@ _CONN_WINDOW = 1024 * 1024
 _MAX_FRAME_SIZE = 16 * 1024
 _MAX_HEADER_LIST_SIZE = 16 * 1024
 _MAX_SEND_BUF_SIZE = 400 * 1024  # hyper proto/h2/server.rs DEFAULT_MAX_SEND_BUF_SIZE (per-stream queued DATA cap)
+_KEEP_ALIVE_TIMEOUT = 20.0  # hyper proto/h2/server.rs:74
 
 
 class ServerRequest:
@@ -232,6 +233,8 @@ class ServerConnection(H2ConnectionBase):
         auto_date_header=True,
         max_send_buf_size=None,
         header_table_size=None,
+        keep_alive_interval=None,
+        keep_alive_timeout=_KEEP_ALIVE_TIMEOUT,
     ):
         # Our advertised windows / frame / header-list profile, defaulting to hyper's
         # (proto/h2/server.rs L36-40). `None` = hyper's default (its builders take
@@ -260,6 +263,10 @@ class ServerConnection(H2ConnectionBase):
             data_frame_budget=data_frame_budget,
             # hyper `http2::Builder::auto_date_header` (proto/h2/server.rs `date_header`, default true).
             auto_date_header=auto_date_header,
+            keep_alive_interval=keep_alive_interval,
+            keep_alive_timeout=keep_alive_timeout,
+            # hyper proto/h2/server.rs:167-169: the server always pings while idle.
+            keep_alive_while_idle=True,
         )
 
     def __init__(
@@ -273,9 +280,10 @@ class ServerConnection(H2ConnectionBase):
         max_frame_size=None,
         max_header_list_size=None,
         auto_date_header=True,
+        keep_alive_interval=None,
         **_options,
     ):
-        super().__init__(transport, backend=backend)
+        super().__init__(transport, backend=backend, keep_alive=keep_alive_interval is not None)
         # The resolved profile, for introspection (immutable; the state holds the copy it uses).
         self._max_concurrent_streams = max_concurrent_streams
         self._initial_window_size = initial_window_size if initial_window_size is not None else _STREAM_WINDOW
@@ -308,6 +316,23 @@ class ServerConnection(H2ConnectionBase):
         # A server-initiated graceful drain completed: signal "no more requests" so
         # `next_request` returns None and the caller's `async for` exits.
         self._incoming_send.send(None)
+
+    def _on_keep_alive_timeout(self):
+        # hyper proto/h2/server.rs:354-357 `abrupt_shutdown(NO_ERROR)` (h2
+        # proto/connection.rs:495-502): GOAWAY, and every stream failed.
+        # DIVERGENCE: h2 fails every stream with the GOAWAY's NO_ERROR (h2
+        # proto/connection.rs:500-501), so hyper marks them reset with NO_ERROR; httpunk
+        # stores `H2KeepAliveTimeoutError`, which a handler's body read, `respond` and
+        # `reset_received` raise, naming the cause (maintainer's decision).
+        # DIVERGENCE: hyper's serve future returns the keep-alive error
+        # (proto/h2/server.rs:326-328); the accept loop just ends, as for every other
+        # failure: `H2Server` does not report why a connection ended (maintainer's
+        # decision).
+        # DIVERGENCE: h2 reads nothing more once this GOAWAY is written, and hyper drops
+        # the IO (h2 proto/connection.rs:371-383); here the owner closes it, and until it
+        # does the read pump still handles what the client sends (maintainer's decision).
+        self._after(self.send_goaway(int(H2Reason.NO_ERROR)))
+        self._fail(H2KeepAliveTimeoutError("keep-alive timed out"))  # hyper proto/h2/ping.rs:510
 
     async def next_request(self):
         req = await self._incoming_recv.receive()
@@ -414,6 +439,8 @@ class H2Server(BaseServer[ServerRequest]):
         auto_date_header: bool = True,
         max_send_buf_size: int | None = None,
         header_table_size: int | None = None,
+        keep_alive_interval: float | None = None,
+        keep_alive_timeout: float = _KEEP_ALIVE_TIMEOUT,
     ) -> None:
         """Options mirror hyper `server::conn::http2::Builder` (defaults are hyper's; `None`
         = default unless noted): `max_concurrent_streams` (200), `initial_window_size`
@@ -423,7 +450,12 @@ class H2Server(BaseServer[ServerRequest]):
         (1024; None = NO limit), `auto_date_header`, `max_send_buf_size` (400 KB: per-stream
         cap on response DATA queued for the connection's writer — the sender awaits room,
         as it awaits flow-control window); `header_table_size` (None = not advertised;
-        hyper server/conn/http2.rs:275); plus h2's own `data_frame_budget` (None = Auto)."""
+        hyper server/conn/http2.rs:275); `keep_alive_interval` (seconds, None = off) sends
+        a PING after that long without reading a request, a body chunk or a pong, idle
+        or not; when the PING is not answered within `keep_alive_timeout` (20 s), a
+        GOAWAY is sent, every request in progress raises `H2KeepAliveTimeoutError` and
+        the accept loop ends. Both are finite, nonnegative seconds, and at least 1 s: a
+        shorter value is raised to it. Plus h2's own `data_frame_budget` (None = Auto)."""
         self._conn = ServerConnection(
             transport,
             backend=backend,
@@ -438,4 +470,6 @@ class H2Server(BaseServer[ServerRequest]):
             auto_date_header=auto_date_header,
             max_send_buf_size=max_send_buf_size,
             header_table_size=header_table_size,
+            keep_alive_interval=keep_alive_interval,
+            keep_alive_timeout=keep_alive_timeout,
         )

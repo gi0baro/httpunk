@@ -104,7 +104,7 @@ class H2ConnectionBase(H2Streams):
         """Client: the peer's initial SETTINGS landed."""
 
     def _on_keep_alive_timeout(self):
-        """Client: the keep-alive PING went unanswered."""
+        """The keep-alive PING went unanswered."""
 
     # ----- verdict acts -----
 

@@ -268,6 +268,16 @@ class Http2Builder:
         `max_send_buf_size`, default 400 KB); the sender awaits room like flow-control window."""
         return self._set("max_send_buf_size", max)
 
+    def keep_alive_interval(self, interval: float | None) -> Http2Builder:
+        """Seconds between keep-alive PINGs (hyper-util `Http2Builder::keep_alive_interval`;
+        `None` = off, the default)."""
+        return self._set("keep_alive_interval", interval)
+
+    def keep_alive_timeout(self, timeout: float) -> Http2Builder:
+        """Seconds to wait for a keep-alive PING's acknowledgement before closing
+        (hyper-util `Http2Builder::keep_alive_timeout`, default 20 s)."""
+        return self._set("keep_alive_timeout", timeout)
+
     def serve_connection(self, transport: Any, *, cancel: Any = None) -> Awaitable[H2Server | H1Server]:
         return self._inner.serve_connection(transport, cancel=cancel)
 

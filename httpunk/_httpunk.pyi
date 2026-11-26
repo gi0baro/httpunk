@@ -1023,7 +1023,7 @@ class H2Streams:
         Reset retention defaults to twice `max_concurrent_streams` streams (at least
         50; 8192 if unset) / 5 seconds; duration is in seconds. `keep_alive_interval`
         (seconds, None = off), `keep_alive_timeout` (seconds, 20) and
-        `keep_alive_while_idle` configure the client keep-alive."""
+        `keep_alive_while_idle` configure the keep-alive."""
 
     @property
     def is_server(self) -> bool: ...
@@ -1128,7 +1128,7 @@ class H2Streams:
     def release_data_frame(self, sid: int, payload_len: int) -> None: ...
     def accepted(self, sid: int) -> None: ...
 
-    # ----- the keep-alive (client) -----
+    # ----- the keep-alive -----
     def keep_alive_poll(self) -> tuple[bool, float | None, int]:
         """`(timed_out, wait, flags)`: one keep-alive step; `wait` = seconds to sleep
         before asking again, None = stop (timed out, or the connection is over)."""

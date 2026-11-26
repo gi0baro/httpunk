@@ -57,7 +57,7 @@ const MIN_DEFAULT_RESET_STREAM_MAX: usize = 50;
 const DEFAULT_RESET_STREAM_MAX: usize = 8192;
 /// h2 proto/mod.rs:46 `DEFAULT_RESET_STREAM_SECS`: how long they are kept.
 const RESET_STREAM_SECS: Duration = Duration::from_secs(5);
-/// hyper proto/h2/client.rs:93.
+/// hyper proto/h2/client.rs:93, proto/h2/server.rs:74.
 const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: f64 = 20.0;
 /// h2 `StreamId::MAX` (u32::MAX >> 1): the phase-1 graceful GOAWAY last-id.
 const MAX_STREAM_ID: u32 = u32::MAX >> 1;
@@ -439,10 +439,13 @@ struct Inner {
     goaway: Option<GoAwayInfo>,
     goaway_last_id: Option<u32>,
     goaway_replied: bool,
+    /// The last GOAWAY we queued, as (last stream id, reason): h2 go_away.rs:12-25
+    /// `going_away`.
+    going_away: Option<(u32, u32)>,
     error: Option<ConnError>,
     user_ping: UserPing,
-    /// `None` when `keep_alive_interval` is not set, and once it timed out (hyper
-    /// ping.rs:314).
+    /// `None` when `keep_alive_interval` is not set, once it timed out (hyper
+    /// ping.rs:314), and once we sent a closing GOAWAY (`send_goaway`).
     keep_alive: Option<KeepAlive>,
     /// hyper ping.rs:136 `Shared::is_keep_alive_timed_out`.
     is_keep_alive_timed_out: bool,
@@ -504,6 +507,20 @@ impl Inner {
             FLAG_WAKE
         } else {
             0
+        }
+    }
+
+    /// h2 go_away.rs:53-69 `GoAway::go_away`: queue a GOAWAY and remember it.
+    fn go_away(&mut self, last: u32, reason: u32, debug_data: &[u8]) {
+        codec::encode_go_away(&mut self.pending, last, reason, debug_data);
+        self.going_away = Some((last, reason));
+    }
+
+    /// h2 go_away.rs:71-81 `GoAway::go_away_now`: the GOAWAY that closes the connection,
+    /// never the same one twice.
+    fn go_away_now(&mut self, last: u32, reason: u32, debug_data: &[u8]) {
+        if self.going_away != Some((last, reason)) {
+            self.go_away(last, reason, debug_data);
         }
     }
 
@@ -762,12 +779,13 @@ impl Inner {
             return 0;
         }
         self.goaway_replied = true;
+        let before = self.pending.len();
         let last_id = self.goaway_last_stream_id();
-        codec::encode_go_away(&mut self.pending, last_id, u32::from(Reason::NO_ERROR), &[]);
+        self.go_away_now(last_id, u32::from(Reason::NO_ERROR), &[]);
         self.error = Some(ConnError::Closed(
             "connection closed: GOAWAY exchanged".to_string(),
         ));
-        FLAG_WAKE | FLAG_CONN_DONE
+        self.wake_flag(before) | FLAG_CONN_DONE
     }
 
     /// Release a normally-completed stream observed while still stored (the recv
@@ -1478,6 +1496,7 @@ impl H2Streams {
                 goaway: None,
                 goaway_last_id: None,
                 goaway_replied: false,
+                going_away: None,
                 error: None,
                 user_ping: UserPing::Empty,
                 keep_alive,
@@ -1746,6 +1765,8 @@ impl H2Streams {
                                 ..ignored(sid)
                             });
                         }
+                        // hyper proto/h2/server.rs:276: a request accepted.
+                        me.update_last_read_at();
                         // Queued, not yet pulled by the app (the Rapid-Reset cap).
                         me.pending_accept.insert(sid);
                         Ok(RecvHeadersVerdict {
@@ -2092,7 +2113,7 @@ impl H2Streams {
         me.shutdown_final = true;
         me.max_stream_id = me.last_processed_id;
         let last = me.last_processed_id;
-        codec::encode_go_away(&mut me.pending, last, u32::from(Reason::NO_ERROR), &[]);
+        me.go_away(last, u32::from(Reason::NO_ERROR), &[]);
         // h2 connection.rs:400-417: the next poll writes the pending GOAWAY, then
         // `poll_ready` the user PING the shutdown PING held back.
         me.send_pending_user_ping();
@@ -2166,7 +2187,10 @@ impl H2Streams {
         let mut me = self.lock();
         let before = me.pending.len();
         let last = me.goaway_last_stream_id();
-        codec::encode_go_away(&mut me.pending, last, reason, debug_data.unwrap_or(&[]));
+        me.go_away_now(last, reason, debug_data.unwrap_or(&[]));
+        // h2 proto/connection.rs:400-417: with a closing GOAWAY pending, the poll returns
+        // before the step that writes PINGs, so no keep-alive PING follows it.
+        me.keep_alive = None;
         me.wake_flag(before)
     }
 
@@ -2792,7 +2816,7 @@ impl H2Streams {
         me.remote_reset_pending.remove(&sid);
     }
 
-    // ===== the keep-alive (client; hyper proto/h2/ping.rs) =====
+    // ===== the keep-alive (hyper proto/h2/ping.rs) =====
 
     /// The keep-alive timer's question: hyper ping.rs:266-324 `Ponger::poll`,
     /// keep-alive parts, in one step. Returns `(timed_out, wait, flags)`: `timed_out`,
@@ -2889,19 +2913,17 @@ impl H2Streams {
     // ===== graceful shutdown (server; h2 Connection::graceful_shutdown) =====
 
     /// PHASE 1: GOAWAY(2^31-1, NO_ERROR) + the shutdown PING, keep serving. Idempotent.
+    /// Nothing once a GOAWAY was sent (h2 proto/connection.rs:688-692) or the connection
+    /// is over: h2 writes GOAWAY and PING frames only while it is open (:339-370,
+    /// :400-417).
     fn begin_graceful_shutdown(&self) -> PyResult<u8> {
         let mut me = self.lock();
-        if me.graceful {
+        if me.going_away.is_some() || me.error.is_some() {
             return Ok(0);
         }
         me.graceful = true;
         let before = me.pending.len();
-        codec::encode_go_away(
-            &mut me.pending,
-            MAX_STREAM_ID,
-            u32::from(Reason::NO_ERROR),
-            &[],
-        );
+        me.go_away(MAX_STREAM_ID, u32::from(Reason::NO_ERROR), &[]);
         codec::encode_ping(&mut me.pending, &frame::Ping::SHUTDOWN, false)?;
         Ok(me.wake_flag(before))
     }
