@@ -39,7 +39,7 @@ use super::codec::{
     SettingsValues, WindowUpdate,
 };
 use super::errors::{
-    H2ProtocolError, H2StreamError, map_proto_err, map_reason, map_user_err,
+    H2ProtocolError, H2StreamError, h2_reason, map_proto_err, map_reason, map_user_err,
     protocol_err_with_debug,
 };
 use super::settings::{PeerSettings, Settings};
@@ -103,6 +103,9 @@ pub struct Stopped {
     pub reason: Option<u32>,
     #[pyo3(get)]
     pub conn: bool,
+    /// The caller's body exception that reset the stream (`reset_on_body_error`).
+    #[pyo3(get)]
+    pub error: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -271,14 +274,17 @@ impl StreamEntry {
                 Ok(Some(reason)) => Stopped {
                     reason: Some(u32::from(reason)),
                     conn: false,
+                    error: None,
                 },
                 Ok(None) => Stopped {
                     reason: None,
                     conn: false,
+                    error: None,
                 },
                 Err(e) => Stopped {
                     reason: e.reason().map(u32::from),
                     conn: true,
+                    error: None,
                 },
             },
         }
@@ -302,14 +308,17 @@ fn stop_from_proto(e: &ProtoError) -> Stopped {
         ProtoError::Reset(_, reason, _) => Stopped {
             reason: Some(u32::from(*reason)),
             conn: false,
+            error: None,
         },
         ProtoError::GoAway(_, reason, _) => Stopped {
             reason: Some(u32::from(*reason)),
             conn: true,
+            error: None,
         },
         ProtoError::Io(..) => Stopped {
             reason: None,
             conn: true,
+            error: None,
         },
     }
 }
@@ -2254,6 +2263,7 @@ impl H2Streams {
                 Stopped {
                     reason: None,
                     conn: false,
+                    error: None,
                 },
             ));
         };
@@ -2392,6 +2402,7 @@ impl H2Streams {
                 Stopped {
                     reason: None,
                     conn: false,
+                    error: None,
                 },
             );
         };
@@ -2440,6 +2451,7 @@ impl H2Streams {
                 Stopped {
                     reason: None,
                     conn: false,
+                    error: None,
                 },
             ));
         };
@@ -2490,6 +2502,48 @@ impl H2Streams {
             stop: stop.map(|s| stop_py(py, s)),
             flags,
         })
+    }
+
+    /// The caller's body raised `exc`: reset the stream with the reason that error
+    /// carries (hyper proto/h2/mod.rs:254, 274-282 `on_user_err`) and hand `copy`, its
+    /// traceback-free copy (which has lost the cause chain the reason is read from), to
+    /// the stream's waiters in the stop. A stream already closed is left alone (h2
+    /// send.rs:231-238): the peer's reset, or the connection's failure, is what its
+    /// waiters see, and what failed the write that brought the caller here.
+    fn reset_on_body_error(
+        &self,
+        py: Python<'_>,
+        sid: u32,
+        exc: &Bound<'_, PyAny>,
+        copy: Py<PyAny>,
+    ) -> ResetVerdict {
+        let reason = h2_reason(exc); // reads Python attributes: before the lock
+        let mut me = self.lock();
+        if me.streams.get(&sid).is_none_or(|e| e.state.is_closed()) {
+            drop(me);
+            return ResetVerdict {
+                handle: None,
+                stop: None,
+                flags: 0,
+            };
+        }
+        let before = me.pending.len();
+        let (handle, stop, flags) = me.reset_stream(py, sid, reason, Initiator::User);
+        let flags = flags | me.wake_flag(before);
+        drop(me);
+        ResetVerdict {
+            handle,
+            stop: stop.map(|s| {
+                stop_py(
+                    py,
+                    Stopped {
+                        error: Some(copy),
+                        ..s
+                    },
+                )
+            }),
+            flags,
+        }
     }
 
     /// Reset a stream after a stream-level protocol violation by the peer, counting

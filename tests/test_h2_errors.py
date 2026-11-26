@@ -169,6 +169,22 @@ async def test_cancel_sends_rst_stream():
 
 
 @pytest.mark.tonio
+async def test_request_body_error_resets_stream():
+    # hyper proto/h2/mod.rs:254, 274-282: a body error resets the stream.
+    async def body():
+        yield b"first"
+        raise RuntimeError("body failed")
+
+    async def server(peer):
+        rst = await peer.recv(RstStream)
+        assert rst.error_code == H2Reason.INTERNAL_ERROR
+
+    async with h2_client_against(server) as conn:
+        with contextlib.suppress(RuntimeError):
+            await conn.request("POST", "/", body=body())
+
+
+@pytest.mark.tonio
 async def test_protocol_error_sends_goaway():
     """When the client detects a connection-level protocol/flow violation, it
     notifies the peer with GOAWAY and fails the connection."""

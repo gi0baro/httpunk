@@ -1044,6 +1044,26 @@ async def test_h2_auto_response_content_length(reply_headers, reply_body, conten
 
 
 @pytest.mark.tonio
+async def test_h2_body_user_error_sends_reset_reason():
+    # hyper tests/server.rs:3061 http2_body_user_error_sends_reset_reason (v1.13.0).
+    async def body():
+        raise StreamResetError(1, H2Reason.INADEQUATE_SECURITY)
+        yield b""
+
+    async def serve(transport):
+        async with H2Server(transport) as server:
+            async for req in server:
+                with contextlib.suppress(StreamResetError):
+                    await req.respond(200, body=body())
+
+    async with _client_against(open_h2, serve, {}) as conn:
+        with pytest.raises(StreamResetError) as exc:
+            resp = await conn.request("GET", "/")
+            await resp.read()
+    assert exc.value.error_code == H2Reason.INADEQUATE_SECURITY
+
+
+@pytest.mark.tonio
 async def test_h2_bodyless_request_with_trailers():
     """A request with trailers but NO body still ends on the trailing HEADERS frame
     (HEADERS + trailers, no DATA) rather than END_STREAM on the request HEADERS."""

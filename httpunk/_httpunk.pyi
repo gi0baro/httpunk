@@ -955,6 +955,9 @@ class H2Stopped:
     def reason(self) -> int | None: ...
     @property
     def conn(self) -> bool: ...
+    @property
+    def error(self) -> BaseException | None:
+        """The caller's body exception that reset the stream (`reset_on_body_error`)."""
 
 class H2RecvHeadersVerdict:
     kind: int
@@ -1103,6 +1106,11 @@ class H2Streams:
     def reset_stream(self, sid: int, reason: int, initiator: str = ...) -> H2ResetVerdict: ...
     def reset_on_error(self, sid: int, reason: int) -> H2ResetVerdict:
         """Library reset after a peer violation; counts toward the ENHANCE_YOUR_CALM cap."""
+
+    def reset_on_body_error(self, sid: int, exc: BaseException, copy: BaseException) -> H2ResetVerdict:
+        """The caller's body raised `exc`: reset with the reason it carries; the stop
+        holds `copy`, its traceback-free copy. A stream already closed is left alone
+        (no handle)."""
 
     def aclose_body(self, sid: int) -> H2ResetVerdict: ...
 

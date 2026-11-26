@@ -14,7 +14,6 @@ Cross-reference: `h2 ...` comments cite hyperium/h2 0.4.21.
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 
@@ -229,11 +228,12 @@ class Connection(H2ConnectionBase):
         return offset
 
     async def _write_body(self, stream, body, trailers, offset):
-        # The stream may error/reset mid-send: that is surfaced when the response body
-        # is read; a background writer has nowhere to propagate to.
+        # A background writer has nowhere to propagate to: a failure reaches the caller
+        # through the stream, as what stopped it.
         try:
-            with contextlib.suppress(Exception):
-                await self._send_body(stream, body, trailers, offset)
+            await self._send_body(stream, body, trailers, offset)
+        except Exception as exc:
+            self._body_failed(stream, exc)
         finally:
             if self.writer_end():
                 self._writers_evt.set()

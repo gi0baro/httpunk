@@ -4,6 +4,7 @@
 //! them. `args` carry the fields positionally (documented per class).
 
 use pyo3::create_exception;
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -104,7 +105,7 @@ fn with_debug_data(error: PyErr, data: &[u8]) -> PyErr {
     Python::attach(|py| {
         error
             .value(py)
-            .setattr("_debug_data", PyBytes::new(py, data))
+            .setattr(intern!(py, "_debug_data"), PyBytes::new(py, data))
             .expect("H2ProtocolError supports instance attributes");
     });
     error
@@ -136,6 +137,39 @@ pub(crate) fn map_proto_err(e: &Error) -> PyErr {
         Error::GoAway(data, r, _) => protocol_err_with_debug(*r, &e.to_string(), data.as_ref()),
         Error::Io(..) => ConnectionClosedError::new_err((e.to_string(),)),
     }
+}
+
+/// The RST_STREAM code for a stream whose body failed with `exc` — hyper error.rs:339-359
+/// (`find_source` + `h2_reason`): the reason of the first HTTP/2 error on the cause
+/// chain (Rust's `source()`, Python's `__cause__`), else INTERNAL_ERROR, also when that
+/// error carries none (h2 `Error::reason` is `None` for a user error).
+pub(crate) fn h2_reason(exc: &Bound<'_, PyAny>) -> u32 {
+    let mut cause = Some(exc.clone());
+    while let Some(e) = cause {
+        if e.is_instance_of::<H2Error>() {
+            return reason_of(&e).unwrap_or(u32::from(Reason::INTERNAL_ERROR));
+        }
+        cause = e
+            .getattr(intern!(e.py(), "__cause__"))
+            .ok()
+            .filter(|c| !c.is_none());
+    }
+    u32::from(Reason::INTERNAL_ERROR)
+}
+
+/// Where an HTTP/2 error keeps its reason: positionally in `args` for the classes
+/// defined here, as `error_code` for `GoAwayError` / `StreamResetError`
+/// (httpunk/exceptions.py).
+fn reason_of(e: &Bound<'_, PyAny>) -> Option<u32> {
+    let py = e.py();
+    let code = if e.is_instance_of::<H2StreamError>() {
+        e.getattr(intern!(py, "args")).ok()?.get_item(1).ok()?
+    } else if e.is_instance_of::<H2ProtocolError>() || e.is_instance_of::<H2FlowControlError>() {
+        e.getattr(intern!(py, "args")).ok()?.get_item(0).ok()?
+    } else {
+        e.getattr(intern!(py, "error_code")).ok()?
+    };
+    code.extract().ok()
 }
 
 pub(crate) fn map_reason(r: Reason) -> PyErr {

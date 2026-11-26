@@ -346,7 +346,11 @@ class ServerConnection(H2ConnectionBase):
             content_length = None
         await self._send_response_head(st, status, headers, end_stream=end_stream, content_length=content_length)
         if not end_stream:
-            await self._send_body(st, body, trailers)
+            try:
+                await self._send_body(st, body, trailers)
+            except Exception as exc:
+                self._body_failed(st, exc)
+                raise
 
     async def _send_response_head(self, st, status, headers, *, end_stream, content_length=None):
         # One locked step (h2 `SendResponse::send_response`, state.rs `send_open`):

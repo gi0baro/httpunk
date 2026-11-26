@@ -152,6 +152,12 @@ class H2ConnectionBase(H2Streams):
         builds a fresh instance (`fresh_exc`: store copies, raise copies)."""
         if stop.reason is None and not stop.conn and st.stop is not None:
             stop = st.stop  # the entry is gone; the pump published the reason on the handle
+        # DIVERGENCE: after a reset caused by the caller's body raising, hyper reports the
+        # reset's HTTP/2 error and only logs the body's (proto/h2/client.rs:508-510,
+        # mod.rs:274-282). httpunk raises the body's own exception, as on HTTP/1
+        # (maintainer's decision).
+        if stop.error is not None:
+            return fresh_exc(stop.error)
         if stop.reason is None and not stop.conn and self.conn_error() is None and self.is_closed():
             info = self.goaway_info()
             if info is not None:
@@ -550,6 +556,16 @@ class H2ConnectionBase(H2Streams):
         """Abort a stream: RST_STREAM + full teardown in one locked step (h2
         `send_reset`), then the waiter wakes."""
         v = self.reset_stream(st.id, int(reason), initiator)
+        if v.handle is not None:
+            self._notify_reset(v.handle, v.stop)
+        self._after(v.flags)
+
+    def _body_failed(self, st, exc):
+        """Sending the body ended with `exc`. If the caller's body raised it, the stream
+        is reset with the reason it carries (hyper proto/h2/mod.rs:254, 274-282
+        `on_user_err`); if a write did, the stream has already stopped and nothing is
+        sent. The state tells the two apart, in one locked step."""
+        v = self.reset_on_body_error(st.id, exc, fresh_exc(exc))
         if v.handle is not None:
             self._notify_reset(v.handle, v.stop)
         self._after(v.flags)
