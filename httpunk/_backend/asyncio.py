@@ -197,14 +197,13 @@ class _AsyncioStream(asyncio.Protocol):
 
     def abort(self):
         """The ABORTIVE end — hyper dropping the IO without `poll_shutdown` (an error
-        out of the connection, or its future dropped): no `close_notify`, no flush of
-        pending writes over TLS; plain TCP has nothing to skip, so it is a `close()`."""
+        out of the connection, or its future dropped): the bytes asyncio has not yet
+        handed to the kernel are dropped and, over TLS, no `close_notify` is sent.
+        `transport.close()` would wait for those bytes to drain, forever if the peer
+        stopped reading, and the parked reader would never be woken."""
         if self._transport is None:
             return
-        if self._transport.get_extra_info("ssl_object") is not None:
-            self._transport.abort()
-        else:
-            self._transport.close()
+        self._transport.abort()
 
     def readable_now(self):
         """Bytes (or EOF / an error) can be read NOW without suspending."""
@@ -375,9 +374,9 @@ class AsyncioBackend:
         tonio twin). `loop.start_tls` swaps the socket's protocol for asyncio's
         `SSLProtocol`, runs the handshake, and hands back the TLS transport this SAME
         `_AsyncioStream` is now fed from and writes to — so the returned stream IS
-        `stream`, re-pointed at it. `close`/`abort` already dispatch on the SSL object
-        being there, and TLS over TLS (an `https://` proxy) works: sslproto cascades
-        both ends through stacked transports.
+        `stream`, re-pointed at it, its `close`/`abort` now reaching the TLS transport.
+        TLS over TLS (an `https://` proxy) works: sslproto cascades both ends through
+        stacked transports.
 
         Handshake failure: sslproto force-closes the socket itself and the error
         (`ssl.SSLError`/`CertificateError`, or `ConnectionResetError` on an EOF mid-
@@ -473,7 +472,8 @@ class AsyncioBackend:
         """The ABORTIVE close (sync): hyper dropping the IO without `poll_shutdown` —
         an error out of the connection (a transport failure, the header-read deadline,
         a body that errored mid-write, the peer gone mid-message), or its future
-        dropped. Over TLS no `close_notify` is sent. See `shutdown_transport`."""
+        dropped. Unsent buffered bytes are dropped rather than waited for, and over TLS
+        no `close_notify` is sent (see `_AsyncioStream.abort`). See `shutdown_transport`."""
         transport.abort()
 
     async def shutdown_transport(self, transport):

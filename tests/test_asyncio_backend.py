@@ -145,7 +145,8 @@ async def test_close_is_orderly_and_abort_is_abortive():
     # hyper's two ends. `close()` = the `Connection` future completing -> `poll_shutdown`
     # on the IO: asyncio's `transport.close()` runs the TLS close_notify exchange (and is
     # a plain FIN over TCP). `abort()` = the IO dropped without `poll_shutdown`: over TLS
-    # `transport.abort()` (no close_notify); plain TCP has nothing to skip -> `close()`.
+    # and plain TCP alike `transport.abort()`: no close_notify, and unsent buffered bytes
+    # are dropped (`close()` would wait for them, forever if the peer stopped reading).
     tls = _AsyncioStream()
     tls.connection_made(_FakeCloseTransport(ssl=True))
     tls.close()
@@ -159,7 +160,7 @@ async def test_close_is_orderly_and_abort_is_abortive():
     plain = _AsyncioStream()
     plain.connection_made(_FakeCloseTransport(ssl=False))
     plain.abort()
-    assert plain._transport.closed and not plain._transport.aborted
+    assert plain._transport.aborted and not plain._transport.closed
 
 
 @pytest.mark.asyncio
