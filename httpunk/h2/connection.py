@@ -586,6 +586,10 @@ class H2ConnectionBase(H2Streams):
             if item is None:
                 return
             if type(item) is H2Stopped:
+                # DIVERGENCE: hyper body/incoming.rs:193-198, 216-222 ends the body
+                # without an error when the stream error's reason is NO_ERROR. httpunk
+                # raises: a body cut before its END_STREAM is reported, not handed over
+                # as complete (maintainer's decision).
                 raise self._stopped_error(st, item)
             chunk, budgeted = item
             if budgeted:
