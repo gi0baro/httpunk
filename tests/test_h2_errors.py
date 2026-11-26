@@ -796,19 +796,21 @@ def _reset(peer):
 @pytest.mark.tonio
 async def test_received_go_away_survives_read_error():
     # h2 0.4.21 tests/h2-tests/tests/go_away.rs:30 received_go_away_survives_read_error, the part with a surface in httpunk: `client.poll_ready`.
-    entered, reset = Event(), Event()
+    entered, processed, reset = Event(), Event(), Event()
 
     async def server(peer):
         await entered.wait()  # `connect()` has returned
         await peer.send_go_away(0, 0x40, b"backoff")
+        await processed.wait()  # upstream reads the GOAWAY before the error
         _reset(peer)
         reset.set()
 
     async with h2_client_against(server) as conn:
         entered.set()
-        await reset.wait()
-        while not conn.closed:  # the GOAWAY is processed (upstream: `conn.await`)
+        while not conn.closed:  # nothing else can close it yet: the GOAWAY is processed
             await sleep(0)
+        processed.set()
+        await reset.wait()
         with pytest.raises(GoAwayError) as exc:
             await conn.ready()
 
