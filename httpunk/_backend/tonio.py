@@ -99,6 +99,15 @@ class TonioBackend:
             raise
         return tls, tls._ssl.selected_alpn_protocol()
 
+    def get_socket(self, transport):
+        """The socket behind a `connect_tcp`, `connect_tls` or `wrap_tls` stream, or
+        `None` when there is none (never on tonio; an asyncio stream fed by a host loop
+        may have none). Only `setsockopt` and `getsockopt` are promised on it: its type
+        is the runtime's own socket and differs per backend."""
+        if isinstance(transport, _TLSStream):
+            return transport.transport.socket
+        return transport.socket
+
     def receive_nowait(self, transport, max_bytes=65536):
         """A synchronous, non-blocking read: whatever bytes are immediately available
         without suspending, `b""` at EOF, or `None` if nothing is ready right now. The

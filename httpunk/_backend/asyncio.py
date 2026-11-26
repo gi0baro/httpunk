@@ -412,6 +412,12 @@ class AsyncioBackend:
         selected = ssl_obj.selected_alpn_protocol() if ssl_obj is not None else None
         return stream, selected
 
+    def get_socket(self, transport):
+        """The socket behind `transport` (see the tonio twin): the asyncio transport's
+        `socket` extra, through the SSL layer too; `None` when that transport exposes
+        none (a host loop may not)."""
+        return transport._transport.get_extra_info("socket")
+
     def receive_nowait(self, transport, max_bytes=65536):  # bytes | b"" (EOF) | None (nothing ready)
         """Synchronous non-blocking peek of the userspace buffer (approach B)."""
         return transport.read_nowait(max_bytes)
