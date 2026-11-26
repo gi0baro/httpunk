@@ -19,6 +19,7 @@
 //! crates/vendor-h2), paths relative to its `src/`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyMemoryView};
 use pyo3::{PyTraverseError, PyVisit};
 
+use vendor_h2::codec::UserError;
 use vendor_h2::frame::{self, Reason, StreamId};
 use vendor_h2::proto::streams::{FlowControl, State};
 use vendor_h2::proto::{Error as ProtoError, Initiator, PollReset};
@@ -56,8 +58,6 @@ const DEFAULT_RESET_STREAM_MAX: usize = 8192;
 const RESET_STREAM_SECS: Duration = Duration::from_secs(5);
 /// h2 `StreamId::MAX` (u32::MAX >> 1): the phase-1 graceful GOAWAY last-id.
 const MAX_STREAM_ID: u32 = u32::MAX >> 1;
-/// Opaque payload of the graceful-shutdown PING (h2 `Ping::SHUTDOWN`).
-const SHUTDOWN_PING: [u8; 8] = *b"SHUTDOWN";
 const DEFAULT_INITIAL_WINDOW_SIZE: u32 = frame::DEFAULT_INITIAL_WINDOW_SIZE;
 /// DATA frames a stream sharing the connection may queue per flush (`Inner::burst_frames`).
 const DEFAULT_SEND_BURST_FRAMES: usize = 4;
@@ -321,6 +321,18 @@ enum ConnError {
     Closed(String),
 }
 
+/// h2 proto/ping_pong.rs:50-59 `USER_STATE_*`, without `USER_STATE_CLOSED`: h2 stores
+/// it when the connection is dropped (L282-287), whatever the state was; here the
+/// connection is over once `Inner::error` is set (`fail`, or the GOAWAY exchange
+/// completed), which is never cleared, so `error.is_some()` stands for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserPing {
+    Empty,
+    PendingPing,
+    PendingPong,
+    ReceivedPong,
+}
+
 struct GoAwayInfo {
     last_stream_id: u32,
     reason: u32,
@@ -415,6 +427,7 @@ struct Inner {
     goaway_last_id: Option<u32>,
     goaway_replied: bool,
     error: Option<ConnError>,
+    user_ping: UserPing,
     local_error_resets: usize,
     max_local_error_resets: Option<usize>,
     data_budget: DataFrameCounts,
@@ -455,6 +468,11 @@ fn protocol_err(reason: Reason, msg: &str) -> PyErr {
     H2ProtocolError::new_err((Some(u32::from(reason)), msg.to_string()))
 }
 
+/// h2 ping_pong.rs:289-291.
+fn broken_pipe() -> PyErr {
+    map_proto_err(&ProtoError::from(io::ErrorKind::BrokenPipe))
+}
+
 impl Inner {
     #[inline]
     fn wake_flag(&self, before: usize) -> u8 {
@@ -474,6 +492,48 @@ impl Inner {
 
     fn is_dead(&self) -> bool {
         self.error.is_some() || self.goaway.is_some()
+    }
+
+    // ----- the user PING (h2 proto/ping_pong.rs `UserPings`) -----
+
+    /// h2 ping_pong.rs:210-233 `UserPings::send_ping`, then the write `send_pending_ping`
+    /// does on the connection's next poll.
+    fn send_user_ping(&mut self) -> PyResult<()> {
+        if self.error.is_some() {
+            return Err(broken_pipe()); // L227
+        }
+        if self.user_ping != UserPing::Empty {
+            // L228-231, share.rs:563-566.
+            return Err(map_user_err(UserError::SendPingWhilePending));
+        }
+        self.user_ping = UserPing::PendingPing;
+        self.send_pending_user_ping();
+        Ok(())
+    }
+
+    /// h2 ping_pong.rs:170-195 `send_pending_ping`, user half: a requested user PING is
+    /// written only while no shutdown PING is pending. h2's `pending_ping` holds the
+    /// shutdown PING from `ping_shutdown` until its ack (L103-111), the span of
+    /// `graceful && !shutdown_final` here (the shutdown PING is written at once).
+    fn send_pending_user_ping(&mut self) {
+        if self.user_ping != UserPing::PendingPing || (self.graceful && !self.shutdown_final) {
+            return;
+        }
+        frame::Ping::new(frame::Ping::USER).encode(&mut self.pending);
+        self.user_ping = UserPing::PendingPong;
+    }
+
+    /// h2 ping_pong.rs:235-255 `UserPings::poll_pong`: `true` once the pong arrived,
+    /// consumed (back to empty); `false` while pending.
+    fn poll_user_pong(&mut self) -> PyResult<bool> {
+        if self.error.is_some() {
+            return Err(broken_pipe()); // L252
+        }
+        if self.user_ping != UserPing::ReceivedPong {
+            return Ok(false);
+        }
+        self.user_ping = UserPing::Empty;
+        Ok(true)
     }
 
     // ----- lookup classification (h2 streams.rs recv_headers / recv_data top) -----
@@ -1329,6 +1389,7 @@ impl H2Streams {
                 goaway_last_id: None,
                 goaway_replied: false,
                 error: None,
+                user_ping: UserPing::Empty,
                 local_error_resets: 0,
                 max_local_error_resets: max_local_error_reset_streams,
                 // h2 counts.rs:106-115: initialize the budget, then resolve Auto
@@ -1896,7 +1957,9 @@ impl H2Streams {
     /// graceful shutdown (h2 connection.rs L630-640): the shutdown PING's ack means
     /// the client has processed everything it sent before our GOAWAY(2^31-1), so the
     /// highest stream we accepted is the true last-processed id; send the final
-    /// GOAWAY with it, and end the accept loop if already drained.
+    /// GOAWAY with it, and end the accept loop if already drained. Otherwise the ack
+    /// of the user PING marks its pong received (h2 ping_pong.rs:118-123); any other
+    /// ack is ignored (L125-129).
     fn recv_ping(&self, py: Python<'_>, frame: &Ping) -> PyResult<u8> {
         let mut me = self.lock();
         let before = me.pending.len();
@@ -1905,13 +1968,23 @@ impl H2Streams {
             codec::encode_ping(&mut me.pending, data, true)?;
             return Ok(me.wake_flag(before));
         }
-        if me.role != Role::Server || data != SHUTDOWN_PING || !me.graceful || me.shutdown_final {
+        if me.role != Role::Server
+            || data != frame::Ping::SHUTDOWN
+            || !me.graceful
+            || me.shutdown_final
+        {
+            if data == frame::Ping::USER && me.user_ping == UserPing::PendingPong {
+                me.user_ping = UserPing::ReceivedPong;
+            }
             return Ok(0);
         }
         me.shutdown_final = true;
         me.max_stream_id = me.last_processed_id;
         let last = me.last_processed_id;
         codec::encode_go_away(&mut me.pending, last, u32::from(Reason::NO_ERROR), &[]);
+        // h2 connection.rs:400-417: the next poll writes the pending GOAWAY, then
+        // `poll_ready` the user PING the shutdown PING held back.
+        me.send_pending_user_ping();
         let mut flags = me.wake_flag(before);
         if me.num_active == 0 {
             flags |= FLAG_STOP_ACCEPTING;
@@ -2621,7 +2694,7 @@ impl H2Streams {
             u32::from(Reason::NO_ERROR),
             &[],
         );
-        codec::encode_ping(&mut me.pending, &SHUTDOWN_PING, false)?;
+        codec::encode_ping(&mut me.pending, &frame::Ping::SHUTDOWN, false)?;
         Ok(me.wake_flag(before))
     }
 
