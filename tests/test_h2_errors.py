@@ -10,6 +10,7 @@ import struct
 import pytest
 from _net import H2Peer, _client_against, h2_client_against, listen, open_h2, read_to_eof
 from tonio.colored import Event, scope, sleep
+from tonio.colored.time import timeout
 
 from httpunk import (
     ConnectionClosedError,
@@ -34,6 +35,9 @@ from httpunk._httpunk import (
     H2FrameSettings as Settings,
 )
 from httpunk.http import HeaderMap
+
+
+_RESPONSE_WAIT = 0.005  # seconds a caller waits for a response before giving up (hyper's test: 5 ms)
 
 
 @pytest.mark.tonio
@@ -166,6 +170,18 @@ async def test_cancel_sends_rst_stream():
     assert resp.status == 200
     assert first == b"partial-body"
     assert seen_rst and seen_rst[0][1] == H2Reason.CANCEL
+
+
+@pytest.mark.tonio
+async def test_h2_pipe_task_cancelled_on_response_future_drop():
+    # hyper tests/client.rs:3470 h2_pipe_task_cancelled_on_response_future_drop (v1.13.0).
+    async def serve(transport):
+        peer = await H2Peer.server(transport, initial_window_size=0)
+        assert await peer.recv(RstStream) is not None
+
+    async with _client_against(open_h2, serve, {}) as conn:
+        _, completed = await timeout(conn.request("POST", "/", body=b"x" * 50), _RESPONSE_WAIT)
+    assert not completed
 
 
 @pytest.mark.tonio

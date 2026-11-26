@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import BaseClientConnection
 from .._httpunk import H2Codec, H2Streams
-from ..exceptions import ConnectionClosedError, fresh_exc
+from ..exceptions import ConnectionClosedError, H2Reason, fresh_exc
 from ..types import Response, Version
 from .connection import H2ConnectionBase
 from .share import H2ResponseBody
@@ -371,7 +371,14 @@ class H2Connection(BaseClientConnection):
         if not end_stream:
             self._conn._send_body_background(stream, body, request.trailers)
 
-        await stream.headers_evt.wait()
+        try:
+            await stream.headers_evt.wait()
+        except BaseException:
+            # The caller gave up on the response (a cancellation): reset the stream, as
+            # hyper does when the response future is dropped (client/dispatch.rs:360-374,
+            # proto/h2/client.rs:486-497).
+            self._conn._reset(stream, H2Reason.CANCEL)
+            raise
         # h2's `ResponseFuture` resolves the moment the head arrives. Gate on whether the
         # head arrived (`stream.status`), NOT on the connection error: a fully-received
         # response must still be returned when the connection closes right after (a
