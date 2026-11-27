@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 
-from .._common import BaseClientConnection
+from .._common import BaseClientConnection, connection_closed_error, request_not_sent_error
 from .._httpunk import H2Codec, H2Streams
 from ..exceptions import ConnectionClosedError, H2Reason, fresh_exc
 from ..types import Response, Version
@@ -157,9 +157,9 @@ class Connection(H2ConnectionBase):
         / failure that arrives while parked fails this request PROMPTLY. The
         waiter idiom: try, clear, try again, wait."""
         while not self.try_claim_slot():
-            self._raise_if_dead()
+            self._raise_if_dead(request_not_sent_error)
             self._slot_evt.clear()
-            self._raise_if_dead()
+            self._raise_if_dead(request_not_sent_error)
             if self.try_claim_slot():
                 return
             await self._slot_evt.wait()
@@ -170,7 +170,7 @@ class Connection(H2ConnectionBase):
         strictly increasing on the wire). h2 streams.rs `send_request` (L265). The head's
         connection-specific fields are stripped there, then `content_length` (the body's
         exact size, or None) declared (hyper proto/h2/client.rs:757-762)."""
-        self._raise_if_dead()
+        self._raise_if_dead(request_not_sent_error)
         await self._acquire_slot()
         st = Stream(self.backend)
         try:
@@ -190,8 +190,8 @@ class Connection(H2ConnectionBase):
             raise
         if sid is None:  # the connection failed / GOAWAY'd meanwhile (the slot was released)
             self._slot_evt.set()
-            self._raise_if_dead()
-            raise ConnectionClosedError("connection closed")
+            self._raise_if_dead(request_not_sent_error)
+            raise request_not_sent_error()
         st.id = sid
         self._write_evt.set()
         return st
@@ -201,11 +201,11 @@ class Connection(H2ConnectionBase):
         no GOAWAY) and a slot is free (h2 `SendRequest::ready`). Non-reserving, like
         h2's `poll_ready`: `send_request` re-applies the backpressure."""
         while True:
-            self._raise_if_dead()
+            self._raise_if_dead(connection_closed_error)
             if self.can_open():
                 return
             self._slot_evt.clear()
-            self._raise_if_dead()
+            self._raise_if_dead(connection_closed_error)
             if self.can_open():
                 return
             await self._slot_evt.wait()
@@ -341,7 +341,8 @@ class H2Connection(BaseClientConnection):
     def ready(self) -> Awaitable[None]:
         """Wait until the connection can accept a new request — it's alive (not
         failed, no GOAWAY received) and a MAX_CONCURRENT_STREAMS slot is free —
-        then return. Raises if the connection has failed or the peer sent GOAWAY.
+        then return. Raises `GoAwayError` if the peer sent GOAWAY, else
+        `ConnectionClosedError` (from its error) if the connection has failed or closed.
         Mirrors h2's `SendRequest::ready` (client.rs L406). Best-effort /
         non-reserving: `send_request` re-applies the same backpressure."""
         return self._conn._wait_until_ready()
@@ -364,7 +365,9 @@ class H2Connection(BaseClientConnection):
         """Send `request` and return its `Response` once the head arrives.
 
         h2: client.rs `SendRequest::send_request` (L517). Open the stream + send
-        HEADERS, stream the body, then await the response head.
+        HEADERS, stream the body, then await the response head. On a dead connection
+        raises `GoAwayError` if the peer sent GOAWAY, else `RequestNotSentError` (from
+        its error): nothing reached the wire.
         """
         # The body's exact size, None for a streamed one (hyper `size_hint().exact()`:
         # `Empty` is 0, `Full` its length, trailers or not).

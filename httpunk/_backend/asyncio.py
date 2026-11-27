@@ -544,15 +544,6 @@ class AsyncioBackend:
         q = asyncio.Queue()
         return _QueueSender(q), _QueueReceiver(q)
 
-    # Abrupt-peer-teardown exceptions (see the tonio backend's twin attribute):
-    # an RST surfaces as `ConnectionError` from `connection_lost`; a TLS close
-    # without close_notify as `ssl.SSLEOFError` (asyncio's SSL layer raises it
-    # on an unexpected EOF).
-    # DIVERGENCE: the h1 server maps these at the request-head boundary to a clean
-    # end-of-iteration, even mid-head; hyper raises IncompleteMessage on mid-head EOF.
-    # This preserves httpunk's public clean-close iteration contract.
-    broken_transport_errors = (ConnectionError, _ssl.SSLEOFError)
-
     # asyncio's Lock/Event/Semaphore already match the seam's neutral contract
     # (Event: set/wait/clear/is_set; Semaphore: async acquire / sync release — the
     # shape step 1 normalized the h1 slot to).

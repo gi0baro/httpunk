@@ -17,6 +17,7 @@ from httpunk import (
     H1UserError,
     HeaderMap,
     HTTPunkError,
+    RequestNotSentError,
     Version,
 )
 from httpunk._backend.asyncio import AsyncioBackend
@@ -189,9 +190,9 @@ class _ParkedClientStub:
 async def test_idle_close_before_the_request_is_written_is_unsent():
     """hyper's turn: before the request is written the task waits for writable OR
     readable. A server that closes (or speaks) in that window is judged by the idle
-    rules — nothing was written, so the failure carries `request_unsent` and any body
+    rules — nothing was written, so the failure is `RequestNotSentError` and any body
     is safe to retry (`TrySendError { message: Some }`), where a write already on the
-    wire would have made it an `IncompleteMessage` without the marker."""
+    wire would have made it an `IncompleteMessage`."""
     stub = _ParkedClientStub()
     conn = Connection(stub, backend=Backend.tonio)
     await conn.connect()  # arms the idle watcher: its read is parked on `stub.release`
@@ -209,7 +210,7 @@ async def test_idle_close_before_the_request_is_written_is_unsent():
         assert not stub.sent and conn.busy
         stub.release.set()  # the server closed idle: the watcher's read completes with EOF
     (exc,) = outcome
-    assert exc.request_unsent is True
+    assert isinstance(exc, RequestNotSentError)
     assert not stub.sent  # nothing reached the wire
     assert conn.closed and stub.closed  # hyper: EOF on idle -> close, no error recorded
     assert conn.error is None
@@ -530,8 +531,9 @@ async def test_unexpected_bytes_past_body_poison_connection():
     async with h1_client_against(serve) as conn:
         r1 = await conn.request("GET", "/a", headers={"host": conn._conn.authority})
         assert await r1.read() == b"hi"  # the response is intact
-        with pytest.raises(H1UnexpectedMessageError):
+        with pytest.raises(RequestNotSentError) as excinfo:
             await conn.request("GET", "/b", headers={"host": conn._conn.authority})  # connection poisoned
+        assert isinstance(excinfo.value.__cause__, H1UnexpectedMessageError)
 
 
 @pytest.mark.tonio
@@ -570,8 +572,14 @@ async def test_reused_connection_poisoned_by_idle_window_bytes():
             if readable:
                 break
             await sleep(0)
-        with pytest.raises(H1UnexpectedMessageError):
+        # Two verdicts are correct, depending on which side of the exchange start the
+        # watcher's poison lands: before it, the request is provably unsent and the
+        # poison is the cause; after it, the request may be on the wire, so the poison
+        # surfaces as itself.
+        with pytest.raises((RequestNotSentError, H1UnexpectedMessageError)) as excinfo:
             await conn.request("GET", "/b", headers={"host": conn._conn.authority})
+        if isinstance(excinfo.value, RequestNotSentError):
+            assert isinstance(excinfo.value.__cause__, H1UnexpectedMessageError)
 
 
 @pytest.mark.tonio
@@ -580,8 +588,8 @@ async def test_idle_fin_closes_connection_promptly():
     with NO send: `closed` flips promptly, no error is recorded (hyper's clean idle
     close — "found EOF on idle connection, closing", conn.rs L472-484), the transport
     is really closed (no CLOSE_WAIT parking — the task drops its io, dispatch.rs
-    L171-179), and the next send_request raises `ConnectionClosedError` carrying
-    `request_unsent` (hyper's TrySendError give-back, client/conn/http1.rs L261-281)."""
+    L171-179), and the next send_request raises `RequestNotSentError` (hyper's
+    TrySendError give-back, client/conn/http1.rs L261-281)."""
     r1_read = Event()
 
     async def serve(stream):
@@ -600,9 +608,8 @@ async def test_idle_fin_closes_connection_promptly():
         assert conn.closed
         assert conn._conn.error is None  # clean close, not an error
         assert conn._conn.transport_ref() is None  # socket closed NOW, not at next use
-        with pytest.raises(HTTPunkError) as excinfo:
+        with pytest.raises(RequestNotSentError):
             await conn.request("GET", "/b", headers={"host": conn._conn.authority})
-        assert getattr(excinfo.value, "request_unsent", False) is True
 
 
 @pytest.mark.tonio
@@ -610,8 +617,8 @@ async def test_idle_stray_bytes_poison_promptly():
     """Bytes arriving on a PARKED connection are consumed by the idle watcher when
     they ARRIVE (no send needed): the connection is poisoned AND closed immediately
     (hyper `new_unexpected_message`, conn.rs L486-490 — the errored task drops its
-    io), and the next send_request raises the recorded error with `request_unsent`
-    set (a queued-never-taken request is handed back, proto/h1/dispatch.rs L742-758)."""
+    io), and the next send_request raises `RequestNotSentError` from the recorded error
+    (a queued-never-taken request is handed back, proto/h1/dispatch.rs L742-758)."""
     r1_read = Event()
 
     async def serve(stream):
@@ -630,9 +637,9 @@ async def test_idle_stray_bytes_poison_promptly():
             await sleep(0.005)
         assert conn.closed
         assert isinstance(conn._conn.error, H1UnexpectedMessageError)
-        with pytest.raises(H1UnexpectedMessageError) as excinfo:
+        with pytest.raises(RequestNotSentError) as excinfo:
             await conn.request("GET", "/b", headers={"host": conn._conn.authority})
-        assert getattr(excinfo.value, "request_unsent", False) is True
+        assert isinstance(excinfo.value.__cause__, H1UnexpectedMessageError)
 
 
 @pytest.mark.tonio

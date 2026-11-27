@@ -20,7 +20,7 @@ from httpunk._httpunk import (
     H2FrameSettings as Settings,
     H2FrameWindowUpdate as WindowUpdate,
 )
-from httpunk.exceptions import ConnectionClosedError, H2UserError, StreamResetError
+from httpunk.exceptions import BodyWriteError, H2BodyError, H2UserError, StreamResetError, TransportError
 from httpunk.h2 import H2Server
 from httpunk.http import HeaderMap
 
@@ -561,9 +561,9 @@ async def test_server_push_send_reset_cancels_stream():
         s.spawn(serve())
         async with open_h2(host, port) as conn:
             resp = await conn.request("GET", "/abort")
-            with pytest.raises(StreamResetError) as exc:
+            with pytest.raises(H2BodyError) as exc:
                 await resp.read()
-            assert exc.value.error_code == H2Reason.CANCEL
+            assert exc.value.__cause__.error_code == H2Reason.CANCEL
             resp = await conn.request("GET", "/fine")  # same connection still serves
             assert await resp.read() == b"ok"
         s.cancel()
@@ -657,8 +657,8 @@ async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_ch
 
                     try:
                         await req.respond(200, body=body())
-                    except StreamResetError as exc:
-                        seen.append(exc.error_code)
+                    except BodyWriteError as exc:
+                        seen.append(exc.__cause__.error_code)
                     done.set()
 
     async with h2_peer_against(serve) as peer:
@@ -676,7 +676,8 @@ async def test_server_respond_fails_fast_when_peer_resets_while_awaiting_body_ch
 @pytest.mark.tonio
 async def test_server_send_stream_reports_peer_reset_reason():
     """Through the push handle a post-END_STREAM reset surfaces on the next `send_data`
-    as `StreamResetError` carrying the peer's reason (h2 `ensure_reason`)."""
+    as `BodyWriteError` from the `StreamResetError` carrying the peer's reason (h2
+    `ensure_reason`)."""
     seen, done = [], Event()
 
     async def serve(transport):
@@ -688,8 +689,8 @@ async def test_server_send_stream_reports_peer_reset_reason():
                         while True:
                             await stream.send_data(b"tick")
                             await sleep(0.005)
-                    except StreamResetError as exc:
-                        seen.append(exc.error_code)
+                    except BodyWriteError as exc:
+                        seen.append(exc.__cause__.error_code)
                     done.set()
 
     async with h2_peer_against(serve) as peer:
@@ -712,7 +713,7 @@ async def test_server_reset_received_raises_on_connection_loss():
                 async for req in server:
                     try:
                         seen.append(await req.reset_received())
-                    except ConnectionClosedError as exc:
+                    except TransportError as exc:
                         seen.append(type(exc))
                     done.set()
 
@@ -721,7 +722,7 @@ async def test_server_reset_received_raises_on_connection_loss():
         assert await peer.recv(Settings) is not None  # the request was accepted
         peer.close()  # client vanishes
         await done.wait()
-        assert seen == [ConnectionClosedError]
+        assert seen == [TransportError]
 
 
 @pytest.mark.tonio
@@ -1057,10 +1058,10 @@ async def test_h2_body_user_error_sends_reset_reason():
                     await req.respond(200, body=body())
 
     async with _client_against(open_h2, serve, {}) as conn:
-        with pytest.raises(StreamResetError) as exc:
+        with pytest.raises(H2BodyError) as exc:
             resp = await conn.request("GET", "/")
             await resp.read()
-    assert exc.value.error_code == H2Reason.INADEQUATE_SECURITY
+    assert exc.value.__cause__.error_code == H2Reason.INADEQUATE_SECURITY
 
 
 @pytest.mark.tonio

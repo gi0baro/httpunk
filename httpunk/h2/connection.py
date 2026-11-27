@@ -25,7 +25,14 @@ crates/vendor-h2), paths relative to its `src/`.
 import contextlib
 
 from .. import _backend
-from .._common import aclose_body, aiter_body
+from .._common import (
+    aclose_body,
+    aiter_body,
+    body_write_error,
+    connection_closed_error,
+    h2_body_error,
+    transport_error,
+)
 from .._httpunk import (
     H2_FLAG_CAPACITY,
     H2_FLAG_CONN_DONE,
@@ -49,7 +56,15 @@ from .._httpunk import (
     H2StreamError,
     H2Streams,
 )
-from ..exceptions import ConnectionClosedError, GoAwayError, H2Error, H2Reason, StreamResetError, fresh_exc
+from ..exceptions import (
+    GoAwayError,
+    H2Error,
+    H2Reason,
+    H2UserError,
+    StreamResetError,
+    TransportError,
+    fresh_exc,
+)
 from ..http import HeaderMap
 from .stream import Stream
 
@@ -149,12 +164,15 @@ class H2ConnectionBase(H2Streams):
         handle.body_send.send(stop)
         handle.window_evt.set()
 
-    def _stopped_error(self, st, stop):
+    def _stopped_error(self, st, stop, kind=None):
         """The exception for a stream that stopped (h2 `ensure_reason` + the stored
         error): a peer reset reports the PEER's reason; a GOAWAY that dropped it, the
         `GoAwayError`; a connection failure, the connection's error; a local cancel
         with no reason falls back to the connection error, then CANCEL. Every raise
-        builds a fresh instance (`fresh_exc`: store copies, raise copies)."""
+        builds a fresh instance (`fresh_exc`: store copies, raise copies). `kind`
+        builds the error a body read (`h2_body_error`: hyper body/incoming.rs:193-201)
+        or a body write (`body_write_error`: hyper proto/h2/mod.rs:155-287
+        `new_body_write`) raises instead, caused by that one."""
         if stop.reason is None and not stop.conn and st.stop is not None:
             stop = st.stop  # the entry is gone; the pump published the reason on the handle
         # DIVERGENCE: after a reset caused by the caller's body raising, hyper reports the
@@ -163,6 +181,14 @@ class H2ConnectionBase(H2Streams):
         # (maintainer's decision).
         if stop.error is not None:
             return fresh_exc(stop.error)
+        err = self._stop_cause(st, stop)
+        if kind is None:
+            return err
+        exc = kind(err)
+        exc.__cause__ = err
+        return exc
+
+    def _stop_cause(self, st, stop):
         if stop.reason is None and not stop.conn and self.conn_error() is None and self.is_closed():
             info = self.goaway_info()
             if info is not None:
@@ -175,7 +201,7 @@ class H2ConnectionBase(H2Streams):
             err = self.conn_error()
             if err is not None:
                 return fresh_exc(err)
-            return ConnectionClosedError("connection closed")
+            return connection_closed_error()
         if stop.reason is not None:
             return StreamResetError(st.id, stop.reason)
         err = self.conn_error()
@@ -190,16 +216,22 @@ class H2ConnectionBase(H2Streams):
     # or one with streams still active, then a transport error, h2's `poll_ready` reports
     # the IO error; httpunk raises the peer's GOAWAY first: the condition retry logic
     # needs (maintainer's decision).
-    def _raise_if_dead(self):
+    def _raise_if_dead(self, kind=None):
         """Raise the stored condition: the peer's GOAWAY first (the retry-relevant
         one; h2's `recv_eof` never overwrites an existing conn_error), then the
-        connection error. Copies per raise."""
+        connection error — a copy, or the error `kind` builds from it (a request the
+        connection did not take, `ready()` on a dead connection)."""
         info = self.goaway_info()
         if info is not None:
             raise GoAwayError(*info)
         err = self.conn_error()
         if err is not None:
-            raise fresh_exc(err) from err
+            # DIVERGENCE: hyper's `Canceled` "connection was not ready" and its
+            # `ChannelClosed` carry no connection error (client/conn/http2.rs:101-103,
+            # 176-178, 207-208); httpunk's `RequestNotSentError` and
+            # `ConnectionClosedError` are raised from it, and copy its errno
+            # (maintainer's decision).
+            raise (fresh_exc(err) if kind is None else kind(err)) from err
 
     def _fail(self, exc):
         """The connection failed (h2 connection.rs `handle_poll2_result`): record a
@@ -209,6 +241,21 @@ class H2ConnectionBase(H2Streams):
             self._notify_stopped(handle, stop, True)
         self._on_conn_done()
 
+    def _transport_failed(self, exc):
+        """A pump's transport read or write ended — raising `exc`, or at EOF (`None`):
+        the connection fails with `TransportError` (h2 proto/connection.rs:542-547,
+        `Error::Io`), unless it was closed locally, which is what ended it."""
+        if self.closed_locally:
+            self._fail(None)
+        elif exc is None:
+            # DIVERGENCE: on a clean EOF with streams in flight h2 fabricates an
+            # `io::Error` of kind `BrokenPipe` (proto/streams/state.rs:314-331,
+            # proto/streams/streams.rs:955-963); httpunk raises `TransportError` with no
+            # cause and no errno: nothing was raised (maintainer's decision).
+            self._fail(TransportError("connection error: closed by peer"))
+        else:
+            self._fail(transport_error(exc))
+
     # ----- lifecycle -----
 
     async def _begin(self):
@@ -216,7 +263,11 @@ class H2ConnectionBase(H2Streams):
         # (client) + our initial SETTINGS + the initial WINDOW_UPDATE(0) are queued by
         # the state and flushed here, BEFORE the pumps start, so nothing can precede them.
         self.begin()
-        await self._flush()
+        try:
+            await self._flush()
+        except Exception as exc:
+            # hyper proto/h2/client.rs:167, server.rs:218: the handshake's io error is `Io`.
+            raise transport_error(exc) from exc
         # Bare tasks (`spawn_without_results`), never cancelled: every point they can
         # park at ends naturally on the transport close in `close()`. The handles live
         # in the state and are taken exactly once (a double `close()` cannot double-await).
@@ -243,6 +294,7 @@ class H2ConnectionBase(H2Streams):
     def abort(self):
         # h2 client.rs:1341-1349, server.rs:1506-1525: dropping a failed or
         # cancelled handshake drops its IO, without flushing or TLS close_notify.
+        self.mark_closed_locally()
         self.backend.close_transport(self._transport)
         self._fail(None)  # preserve a failure already recorded by the read pump
         self.stop_pump()
@@ -263,7 +315,9 @@ class H2ConnectionBase(H2Streams):
         # exits — hyper's connection task likewise ends only after the last
         # `PipeToSendStream` dropped its `conn_drop_ref`; the writers are never
         # cancelled, here or there. The keep-alive timer goes first, so it cannot drop
-        # the connection under the drain.
+        # the connection under the drain. Closed locally before the transport is touched:
+        # the pumps' reads and writes end because of it.
+        self.mark_closed_locally()
         handle = self.take_keep_alive_handle()
         if handle is not None:
             self._keep_alive_evt.set()
@@ -326,10 +380,8 @@ class H2ConnectionBase(H2Streams):
                 if data:
                     try:
                         await self._transport.send_all(data)
-                    except OSError as exc:
-                        failed = ConnectionClosedError(f"connection closed: {exc}")
                     except Exception as exc:
-                        failed = exc
+                        failed = exc.with_traceback(None)
                 # `take_pending` hands out the pending buffer itself, as a memoryview,
                 # no copy; releasing it here (not when the name is rebound next turn)
                 # returns the buffer to the state NOW, so two buffers alternate.
@@ -339,7 +391,7 @@ class H2ConnectionBase(H2Streams):
             for handle in self.credit_written():
                 handle.window_evt.set()
             if failed is not None:
-                self._fail(failed)
+                self._transport_failed(failed)
                 break
             if stopping and not self.has_pending():
                 break  # drain-then-exit; frames enqueued later are `close()`'s drain's
@@ -351,9 +403,13 @@ class H2ConnectionBase(H2Streams):
         spare = Stream(self.backend) if server else None  # the next request's handle
         try:
             while True:
-                data = await self._transport.receive_some(_READ_SIZE)
+                try:
+                    data = await self._transport.receive_some(_READ_SIZE)
+                except Exception as exc:
+                    self._transport_failed(exc)
+                    break
                 if not data:  # EOF
-                    self._fail(ConnectionClosedError("connection closed by peer"))
+                    self._transport_failed(None)
                     break
                 for frame in self.receive(data):
                     try:
@@ -377,7 +433,7 @@ class H2ConnectionBase(H2Streams):
                 if flags:
                     self._after(flags)
                     break
-        except H2Error as exc:
+        except (H2Error, H2UserError) as exc:
             # A protocol/flow violation we detected: notify the peer with GOAWAY, then
             # tear down (h2 `go_away_now`). Best-effort: the connection is going down.
             reason = exc.args[0] if exc.args and isinstance(exc.args[0], int) else int(H2Reason.PROTOCOL_ERROR)
@@ -386,10 +442,6 @@ class H2ConnectionBase(H2Streams):
             with contextlib.suppress(Exception):
                 await self._flush()
             self._fail(exc)
-        except OSError as exc:
-            # A raw transport error (an abrupt peer RST, a broken pipe): a transport
-            # failure, not a protocol violation — no GOAWAY.
-            self._fail(ConnectionClosedError(f"connection closed: {exc}"))
         except Exception as exc:  # any other unexpected error (cancellation is BaseException)
             self._fail(exc)
 
@@ -518,7 +570,7 @@ class H2ConnectionBase(H2Streams):
                     scope.cancel()  # leave with the pump gone, whatever ended the wait
         await done.wait()
         if abandoned:
-            raise self._stopped_error(st, st.stop)
+            raise self._stopped_error(st, st.stop, body_write_error)
         if box:
             raise box[0]
 
@@ -556,7 +608,7 @@ class H2ConnectionBase(H2Streams):
         while True:
             v = self.send_data(st.id, data, offset, end_stream)
             if v.stopped is not None:
-                raise self._stopped_error(st, v.stopped)
+                raise self._stopped_error(st, v.stopped, body_write_error)
             if v.flags:
                 self._after(v.flags)
             if v.done:
@@ -586,7 +638,7 @@ class H2ConnectionBase(H2Streams):
         (h2 `send_trailers`); see `_send_data` for the server's `handle`."""
         v = self.send_trailers(st.id, trailers)
         if v.stopped is not None:
-            raise self._stopped_error(st, v.stopped)
+            raise self._stopped_error(st, v.stopped, body_write_error)
         if v.flags:
             self._after(v.flags)
         if v.handle is not None:
@@ -646,7 +698,7 @@ class H2ConnectionBase(H2Streams):
                 # without an error when the stream error's reason is NO_ERROR. httpunk
                 # raises: a body cut before its END_STREAM is reported, not handed over
                 # as complete (maintainer's decision).
-                raise self._stopped_error(st, item)
+                raise self._stopped_error(st, item, h2_body_error)
             chunk, budgeted = item
             if budgeted:
                 self.release_data_frame(st.id, len(chunk))

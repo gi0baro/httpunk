@@ -14,8 +14,7 @@ genuinely shared, and they live here. All byte work is the Rust sans-IO core
 Cross-reference: hyperium/hyper 1.13.0 `src/proto/h1/{conn,dispatch,role}.rs`.
 """
 
-from .._common import aiter_body
-from ..exceptions import ConnectionClosedError
+from .._common import aiter_body, body_write_error, connection_closed_error, h1_body_error
 
 
 _READ_SIZE = 65536
@@ -45,7 +44,29 @@ BODY_ASYNC = 3  # an async iterable: pumped in its own task (may park between ch
 class H1Framing:
     """The body-framing + send leaves shared by both roles (hyper's `Conn` write
     half: `encode_head`'s body length, `write_body`/`end_body`). Pure orchestration
-    over `self.write` — no state of its own."""
+    over `self.write` — no state of its own.
+
+    A write raises `BodyWriteError` and a body read `H1BodyError` (hyper
+    dispatch.rs:468-473 `new_body_write`, :307-309 `new_body`), from what the transport
+    raised — or, once the connection was closed locally, from that close, whatever
+    the transport did then (`EOF` on asyncio, `EBADF` on tonio)."""
+
+    def _write_error(self, exc):
+        """The `BodyWriteError` for a write that raised `exc`, its `__cause__` set."""
+        cause = connection_closed_error() if self.closed_locally else exc
+        err = body_write_error(cause)
+        err.__cause__ = cause
+        return err
+
+    def _raise_write_failed(self, exc):
+        # Called from the `except` at the write, while `exc` is live.
+        raise self._write_error(exc)
+
+    def _raise_read_failed(self, exc):
+        """Raise the `H1BodyError` for a body read that raised `exc` (called from the
+        `except` at the read, while `exc` is live), or that the local close ended."""
+        cause = connection_closed_error() if self.closed_locally else exc
+        raise h1_body_error(cause) from cause
 
     @staticmethod
     def _body_plan(body, max_buf_size):
@@ -78,11 +99,18 @@ class H1Framing:
         state (`None` = closed by then: the failure a write into it would raise); the
         body's chunks go through `write`, each fetching the transport anew."""
         if transport is None:
-            raise ConnectionClosedError("connection closed")
+            self._raise_write_failed(connection_closed_error())
         if coalesce:
-            await transport.send_all(codec.serialize_head_and_body(head, body, trailers))
+            data = codec.serialize_head_and_body(head, body, trailers)
+            try:
+                await transport.send_all(data)
+            except Exception as exc:
+                self._raise_write_failed(exc)
             return
-        await transport.send_all(head)
+        try:
+            await transport.send_all(head)
+        except Exception as exc:
+            self._raise_write_failed(exc)
         await self._send_body(codec, body, trailers)
 
     async def _send_body(self, codec, body, trailers=None):
@@ -96,20 +124,31 @@ class H1Framing:
         # a request with trailers is always chunked, so it is never `body_is_eof`.
         # All writes go through `write`, which raises a clean ConnectionClosedError once the
         # state gave the transport away — a body pump orphaned by an abandoned
-        # exchange wakes into that, not into an AttributeError on `None.send_all`.
+        # exchange wakes into that, not into an AttributeError on `None.send_all`. Only
+        # the writes are wrapped: the body's iteration and the codec's framing raise as
+        # themselves.
         # `serialize_end` is always CALLED (it is what raises on a body short of its
         # Content-Length) but only WRITTEN when it has bytes: the chunked terminator.
         # A content-length body ends with nothing on the wire (hyper `end_body`).
         if codec.body_is_eof():
             end = codec.serialize_end()
             if end:
-                await self.write(end)
+                try:
+                    await self.write(end)
+                except Exception as exc:
+                    self._raise_write_failed(exc)
             return
         if body is not None:
             async for chunk in aiter_body(body):
                 chunk = codec.serialize_data(bytes(chunk))
                 if chunk:
-                    await self.write(chunk)
+                    try:
+                        await self.write(chunk)
+                    except Exception as exc:
+                        self._raise_write_failed(exc)
         end = codec.serialize_trailers(trailers) if trailers is not None else codec.serialize_end()
         if end:
-            await self.write(end)
+            try:
+                await self.write(end)
+            except Exception as exc:
+                self._raise_write_failed(exc)

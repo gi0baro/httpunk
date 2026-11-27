@@ -8,7 +8,7 @@ from tonio.colored import Event, scope
 from tonio.exceptions import CancelledError
 
 from httpunk import H2Connection
-from httpunk.exceptions import ConnectionClosedError
+from httpunk.exceptions import TransportError
 from httpunk.h2.connection import PREFACE
 from httpunk.h2.server import H2Server
 
@@ -76,7 +76,7 @@ async def test_h2_client_handshake_aborts_transport_and_pumps(outcome):
             assert isinstance(errors[0], CancelledError)
             await read_to_eof(peer, allow_reset=True)
         else:
-            assert isinstance(errors[0], ConnectionClosedError)
+            assert isinstance(errors[0], TransportError)
         assert observed.aborts == 1
         assert conn.closed
         error = conn._conn.conn_error()
@@ -125,8 +125,9 @@ async def test_h2_server_handshake_aborts_during_initial_flush(outcome):
         if outcome == "cancel":
             assert isinstance(errors[0], CancelledError)
         else:
-            assert isinstance(errors[0], OSError)
-            assert errors[0].args == ("handshake write failed",)
+            assert isinstance(errors[0], TransportError)
+            assert isinstance(errors[0].__cause__, OSError)
+            assert errors[0].__cause__.args == ("handshake write failed",)
         assert observed.aborts == 1
         assert server._conn.is_closed()
         assert server._conn.take_pump_handle() is None

@@ -138,7 +138,7 @@ async def test_h1_client_orderly_close_sends_close_notify(ca):
         await stream.receive_some()
         backend.close_transport(stream)
     assert ends[0] == b""  # close_notify: a clean TLS EOF
-    assert isinstance(ends[1], backend.broken_transport_errors)  # no alert: a torn-down transport
+    assert isinstance(ends[1], (ConnectionError, ResourceBroken))  # no alert: a torn-down transport
 
 
 @pytest.mark.tonio
@@ -350,7 +350,7 @@ async def test_wrap_tls_tunnel_close_ends_reach_the_socket(ca):
         await stream.receive_some()
         backend.close_transport(stream)
     assert ends[0] == b""
-    assert isinstance(ends[1], backend.broken_transport_errors)
+    assert isinstance(ends[1], (ConnectionError, ResourceBroken))
 
 
 @pytest.mark.tonio

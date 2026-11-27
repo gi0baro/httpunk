@@ -10,7 +10,7 @@ from tonio.colored import Event, scope, sleep
 from tonio.colored.sync import Lock
 from tonio.colored.time import timeout
 
-from httpunk import H2Reason, StreamResetError
+from httpunk import ConnectionClosedError, H2BodyError, H2Reason, StreamResetError
 from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
     H2_DEFAULT_DATA_FRAME_BUDGET as _DATA_FRAME_BUDGET,
@@ -450,12 +450,13 @@ async def _empty_data_flood_sends_goaway(frame):
     async with h2_client_against(server, **_H2_DEFAULT_WINDOWS) as conn:
         response = await conn.request("GET", _AKAMAI)
         # Upstream holds the body unread; reading it waits for the connection to fail.
-        with pytest.raises(H2ProtocolError):
+        with pytest.raises(H2BodyError) as body_exc:
             async for _chunk in response.aiter_bytes():
                 pass
-        with pytest.raises(H2ProtocolError) as exc:
+        assert isinstance(body_exc.value.__cause__, H2ProtocolError)
+        with pytest.raises(ConnectionClosedError) as exc:
             await conn.ready()
-        assert exc.value.args[0] == H2Reason.ENHANCE_YOUR_CALM
+        assert exc.value.__cause__.args[0] == H2Reason.ENHANCE_YOUR_CALM
         await finished.wait()
 
 
@@ -500,9 +501,9 @@ async def test_empty_data_frames_on_locally_reset_stream_send_goaway():
         response = await conn.request("GET", _AKAMAI)
         await response.aclose()  # RST_STREAM(CANCEL)
         await finished.wait()
-        with pytest.raises(H2ProtocolError) as exc:
+        with pytest.raises(ConnectionClosedError) as exc:
             await conn.ready()
-        assert exc.value.args[0] == H2Reason.ENHANCE_YOUR_CALM
+        assert exc.value.__cause__.args[0] == H2Reason.ENHANCE_YOUR_CALM
 
 
 @pytest.mark.tonio

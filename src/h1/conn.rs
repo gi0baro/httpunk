@@ -157,6 +157,9 @@ struct Inner {
     /// The caller-supplied transport; `None` once closed or handed off as a tunnel.
     transport: Option<Py<PyAny>>,
     closed: bool,
+    /// Closed by `close()`, `abort()` or a cancelled response, recorded before the
+    /// transport is touched: a read or write that ends from here on ended because of it.
+    closed_locally: bool,
     /// keep-alive: may we read another request after this one?
     reusable: bool,
     /// Handed off as a raw tunnel (101 / CONNECT / detach): the transport belongs
@@ -430,6 +433,7 @@ impl H1ServerState {
                 codec,
                 transport: Some(transport),
                 closed: false,
+                closed_locally: false,
                 reusable: true,
                 upgraded: false,
                 half_close,
@@ -490,7 +494,7 @@ impl H1ServerState {
     }
 
     /// The transport for a read or write, `None` once closed or handed off (the
-    /// caller raises `ConnectionClosedError`).
+    /// caller fails as a read or write into a closed connection).
     fn transport_ref(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         self.lock().transport.as_ref().map(|t| t.clone_ref(py))
     }
@@ -498,6 +502,11 @@ impl H1ServerState {
     #[getter]
     fn closed(&self) -> bool {
         self.lock().closed
+    }
+
+    #[getter]
+    fn closed_locally(&self) -> bool {
+        self.lock().closed_locally
     }
 
     #[getter]
@@ -707,6 +716,13 @@ impl H1ServerState {
         self.lock().close_now()
     }
 
+    /// `abort()`: closed locally; returns the transport to close.
+    fn close_locally(&self) -> Option<Py<PyAny>> {
+        let mut me = self.lock();
+        me.closed_locally = true;
+        me.close_now()
+    }
+
     /// A clean EOF between requests (or a graceful shutdown released the idle read):
     /// no more requests; the transport stays for `close()` to close.
     fn stop_serving(&self) {
@@ -724,6 +740,7 @@ impl H1ServerState {
     fn mark_closed(&self, py: Python<'_>) -> (Option<Py<PyAny>>, Option<Py<PyAny>>, bool) {
         let mut me = self.lock();
         let ended = me.closed;
+        me.closed_locally = true;
         let transport = me.close_now();
         let done = me.watcher.as_ref().map(|w| w.done.clone_ref(py));
         (transport, done, ended)
@@ -815,6 +832,18 @@ impl H1ServerState {
     fn peer_closed_flag(&self, seq: u64) -> bool {
         let me = self.lock();
         me.is_current(seq) && me.current.peer_closed
+    }
+
+    /// The transport error the watcher saw when it marked the request peer-closed
+    /// (`None`: a clean EOF, or not peer-closed).
+    fn peer_error(&self, py: Python<'_>, seq: u64) -> Option<Py<PyAny>> {
+        let me = self.lock();
+        if !me.is_current(seq) || !me.current.peer_closed {
+            return None;
+        }
+        me.watcher
+            .as_ref()
+            .and_then(|w| w.error.as_ref().map(|e| e.clone_ref(py)))
     }
 
     /// The whole arm decision (see `Inner::arm_decision`) with the want/negotiated
@@ -1032,11 +1061,16 @@ impl H1ServerState {
     }
 
     /// A failed response poisons the connection (hyper `Writing::Closed`): the window
-    /// closes, non-reusable, closed; returns the transport to close.
-    fn fail_response(&self, seq: u64) -> Option<Py<PyAny>> {
+    /// closes, non-reusable, closed; returns the transport to close. `local`: the
+    /// response was cancelled, which closes the connection locally.
+    #[pyo3(signature = (seq, local=false))]
+    fn fail_response(&self, seq: u64, local: bool) -> Option<Py<PyAny>> {
         let mut me = self.lock();
         if me.is_current(seq) {
             me.current.response_done = true;
+        }
+        if local {
+            me.closed_locally = true;
         }
         me.close_now()
     }
@@ -1118,8 +1152,12 @@ struct ClientInner {
     codec: Py<H1Codec>,
     transport: Option<Py<PyAny>>,
     closed: bool,
+    /// Closed by `close()`, `abort()` or a cancelled request, recorded before the
+    /// transport is touched: a read or write that ends from here on ended because of it.
+    closed_locally: bool,
     upgraded: bool,
-    /// The stored failure (a traceback-free copy), first writer wins.
+    /// The stored failure (a traceback-free copy), stored only by the failure that
+    /// closes the connection.
     error: Option<Py<PyAny>>,
     /// The single in-flight exchange holds the connection (hyper `Conn::is_busy`).
     busy: bool,
@@ -1167,6 +1205,7 @@ impl H1ClientState {
                 codec,
                 transport: Some(transport),
                 closed: false,
+                closed_locally: false,
                 upgraded: false,
                 error: None,
                 busy: false,
@@ -1236,6 +1275,11 @@ impl H1ClientState {
     }
 
     #[getter]
+    fn closed_locally(&self) -> bool {
+        self.lock().closed_locally
+    }
+
+    #[getter]
     fn busy(&self) -> bool {
         self.lock().busy
     }
@@ -1271,8 +1315,8 @@ impl H1ClientState {
     /// connection's state decides whether it takes the request): `(transport,
     /// watcher_done)` — the transport for the peek and the write, and the armed idle
     /// watcher's done event (the exchange's "readable" until that read completes).
-    /// `None` transport = dead (failed, closed, or handed off): the caller raises with
-    /// `request_unsent`.
+    /// `None` transport = dead (failed, closed, or handed off): the caller raises
+    /// `RequestNotSentError`.
     fn begin_send(&self, py: Python<'_>) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
         let me = self.lock();
         if me.error.is_some() {
@@ -1335,17 +1379,16 @@ impl H1ClientState {
     // ----- failure / close -----
 
     /// Poison + close (hyper `state.close()` with the error stored): `exc` is a
-    /// traceback-free copy, stored only if no error is stored yet (`None`: close
-    /// without recording, hyper's Io-less close). Returns the transport to close.
-    #[pyo3(signature = (exc=None))]
-    fn fail(&self, exc: Option<Py<PyAny>>) -> Option<Py<PyAny>> {
+    /// traceback-free copy, stored only if the connection is still open — a failure
+    /// raised on a connection already closed or failed is a consequence of that end,
+    /// not its cause. Returns the transport to close.
+    fn fail(&self, exc: Py<PyAny>) -> Option<Py<PyAny>> {
         let mut me = self.lock();
-        let unused = match exc {
-            Some(e) if me.error.is_none() => {
-                me.error = Some(e);
-                None
-            }
-            other => other,
+        let unused = if me.closed {
+            Some(exc)
+        } else {
+            me.error = Some(exc);
+            None
         };
         let transport = me.close_now();
         drop(me);
@@ -1357,6 +1400,13 @@ impl H1ClientState {
     /// returns the transport to close.
     fn close_now(&self) -> Option<Py<PyAny>> {
         self.lock().close_now()
+    }
+
+    /// `abort()`, a cancelled request: closed locally; returns the transport to close.
+    fn close_locally(&self) -> Option<Py<PyAny>> {
+        let mut me = self.lock();
+        me.closed_locally = true;
+        me.close_now()
     }
 
     /// `release_slot`'s verdict, ONE step (hyper `try_keep_alive`: both halves at
@@ -1391,6 +1441,7 @@ impl H1ClientState {
     ) {
         let mut me = self.lock();
         let idle = !me.busy;
+        me.closed_locally = true;
         let transport = me.close_now();
         let done = me.watcher.as_ref().map(|w| w.done.clone_ref(py));
         let writer = me.writer.take();

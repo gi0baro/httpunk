@@ -21,7 +21,7 @@ from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 
 from .. import _backend
-from .._common import BaseClientConnection
+from .._common import BaseClientConnection, connection_closed_error, request_not_sent_error, transport_error
 from .._httpunk import (
     H1_WATCH_IDLE_BYTES,
     H1_WATCH_IDLE_EOF,
@@ -30,12 +30,7 @@ from .._httpunk import (
     H1ClientState,
     H1Codec,
 )
-from ..exceptions import (
-    ConnectionClosedError,
-    H1IncompleteMessageError,
-    H1UnexpectedMessageError,
-    fresh_exc,
-)
+from ..exceptions import BodyWriteError, H1IncompleteMessageError, H1UnexpectedMessageError, fresh_exc
 from ..types import Response, Version
 from .connection import BODY_ASYNC, H1Framing
 from .share import H1ResponseBody, H1Upgraded
@@ -105,9 +100,9 @@ class Connection(H1Framing, H1ClientState):
     - While reusable-idle, a watcher task holds read interest — the re-expression
       of hyper's always-polled `Connection` future (see `_watch_idle`) — so an
       idle peer close or stray byte flips `closed`/`error` when it happens, and
-      a `send_request` failure raised before the request was handed to the
-      writer carries `request_unsent = True` (hyper's `TrySendError` message
-      give-back, client/conn/http1.rs L261-281).
+      a `send_request` that fails before the request was handed to the writer
+      raises `RequestNotSentError` (hyper's `TrySendError` message give-back,
+      client/conn/http1.rs L261-281).
     """
 
     def __new__(
@@ -146,14 +141,14 @@ class Connection(H1Framing, H1ClientState):
     def write(self, data):
         transport = self.transport_ref()
         if transport is None:
-            raise ConnectionClosedError("connection closed")
+            raise connection_closed_error()
         return transport.send_all(data)
 
     def read_body_more(self):
         """Read more transport bytes for an in-flight body. Empty bytes = EOF."""
         transport = self.transport_ref()
         if transport is None:
-            raise ConnectionClosedError("connection closed")
+            raise connection_closed_error()
         return transport.receive_some(_READ_SIZE)
 
     def _close(self, transport):
@@ -190,14 +185,18 @@ class Connection(H1Framing, H1ClientState):
 
     async def wait_idle(self):
         """Resolve once the connection can accept a request (h1 analogue of
-        `SendRequest::ready`); raise if it has failed or closed."""
+        `SendRequest::ready`); raise `ConnectionClosedError` if it has failed or closed
+        (hyper `ChannelClosed`, client/dispatch.rs:72-76), from its stored error."""
         await self._acquire()
         self._release()
         err = self.error
         if err is not None:
-            raise fresh_exc(err) from err  # a copy per raise (exceptions.fresh_exc)
+            # DIVERGENCE: hyper's `poll_ready` fails with a bare `ChannelClosed`
+            # (client/dispatch.rs:72-76); httpunk's carries the connection's stored error
+            # as its cause, and its errno (maintainer's decision).
+            raise connection_closed_error(err) from err
         if self.closed:
-            raise ConnectionClosedError("connection closed")
+            raise connection_closed_error()
 
     # ----- the background writer -----
 
@@ -246,8 +245,9 @@ class Connection(H1Framing, H1ClientState):
           closing" (conn.rs L472-484): closed, NO error recorded — a pool discards
           silently; the transport is closed NOW so the socket never parks in CLOSE_WAIT;
         - idle bytes -> `new_unexpected_message` (conn.rs L486-490): poison + close;
-        - idle transport error -> fail (`force_io_read` io error, conn.rs L512-521)
-          — unless a concurrent `close()` already committed the flags."""
+        - idle transport error -> fail with `TransportError` (`force_io_read` io
+          error, conn.rs L512-521) — unless a concurrent `close()` already committed
+          the flags."""
         transport = self.transport_ref()
         if transport is None:  # a racing close() took it before we ran
             self.watcher_aborted()
@@ -264,7 +264,7 @@ class Connection(H1Framing, H1ClientState):
         elif code == H1_WATCH_IDLE_BYTES:
             self.poison_unexpected(len(data))
         elif code == H1_WATCH_IDLE_ERROR:
-            self._fail(error)
+            self._fail(transport_error(error))
         done.set()
 
     async def _join_watcher(self):
@@ -293,13 +293,14 @@ class Connection(H1Framing, H1ClientState):
             # The watcher may have observed EOF/bytes and closed/poisoned the
             # connection while we waited — the mirror of `SendRequest::poll_ready`
             # failing once the connection task died (client/conn/http1.rs L163-191).
-            # `request_unsent` mirrors hyper handing the request back
+            # `RequestNotSentError` mirrors hyper handing the request back
             # (`TrySendError { message: Some(req) }`, L261-281): nothing was written,
             # so the caller may safely retry ANY body, streamed included.
             # One step: dead?, the transport, the watcher's done event (`begin_send`).
             transport, done = self.begin_send()
             if transport is None:
-                raise self._unsent_error()
+                cause = self._unsent_cause()
+                raise request_not_sent_error(cause) from cause
             # `require_empty_read`'s buffered-bytes fast path at send time (conn.rs
             # L465-468): bytes ALREADY DELIVERED when a request is submitted are always
             # a violation, never that request's "response". Checked BEFORE the exchange
@@ -313,10 +314,20 @@ class Connection(H1Framing, H1ClientState):
             # sees nothing while it is parked: bytes still ciphertext in the socket reach
             # the watcher's read instead — hyper's `read_buf` over rustls holds decrypted
             # bytes only, and its next `poll_read_head` parses the rest as the response too.)
-            pending = self.backend.receive_nowait(transport, _READ_SIZE)
+            try:
+                pending = self.backend.receive_nowait(transport, _READ_SIZE)
+            except Exception as exc:
+                # The transport failed before the request was written (tonio raises
+                # from the peek): the connection dies with it, the request is given back.
+                # The cause is this failure, not the stored error: the idle watcher may
+                # read the EOF that follows a consumed reset and close cleanly first.
+                err = transport_error(exc)
+                self._fail(err)
+                raise request_not_sent_error(err) from err
             if pending:
                 self.poison_unexpected(len(pending))  # records the error AND closes
-                raise self._unsent_error()
+                cause = self._unsent_cause()
+                raise request_not_sent_error(cause) from cause
             codec = self._codec  # started on the next message by the claim (`try_begin_exchange`)
             content_length, chunked, kind, coalesce = self._body_plan(body, self._max_buf_size)
             # A previous HTTP/1.0 response on this (reused) connection downgrades this
@@ -338,7 +349,7 @@ class Connection(H1Framing, H1ClientState):
             #      watcher's completing read (it holds the connection's one parked read,
             #      never a second reader): bytes or EOF BEFORE the request went out are
             #      the idle verdicts (unexpected message / idle close), and the failure
-            #      carries `request_unsent` — nothing was written. Writable now (the
+            #      is `RequestNotSentError` — nothing was written. Writable now (the
             #      common case): no wait at all.
             #   B. writing — the write runs in its own task (`send_all` is the transport's
             #      only send and suspends inside; a task is what lets this one keep
@@ -356,13 +367,14 @@ class Connection(H1Framing, H1ClientState):
             if done is not None and (wait := self._wait_writable(done)) is not None:
                 await wait
                 if done.is_set():  # the watcher's read completed first: the idle rules judged it
-                    raise self._unsent_error()
+                    cause = self._unsent_cause()
+                    raise request_not_sent_error(cause) from cause
             # The exchange starts NOW: the watcher is not stopped (its parked read is
             # never cancelled); the state redirects its completing read to the exchange,
             # whose `_read_head` joins it and takes the bytes as the response's first read.
-            # The `request_unsent` boundary: this spawn is httpunk's analogue of hyper's
-            # dispatcher taking the request off the channel (dispatch.rs `poll_msg`). From
-            # here on a failure NEVER carries the marker.
+            # The `RequestNotSentError` boundary: this spawn is httpunk's analogue of
+            # hyper's dispatcher taking the request off the channel (dispatch.rs
+            # `poll_msg`). From here on a failure is NEVER that class.
             self.exchange_started()
             write_error = []
             write_done = self.backend.event()
@@ -385,7 +397,7 @@ class Connection(H1Framing, H1ClientState):
                 err = self.error
                 if err is not None:
                     raise fresh_exc(err) from err
-                raise ConnectionClosedError("connection closed")
+                raise connection_closed_error()
             resp_head = await self._read_head(codec, write_error, done)
             # Remember the peer's version so the next request on a reused
             # connection can fix itself up (hyper conn.rs L301).
@@ -425,7 +437,12 @@ class Connection(H1Framing, H1ClientState):
                 await body._finish()
             return Response(resp_head.status, resp_head.headers, body, version=_version_of(resp_head))
         except BaseException as exc:
-            self._fail(exc)  # sync poison BEFORE the teardown suspension (see release_slot)
+            # Sync poison BEFORE the teardown suspension (see release_slot). A
+            # cancellation is not a failure: the connection is closed locally.
+            if isinstance(exc, Exception):
+                self._fail(exc)
+            else:
+                self._close(self.close_locally())
             try:
                 await self._teardown_writer(cancel=True)
                 # A watcher not yet consumed by `_read_head`: `_fail` closed the
@@ -435,14 +452,20 @@ class Connection(H1Framing, H1ClientState):
                 self._release()
             raise
 
-    def _unsent_error(self):
-        # The flag rides the raised copy, not the stored error: it holds for THIS
-        # give-back, while a stored flag would leak onto unrelated raises.
+    def _unsent_cause(self):
+        """What a request the connection could not take failed from: its stored error,
+        the local close, or nothing (it just closed: hyper's "connection closed"
+        `Canceled`, client/dispatch.rs:215-223)."""
+        # DIVERGENCE: hyper's `Canceled` for a connection that was not ready carries
+        # only the text "connection was not ready" (client/conn/http1.rs:244-246,
+        # 274-280); httpunk's `RequestNotSentError` is raised from the connection's
+        # stored error, or its local close, and copies its errno (maintainer's decision).
         err = self.error
-        exc = fresh_exc(err) if err is not None else ConnectionClosedError("connection closed")
-        exc.request_unsent = True
-        exc.__cause__ = err
-        return exc
+        if err is not None:
+            return err
+        if self.closed_locally:
+            return connection_closed_error()
+        return None
 
     async def _write_request(self, codec, head, body, write_error, trailers, coalesce, done):
         # Write the head then the framed body. A write failure (e.g. the server
@@ -454,13 +477,15 @@ class Connection(H1Framing, H1ClientState):
         try:
             await self._send_head_and_body(codec, head, body, trailers, self.transport_ref(), coalesce)
             self.writer_done()
-        except OSError as exc:
-            # A TRANSPORT write failure (broken pipe / reset): the peer may have closed
-            # right after sending an early response (413/redirect) that is still buffered
-            # for `_read_head`, so DEFER — record it and surface it only if no head
-            # arrives (EOF). Do NOT fail the connection, or we'd race away that buffered
-            # response.
-            write_error.append(exc.with_traceback(None))  # stored past this frame — strip (exceptions.fresh_exc)
+        except BodyWriteError as exc:
+            # A write failed (broken pipe / reset): the peer may have closed right after
+            # sending an early response (413/redirect) that is still buffered for
+            # `_read_head`, so DEFER — record it and surface it only if no head arrives
+            # (EOF). Do NOT fail the connection, or we'd race away that buffered
+            # response (hyper polls the read first, dispatch.rs:192).
+            # Stored past this frame — strip it and its cause (exceptions.fresh_exc).
+            exc.__cause__.with_traceback(None)
+            write_error.append(exc.with_traceback(None))
         except Exception as exc:
             # A BODY-ITERABLE / framing error (the caller's body generator raised, or a
             # length mismatch): the request can't complete and no valid response is
@@ -489,9 +514,12 @@ class Connection(H1Framing, H1ClientState):
             if handle is not None:
                 await handle
             if exc is not None:
+                if self.closed_locally:
+                    raise connection_closed_error()
                 if write_error:  # the writer's failure ended the read: it is the cause
                     raise fresh_exc(write_error[0]) from write_error[0]
-                raise exc
+                # hyper io.rs:224: a failed read for the head is `Kind::Io`.
+                raise transport_error(exc) from exc
             if data is None:
                 # The watcher exited without a hand-off: it dispatched through the IDLE
                 # rules against this exchange (a racing close() tore the connection down,
@@ -500,7 +528,7 @@ class Connection(H1Framing, H1ClientState):
                 err = self.error
                 if err is not None:
                     raise fresh_exc(err) from err
-                raise ConnectionClosedError("connection closed")
+                raise connection_closed_error()
         while True:
             if data is None:
                 transport = self.transport_ref()
@@ -509,17 +537,22 @@ class Connection(H1Framing, H1ClientState):
                 else:
                     try:
                         data = await transport.receive_some(_READ_SIZE)
-                    except Exception:
-                        # The body writer failed and ended this read by closing the
-                        # transport (on tonio a close re-dispatches the parked reader,
-                        # which fails with EBADF rather than EOF): its error is the cause.
+                    except Exception as exc:
+                        # A local close, or the body writer failing, ended this read by
+                        # closing the transport (on tonio a close re-dispatches the parked
+                        # reader, which fails with EBADF rather than EOF): that is the cause.
+                        if self.closed_locally:
+                            raise connection_closed_error() from None
                         if write_error:
                             raise fresh_exc(write_error[0]) from write_error[0]
-                        raise
+                        # hyper io.rs:224: a failed read for the head is `Kind::Io`.
+                        raise transport_error(exc) from exc
             if not data:
                 # EOF before a full head. If the body write also failed (server
                 # closed both directions, or the body iterable raised), surface that
                 # as the cause. A copy — the instance stays in `write_error`.
+                if self.closed_locally:
+                    raise connection_closed_error()
                 if write_error:
                     raise fresh_exc(write_error[0]) from write_error[0]
                 # hyper: an EOF while parsing -> `IncompleteMessage` (io.rs L224-227;
@@ -590,8 +623,8 @@ class Connection(H1Framing, H1ClientState):
 
     def abort(self):
         # hyper client/conn/http1.rs:586-590: dropping the handshake drops its IO.
-        # The same failure verdict as _fail's Io-less close; closing wakes the watcher.
-        self._close(self.fail())
+        # Closed locally; closing wakes the watcher.
+        self._close(self.close_locally())
 
     async def close(self):
         # Commit `closed` + take the transport FIRST (one step in the state): the
@@ -616,13 +649,12 @@ class Connection(H1Framing, H1ClientState):
             await writer.finish(True)
 
     def _fail(self, exc):
-        # Sync poison + close, first writer wins. A stripped COPY is stored: the
-        # caught instance keeps propagating to the caller and would accumulate
-        # every frame above onto a stored traceback (exceptions.fresh_exc). A
-        # `ConnectionClosedError` is not recorded (hyper's Io-less close: the
-        # connection just closes).
-        stored = None if isinstance(exc, ConnectionClosedError) else fresh_exc(exc)
-        self._close(self.fail(stored))
+        # Sync poison + close. A stripped COPY is stored: the caught instance keeps
+        # propagating to the caller and would accumulate every frame above onto a
+        # stored traceback (exceptions.fresh_exc). The state stores it only while the
+        # connection is open: a failure raised on a connection already closed or
+        # failed is a consequence of that end, not its cause.
+        self._close(self.fail(fresh_exc(exc)))
 
 
 class H1Connection(BaseClientConnection):
@@ -712,11 +744,11 @@ class H1Connection(BaseClientConnection):
         authority-form for CONNECT. The caller supplies the ``Host`` header (we
         never auto-add it), exactly like hyper's `client::conn::http1`.
 
-        A failure raised before the request was handed to the writer carries
-        ``request_unsent = True`` on the exception: nothing reached the wire, so
-        the request — any body, streamed included — is safe to retry. The mirror
-        of hyper handing the request back in `TrySendError { message: Some }`
-        (client/conn/http1.rs L261-281; proto/h1/dispatch.rs L742-758). Absent
-        (falsy) once the write may have begun.
+        A failure before the request was handed to the writer raises
+        `RequestNotSentError`, from the connection's stored error: nothing reached
+        the wire, so the request — any body, streamed included — is safe to retry.
+        The mirror of hyper handing the request back in `TrySendError { message: Some }`
+        (client/conn/http1.rs L261-281; proto/h1/dispatch.rs L742-758). Never raised
+        once the write may have begun.
         """
         return self._conn.send_request(request.method, request.target, request.headers, request.body, request.trailers)

@@ -14,7 +14,7 @@ from tonio.colored.net.tls import TLSStream as _TLSStream, open_tls_over_tcp_str
 from tonio.colored.sync import Lock as _Lock, Semaphore as _Semaphore
 from tonio.colored.sync.channel import unbounded as _unbounded
 from tonio.colored.time import time as _now, timeout as _timeout
-from tonio.exceptions import CancelledError, ResourceBroken
+from tonio.exceptions import CancelledError
 
 
 class _TonioSemaphore:
@@ -120,9 +120,9 @@ class TonioBackend:
         already holds — feeds the ingress BIO without suspending — the way hyper's read
         over rustls does, so the server's drain finds a small unread body instead of
         closing; a close_notify already in the socket is `b""`, an abrupt close raises
-        `ResourceBroken` (a `broken_transport_errors` shape, like the plain socket's
-        `ConnectionResetError`). Beside a parked reader: on a plain socket both are one
-        `recv` on the same non-blocking socket and the bytes go to exactly one of them;
+        `ResourceBroken` (as the plain socket raises `ConnectionResetError`). Beside a
+        parked reader: on a plain socket both are one `recv` on the same non-blocking
+        socket and the bytes go to exactly one of them;
         over TLS the parked reader holds the receive lock, so the peek answers `None`
         whatever the socket holds — hyper's `require_empty_read` looks at its `read_buf`
         the same way, and ciphertext not yet decrypted is invisible to it too."""
@@ -321,17 +321,6 @@ class TonioBackend:
             await transport.close()
         except OSError:  # the alert did not go out; the socket closed regardless
             pass
-
-    # Exceptions `receive_some`/`send_all` raise when the peer tears the
-    # transport down ABRUPTLY instead of a clean EOF: an RST on plain TCP
-    # (`ConnectionError`: ConnectionResetError/BrokenPipeError), or a TLS close
-    # without close_notify (tonio wraps the SSLEOFError in `ResourceBroken`) —
-    # which httpunk's own abortive `close_transport` produces, so an httpunk
-    # peer that drops a connection makes the other side see one.
-    # DIVERGENCE: the h1 server maps these at the request-head boundary to a clean
-    # end-of-iteration, even mid-head; hyper raises IncompleteMessage on mid-head EOF.
-    # This preserves httpunk's public clean-close iteration contract.
-    broken_transport_errors = (ConnectionError, ResourceBroken)
 
     # Spawn task(s) NOW, discarding their results; returns the join handle.
     # `await handle` resolves once ALL of them finished — exactly one owner

@@ -211,12 +211,13 @@ On HTTP/2 you can also abort a single stream with `request.reset()` instead of r
 `await request.reset_received()` resolves with the reason
 when the *client* abandons the request (`RST_STREAM`, even after it finished sending), the
 signal a long-running or streaming handler races against its own completion to stop early.
-A reset also fails an in-flight `respond()` / `send_data` with `StreamResetError` carrying the
-client's reason, including while the body is waiting on the app's next chunk. The HTTP/1 twin
+A reset also fails an in-flight response: the head with `StreamResetError` carrying the
+client's reason, the body's writes (`respond()`'s body, `send_data`) with `BodyWriteError`
+caused by it, including while the body is waiting on the app's next chunk. The HTTP/1 twin
 is `await request.peer_closed()`: once the request body is complete, a client that closes the
 connection before the response is done is detected (hyper's `mid_message_detect_eof`), the
-in-flight `respond()` / `send_data` fail with `H1IncompleteMessageError`, and the accept loop
-ends. The await resolves either way and never hangs: `True` when the client closed
+in-flight `respond()` / `send_data` fail with `H1IncompleteMessageError` (`TransportError` when
+the transport failed instead), and the accept loop ends. The await resolves either way and never hangs: `True` when the client closed
 mid-request, `False` once the exchange completed (or failed) first, at once if it already had.
 `H1Server(half_close=True)` turns the detection off, as hyper's `half_close` does. A request
 announcing an upgrade (`Upgrade: h2c`, `Upgrade: websocket`, CONNECT) is watched only from its
@@ -288,54 +289,76 @@ h.raw_items()                # [(b'content-type', b'text/plain'), (b'set-cookie'
 ### Errors
 
 HTTPunk's exceptions all derive from a common `HTTPunkError` root, with one class per
-public error kind of the upstream crate, so a caller can match on what hyper or h2 would
-have reported. `ConnectionClosedError` is **protocol-neutral** — hyper's `Io` and h2's
-`Io`: the transport failed with work in flight — so it sits directly under the root. The
-**HTTP/1** errors mirror hyper's `Error` kinds under `H1Error`; the **HTTP/2** errors
-mirror the h2 crate's under `H2Error`:
+public error kind of the upstream crates, so a caller can match on what hyper or h2 would
+have reported. What a connection reports is protocol-neutral and sits under
+`HTTPConnectionError`: its transport failing (hyper's and h2's `Io`), a body that could not be
+read or written, a request it did not send, its own closure. Local misuse the stack detects is
+a `UserError`. `H1Error` / `H2Error` hold only what the other protocol has no counterpart for:
 
 ```
 HTTPunkError
-├── ConnectionClosedError        transport closed / IO error with work in flight  (hyper Io, h2 Io)
-├── H1Error                      base for HTTP/1 errors (hyper `Error` kinds)
-│   ├── H1ParseError             malformed message head (hyper Parse) — args = (kind, message)
-│   ├── H1BodyError              malformed or truncated body (hyper Body) — args = (io_kind, message)
-│   ├── H1IncompleteMessageError EOF while a message was still expected (hyper IncompleteMessage)
-│   ├── H1UnexpectedMessageError bytes on an idle client connection (hyper UnexpectedMessage)
-│   └── H1UserError              local misuse hyper reports on the wire path (hyper User) — args = (kind, message)
-└── H2Error                      base for HTTP/2 protocol errors
-    ├── H2ProtocolError          connection-level protocol violation (-> GOAWAY)
-    ├── H2StreamError            stream-level protocol violation (-> RST_STREAM)
-    ├── H2UserError              local API misuse
-    ├── H2FlowControlError       flow-control window over/underflow
-    ├── H2KeepAliveTimeoutError  a keep-alive PING went unanswered (hyper KeepAliveTimedOut)
-    ├── GoAwayError              the peer sent GOAWAY
-    └── StreamResetError         the peer sent RST_STREAM for a stream
+├── HTTPConnectionError           the connection reported a failure; `errno`
+│   ├── TransportError            the transport failed or ended with work in flight (hyper Io, h2 Io)
+│   ├── BodyError                 a body could not be read (hyper Body)
+│   │   ├── H1BodyError           args = (io_kind, message)
+│   │   └── H2BodyError           caused by what stopped the stream (a reset, a GOAWAY, the connection's error)
+│   ├── BodyWriteError            a head or body could not be written (hyper BodyWrite)
+│   ├── RequestNotSentError       nothing of the request reached the wire: safe to retry (hyper Canceled)
+│   ├── ConnectionClosedError     the connection is closed: locally, or asked for after its end
+│   ├── H1IncompleteMessageError  EOF while a message was still expected (also an H1Error)
+│   ├── H2KeepAliveTimeoutError   a keep-alive PING went unanswered (also an H2Error)
+│   └── GoAwayError               the peer sent GOAWAY (also an H2Error)
+├── UserError                     local misuse the stack detects
+│   ├── H1UserError               hyper User — args = (kind, message)
+│   └── H2UserError               h2 UserError — args = (kind, message)
+├── H1Error                       HTTP/1 only (hyper `Error` kinds)
+│   ├── H1IncompleteMessageError
+│   ├── H1ParseError              malformed message head (hyper Parse) — args = (kind, message)
+│   └── H1UnexpectedMessageError  bytes on an idle client connection (hyper UnexpectedMessage)
+└── H2Error                       HTTP/2 only
+    ├── GoAwayError
+    ├── H2KeepAliveTimeoutError
+    ├── StreamResetError          the peer sent RST_STREAM for a stream
+    ├── H2ProtocolError           connection-level protocol violation (-> GOAWAY)
+    ├── H2StreamError             stream-level protocol violation (-> RST_STREAM)
+    └── H2FlowControlError        flow-control window over/underflow
 ```
 
-Catch `H1Error` / `H2Error` for protocol failures, `ConnectionClosedError` for a dropped
-transport, or `HTTPunkError` for anything httpunk raises.
+The kind is the class; what it came from is its `__cause__`: the transport's own exception
+where a read or write failed, the connection's stored error when the failure is a consequence
+of it. `errno` on an `HTTPConnectionError` is the number of the OS error behind the failure,
+`None` when there is none. Catch `RequestNotSentError` to retry on a new connection,
+`HTTPConnectionError` for anything the connection reported, or `HTTPunkError` for anything
+httpunk raises. A caller's own body exception and a cancellation propagate as themselves.
 
 `GoAwayError` carries `last_stream_id`, `error_code` and `debug_data`; `StreamResetError`
 carries `stream_id` and `error_code`. Error codes are `H2Reason` members (an `IntEnum`, so
 they compare equal to plain ints) for known codes, or a raw int otherwise.
 
 ```python
-from httpunk import ConnectionClosedError, GoAwayError, H1BodyError, HTTPunkError, StreamResetError
+from httpunk import (
+    BodyError,
+    GoAwayError,
+    HTTPConnectionError,
+    HTTPunkError,
+    RequestNotSentError,
+    StreamResetError,
+)
 
 try:
     resp = await conn.request("GET", "/")
     await resp.read()
+except RequestNotSentError:
+    print("not sent: safe to retry on a new connection")
 except StreamResetError as exc:
     print("stream reset:", exc.stream_id, exc.error_code)
 except GoAwayError as exc:
     # streams above last_stream_id were not processed and are safe to retry
     print("server going away:", exc.last_stream_id)
-except H1BodyError as exc:
-    io_kind, message = exc.args
-    print("truncated" if io_kind == "unexpected_eof" else "malformed body")
-except ConnectionClosedError:
-    print("transport dropped")
+except BodyError as exc:
+    print("body cut short:", exc.__cause__)
+except HTTPConnectionError as exc:
+    print("connection failed:", exc, exc.errno)
 except HTTPunkError:
     ...
 ```

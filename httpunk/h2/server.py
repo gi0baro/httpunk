@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._common import BaseServer, read_all
 from .._httpunk import H2Streams
-from ..exceptions import ConnectionClosedError, H2KeepAliveTimeoutError, H2Reason, _reason
+from ..exceptions import H2KeepAliveTimeoutError, H2Reason, H2UserError, _reason
 from ..http import HeaderMap
 from ..types import Version
 from .connection import H2ConnectionBase
@@ -109,8 +109,9 @@ class ServerRequest:
         carry one; an empty `bytes` body without `trailers` declares none and, like no
         body, ends the stream on HEADERS.
 
-        Raises `StreamResetError` with the client's reason if it reset the stream (also
-        after its own END_STREAM, the cancelled-GET case). With an async body that is
+        Raises `StreamResetError` with the client's reason if it reset the stream before
+        the head went out (also after its own END_STREAM, the cancelled-GET case), and
+        `BodyWriteError` from it once the body is being sent. With an async body that is
         raised at once even while the body is parked on its next chunk: the producer is
         cancelled at that await (hyper drops the body future) and has unwound — its
         cleanup ran — before this raises."""
@@ -392,7 +393,9 @@ class ServerConnection(H2ConnectionBase):
         stop = v.stopped
         if stop is not None:
             if stop.reason is None and not stop.conn and st.stop is None:
-                raise ConnectionClosedError("stream already closed")  # completed / cancelled locally
+                # Completed or cancelled locally: h2 refuses HEADERS on a closed stream
+                # (proto/streams/send.rs:144, state.rs:125-128).
+                raise H2UserError("unexpected_frame_type", "unexpected frame type")
             raise self._stopped_error(st, stop)
         if v.flags:
             self._after(v.flags)

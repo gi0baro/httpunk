@@ -11,7 +11,7 @@ import weakref
 import pytest
 
 from httpunk._backend.asyncio import AsyncioBackend, _AsyncioStream
-from httpunk.exceptions import GoAwayError, H2Reason, StreamResetError, fresh_exc
+from httpunk.exceptions import ConnectionClosedError, GoAwayError, H2Reason, StreamResetError, fresh_exc
 from httpunk.h1.client import Connection as H1Driver
 
 
@@ -179,8 +179,7 @@ async def test_h1_fail_stores_a_stripped_copy():
 async def test_h1_wait_idle_raises_a_fresh_copy():
     conn = H1Driver(_DummyTransport(), backend=AsyncioBackend())
     conn._fail(_caught(ValueError("dead")))
-    with pytest.raises(ValueError) as ei:
+    with pytest.raises(ConnectionClosedError) as ei:
         await conn.wait_idle()
-    assert ei.value is not conn.error
     assert ei.value.__cause__ is conn.error
     assert conn.error.__traceback__ is None  # this raise added nothing to the stored error

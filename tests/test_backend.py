@@ -259,8 +259,8 @@ async def test_receive_nowait_tls_decrypts_what_the_socket_holds(ca):
 @pytest.mark.tonio
 async def test_receive_nowait_tls_abrupt_close_is_broken_transport(ca):
     """The peer's socket closed with no close_notify (what `close_transport` does): the
-    peek raises `ResourceBroken` — a `broken_transport_errors` shape, as a plain socket's
-    `ConnectionResetError` is. The server drain treats any raise as "not drainable"."""
+    peek raises `ResourceBroken`, as a plain socket's raises `ConnectionResetError`. The
+    server drain treats any raise as "not drainable"."""
     backend = TonioBackend()
     async with scope() as s:
         pair = await _tls_pair(s, ca)
@@ -272,7 +272,6 @@ async def test_receive_nowait_tls_abrupt_close_is_broken_transport(ca):
             await pair.server.transport.wait_readable()
             with pytest.raises(ResourceBroken):
                 backend.receive_nowait(pair.server)
-            assert isinstance(ResourceBroken(), backend.broken_transport_errors)
         finally:
             pair.close()
 

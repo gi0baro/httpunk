@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 from tonio.colored import Event, scope
 from tonio.colored.net import open_tcp_listeners
-from tonio.exceptions import CancelledError
+from tonio.exceptions import CancelledError, ResourceBroken
 
 from httpunk import H1Connection, H2Connection
 from httpunk._backend.tonio import TonioBackend
@@ -75,7 +75,7 @@ async def read_to_eof(stream, *, allow_reset=False):
     try:
         while chunk := await stream.receive_some(65536):
             data += chunk
-    except TonioBackend.broken_transport_errors:
+    except (ConnectionError, ResourceBroken):
         if not allow_reset:
             raise
     return data

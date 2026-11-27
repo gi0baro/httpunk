@@ -443,6 +443,9 @@ struct Inner {
     /// `going_away`.
     going_away: Option<(u32, u32)>,
     error: Option<ConnError>,
+    /// `close()` / `abort()` began: a transport read or write that ends from here on
+    /// ended because of it.
+    closed_locally: bool,
     user_ping: UserPing,
     /// `None` when `keep_alive_interval` is not set, once it timed out (hyper
     /// ping.rs:314), and once we sent a closing GOAWAY (`send_goaway`).
@@ -1498,6 +1501,7 @@ impl H2Streams {
                 goaway_replied: false,
                 going_away: None,
                 error: None,
+                closed_locally: false,
                 user_ping: UserPing::Empty,
                 keep_alive,
                 is_keep_alive_timed_out: false,
@@ -2220,6 +2224,17 @@ impl H2Streams {
         drop(me);
         drop(unused);
         out
+    }
+
+    /// `close()` / `abort()`: recorded before the transport is touched, so the pumps
+    /// tell the end of their read or write it causes from a transport failure.
+    fn mark_closed_locally(&self) {
+        self.lock().closed_locally = true;
+    }
+
+    #[getter]
+    fn closed_locally(&self) -> bool {
+        self.lock().closed_locally
     }
 
     /// The stored connection error, if any (a `clone_ref` of the stored copy, or a

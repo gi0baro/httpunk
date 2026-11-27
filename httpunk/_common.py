@@ -2,16 +2,28 @@
 
 Pure orchestration with **no protocol behavior** — the one place h1 and h2
 (separate crates upstream, sharing nothing at the protocol level) legitimately
-share code: body-chunk normalization, and the public connection/server facade
-shells that collapse the driver into an async-context-managed handle. Everything
-protocol-specific stays in the h1/h2 role files.
+share code: body-chunk normalization, the builders of the connection errors both
+protocols raise, and the public connection/server facade shells that collapse the
+driver into an async-context-managed handle. Everything protocol-specific stays in
+the h1/h2 role files.
 """
 
 from __future__ import annotations
 
+import ssl as _ssl
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Generic, TypeVar
 
+from ._httpunk import (
+    BodyWriteError,
+    ConnectionClosedError,
+    H1BodyError,
+    H2BodyError,
+    HTTPConnectionError,
+    RequestNotSentError,
+    TransportError,
+    h1_io_kind,
+)
 from .types import Body, HeadersInput, Request, Response
 
 
@@ -53,6 +65,73 @@ async def aclose_body(body):
             await aclose()
         except Exception:  # noqa: S110 - the app's cleanup failing must not mask the send outcome
             pass
+
+
+_CLOSED = "connection closed"
+
+
+def _detail(cause):
+    """The text a message takes from what it was raised from: its own, or — empty, as
+    tonio's `ResourceBroken` — its type's name."""
+    return str(cause) or type(cause).__name__
+
+
+def _errno(cause):
+    if isinstance(cause, _ssl.SSLError):
+        return None  # its errno is an OpenSSL library code, not an OS error number
+    if isinstance(cause, (OSError, HTTPConnectionError)):
+        return cause.errno
+    return None
+
+
+def _with_errno(exc, cause):
+    errno = _errno(cause)
+    if errno is not None:
+        exc.errno = errno
+    return exc
+
+
+def transport_error(cause):
+    """The `TransportError` for a transport operation that raised `cause`."""
+    return _with_errno(TransportError(f"connection error: {_detail(cause)}"), cause)
+
+
+def body_write_error(cause):
+    return _with_errno(BodyWriteError(f"error writing a body to connection: {_detail(cause)}"), cause)
+
+
+def h1_body_error(cause):
+    """An HTTP/1 body read that failed with `cause`: `io_kind` is the kind Rust derives
+    from its errno (hyper's `Body` over the `io::Error`), `other` without one."""
+    errno = _errno(cause)
+    exc = H1BodyError(h1_io_kind(errno), f"error reading a body from connection: {_detail(cause)}")
+    if errno is not None:
+        exc.errno = errno
+    return exc
+
+
+def h2_body_error(cause):
+    return _with_errno(H2BodyError(f"error reading a body from connection: {_detail(cause)}"), cause)
+
+
+# DIVERGENCE: hyper's `Kind::Canceled` reads "operation was canceled" and
+# `Kind::ChannelClosed` "channel closed" (error.rs:539-540), Rust plumbing words;
+# `RequestNotSentError` and `ConnectionClosedError` use httpunk's own wording
+# (maintainer's decision).
+def request_not_sent_error(cause=None):
+    """The `RequestNotSentError` for a connection that could not take a request:
+    `cause` is its stored error (or the local close), `None` when it just closed."""
+    if cause is None:
+        return RequestNotSentError(f"request not sent: {_CLOSED}")
+    return _with_errno(RequestNotSentError(f"request not sent: {_detail(cause)}"), cause)
+
+
+def connection_closed_error(cause=None):
+    """The `ConnectionClosedError` for a closed connection; `cause` its stored error."""
+    exc = ConnectionClosedError(_CLOSED)
+    if cause is None:
+        return exc
+    return _with_errno(exc, cause)
 
 
 class BaseClientConnection:

@@ -1,29 +1,47 @@
 """httpunk's error taxonomy — one class per public error kind of the upstream
 crates, so a caller can match on what hyper / h2 would have reported.
 
-Everything derives from `HTTPunkError`, the neutral root. `ConnectionClosedError`
-is protocol-neutral: hyper's `Kind::Io` and h2's `Error::Io`, a transport
-failure with work in flight, on either protocol. The HTTP/1 errors mirror
-hyper's `Error` kinds (`H1Error` sub-base) and the HTTP/2 errors the h2
-crate's (`H2Error` sub-base); both families are defined in Rust, where the
-codecs / state machines raise them (`src/h1/errors.rs`, `src/h2/errors.rs`):
+Everything derives from `HTTPunkError`, the neutral root. What a connection
+reports — its transport failing, a body that could not be read or written, a
+request it did not send, its own closure — is an `HTTPConnectionError`, on either
+protocol; local misuse the stack detects is a `UserError`. `H1Error` / `H2Error`
+hold only what the other protocol has no counterpart for. The classes are
+defined in Rust (`src/errors.rs`, `src/h1/errors.rs`, `src/h2/errors.rs`), except
+`GoAwayError` and `StreamResetError`:
 
     HTTPunkError
-    ├── ConnectionClosedError         transport closed / IO error with work in flight (hyper `Io`, h2 `Io`; Rust)
-    ├── H1Error                       base for HTTP/1 errors (hyper `Error` kinds; Rust)
+    ├── HTTPConnectionError           the connection reported a failure; `errno`
+    │   ├── TransportError            the transport failed or ended with work in flight (hyper `Io`, h2 `Io`)
+    │   ├── BodyError                 a body could not be read (hyper `Body`)
+    │   │   ├── H1BodyError           `io_kind` = the io cause
+    │   │   └── H2BodyError           its cause is what stopped the stream
+    │   ├── BodyWriteError            a head or body could not be written (hyper `BodyWrite`)
+    │   ├── RequestNotSentError       the request never reached the wire: safe to retry (hyper `Canceled`)
+    │   ├── ConnectionClosedError     the connection is closed (locally, or asked for after its end)
+    │   ├── H1IncompleteMessageError  EOF while a message was still expected (also an H1Error)
+    │   ├── H2KeepAliveTimeoutError   keep-alive PING unanswered (also an H2Error)
+    │   └── GoAwayError               peer sent GOAWAY (also an H2Error)
+    ├── UserError                     local misuse the stack detects
+    │   ├── H1UserError               hyper `User`; `kind`
+    │   └── H2UserError               h2 `UserError`; `kind`
+    ├── H1Error                       HTTP/1 only (hyper `Error` kinds)
+    │   ├── H1IncompleteMessageError
     │   ├── H1ParseError              malformed message head (hyper `Parse`; `kind` = the variant)
-    │   ├── H1BodyError               malformed or truncated body (hyper `Body`; `io_kind` = the io cause)
-    │   ├── H1IncompleteMessageError  EOF while a message was still expected (hyper `IncompleteMessage`)
-    │   ├── H1UnexpectedMessageError  bytes on an idle client connection (hyper `UnexpectedMessage`)
-    │   └── H1UserError               local misuse hyper reports on the wire path (hyper `User`; `kind`)
-    └── H2Error                       base for HTTP/2 protocol errors (Rust)
-        ├── H2ProtocolError           connection-level protocol violation (-> GOAWAY; Rust)
-        ├── H2StreamError             stream-level protocol violation (-> RST_STREAM; Rust)
-        ├── H2UserError               local API misuse (from the Rust state machine)
-        ├── H2FlowControlError        flow-control window over/underflow (Rust)
-        ├── H2KeepAliveTimeoutError   keep-alive PING unanswered (hyper `KeepAliveTimedOut`; Rust)
-        ├── GoAwayError               peer sent GOAWAY
-        └── StreamResetError          peer sent RST_STREAM for a stream
+    │   └── H1UnexpectedMessageError  bytes on an idle client connection (hyper `UnexpectedMessage`)
+    └── H2Error                       HTTP/2 only
+        ├── GoAwayError
+        ├── H2KeepAliveTimeoutError
+        ├── StreamResetError          peer sent RST_STREAM for a stream
+        ├── H2ProtocolError           connection-level protocol violation (-> GOAWAY)
+        ├── H2StreamError             stream-level protocol violation (-> RST_STREAM)
+        └── H2FlowControlError        flow-control window over/underflow
+
+`HTTPConnectionError.errno` is the number of the OS error behind the failure:
+the transport's `OSError` where it was raised, or the connection's stored error
+when the failure is a consequence of it; `None` otherwise (a clean close, a
+transport error that is not an `OSError`, a GOAWAY). An exception raised where
+a transport operation failed has that operation's exception as `__cause__`; a
+stored error raised again carries the stored copy as `__cause__`.
 
 `error_code` attributes are `H2Reason` members for known codes (a Rust-defined enum
 whose members compare equal to, hash like, and convert to their int code), or a
@@ -39,15 +57,8 @@ httpunk's own API (responding twice, reading the next request before answering
 the current one) is a `RuntimeError`. Neither is a hyper error kind. An
 exception raised by the caller's own body iterable propagates as itself: hyper
 wraps it as `User::Body` because Rust must; Python carries the instance.
-
-An HTTP/1 `send_request` failure raised before the request was handed to the
-writer carries `request_unsent = True` on the exception instance (whatever its
-type — `ConnectionClosedError`, or the unexpected-bytes poison error): nothing
-reached the wire, so the request is safe to retry with any body, streamed
-included. The mirror of hyper's `TrySendError { message: Some(request) }`
-give-back (client/conn/http1.rs L261-281; proto/h1/dispatch.rs L742-758). Read
-it with `getattr(exc, "request_unsent", False)` — it is absent once the write
-may have begun.
+Cancellation is not an error kind: it propagates as itself and closes the
+connection it interrupted.
 """
 
 from __future__ import annotations
@@ -55,6 +66,8 @@ from __future__ import annotations
 import copy as _copy
 
 from ._httpunk import (
+    BodyError as BodyError,
+    BodyWriteError as BodyWriteError,
     ConnectionClosedError as ConnectionClosedError,
     H1BodyError as H1BodyError,
     H1Error as H1Error,
@@ -62,6 +75,7 @@ from ._httpunk import (
     H1ParseError as H1ParseError,
     H1UnexpectedMessageError as H1UnexpectedMessageError,
     H1UserError as H1UserError,
+    H2BodyError as H2BodyError,
     H2Error as H2Error,
     H2FlowControlError as H2FlowControlError,
     H2KeepAliveTimeoutError as H2KeepAliveTimeoutError,
@@ -69,7 +83,11 @@ from ._httpunk import (
     H2Reason as H2Reason,
     H2StreamError as H2StreamError,
     H2UserError as H2UserError,
+    HTTPConnectionError as HTTPConnectionError,
     HTTPunkError as HTTPunkError,
+    RequestNotSentError as RequestNotSentError,
+    TransportError as TransportError,
+    UserError as UserError,
 )
 
 
@@ -97,7 +115,7 @@ def fresh_exc(exc: BaseException) -> BaseException:
     carries frames.
 
     Copies via `copy.copy`: `BaseException.__reduce__` rebuilds from type + args
-    and restores `__dict__` extras (e.g. `request_unsent`); `GoAwayError` /
+    and restores `__dict__` extras (e.g. `errno`); `GoAwayError` /
     `StreamResetError` define `__reduce__` because their args don't roundtrip
     through their constructors. The copy carries no `__traceback__` / `__cause__` /
     `__context__`. An uncopyable exception is returned as-is — degraded (shared
@@ -108,7 +126,7 @@ def fresh_exc(exc: BaseException) -> BaseException:
         return exc
 
 
-class GoAwayError(H2Error):
+class GoAwayError(HTTPConnectionError, H2Error):
     """The peer sent GOAWAY. Streams with id > `last_stream_id` were not
     processed and are safe to retry on a new connection."""
 

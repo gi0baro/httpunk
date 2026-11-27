@@ -11,7 +11,7 @@ import ssl
 import pytest
 import trustme
 
-from httpunk import H1Connection, H2Connection, H2KeepAliveTimeoutError, HTTPunkError
+from httpunk import H1Connection, H2Connection, H2KeepAliveTimeoutError, HTTPunkError, RequestNotSentError
 from httpunk._backend.asyncio import AsyncioBackend, _AsyncioStream
 from httpunk._httpunk import H2Codec
 from httpunk.h1.server import H1Server
@@ -118,7 +118,7 @@ async def test_h1_idle_fin_closes_connection_promptly():
     """The idle watcher on the asyncio backend (a single parked read over
     `_AsyncioStream`): a server FIN on a PARKED keep-alive connection flips
     `closed` promptly with NO send and no error (hyper's clean idle close,
-    conn.rs L472-482), and the next send_request raises with `request_unsent`
+    conn.rs L472-482), and the next send_request raises `RequestNotSentError`
     (client/conn/http1.rs L261-281)."""
     backend = AsyncioBackend()
     host, port, accept, listener = await _listen()
@@ -149,9 +149,8 @@ async def test_h1_idle_fin_closes_connection_promptly():
                 await asyncio.sleep(0.005)
             assert conn.closed
             assert conn._conn.error is None  # clean close, not an error
-            with pytest.raises(HTTPunkError) as excinfo:
+            with pytest.raises(RequestNotSentError):
                 await conn.request("GET", "/b", headers={"host": host})
-            assert getattr(excinfo.value, "request_unsent", False) is True
 
 
 @pytest.mark.asyncio

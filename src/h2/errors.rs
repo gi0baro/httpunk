@@ -2,6 +2,10 @@
 //! vendored state machine / codec can produce (the h2 twin of `h1::errors`), and
 //! the mappings from the h2 crate's `UserError` / `proto::Error` / `Reason` to
 //! them. `args` carry the fields positionally (documented per class).
+//!
+//! `H2BodyError` is a `BodyError` and `H2UserError` a `UserError` (their HTTP/1
+//! counterparts sit beside them); `H2KeepAliveTimeoutError` is both an
+//! `HTTPConnectionError` and an `H2Error`.
 
 use pyo3::create_exception;
 use pyo3::intern;
@@ -12,13 +16,16 @@ use vendor_h2::codec::UserError;
 use vendor_h2::frame::Reason;
 use vendor_h2::proto::{Error, Initiator};
 
-use crate::errors::{ConnectionClosedError, HTTPunkError};
+use crate::errors::{
+    BodyError, HTTPConnectionError, HTTPunkError, TransportError, UserError as PyUserError,
+    create_exception_multi,
+};
 
 create_exception!(
     _httpunk,
     H2Error,
     HTTPunkError,
-    "Base class for every httpunk HTTP/2 protocol error."
+    "Base class for the HTTP/2 errors HTTP/1 has no counterpart for."
 );
 create_exception!(
     _httpunk,
@@ -36,8 +43,16 @@ create_exception!(
 create_exception!(
     _httpunk,
     H2UserError,
-    H2Error,
+    PyUserError,
     "Local API misuse (h2 UserError). args = (kind: str, message: str)."
+);
+create_exception!(
+    _httpunk,
+    H2BodyError,
+    BodyError,
+    "An HTTP/2 body read stopped before its end (hyper `Kind::Body` over the h2 \
+     error): its cause is what stopped it — a peer reset, a GOAWAY, the connection's \
+     failure. args = (message: str,)."
 );
 create_exception!(
     _httpunk,
@@ -45,10 +60,10 @@ create_exception!(
     H2Error,
     "Flow-control window over/underflow. args = (reason: int,)."
 );
-create_exception!(
+create_exception_multi!(
     _httpunk,
     H2KeepAliveTimeoutError,
-    H2Error,
+    (HTTPConnectionError, H2Error),
     "The keep-alive PING was not answered in time (hyper `KeepAliveTimedOut`)."
 );
 
@@ -58,6 +73,7 @@ pub fn register(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("H2ProtocolError", py.get_type::<H2ProtocolError>())?;
     m.add("H2StreamError", py.get_type::<H2StreamError>())?;
     m.add("H2UserError", py.get_type::<H2UserError>())?;
+    m.add("H2BodyError", py.get_type::<H2BodyError>())?;
     m.add("H2FlowControlError", py.get_type::<H2FlowControlError>())?;
     m.add(
         "H2KeepAliveTimeoutError",
@@ -135,7 +151,7 @@ pub(crate) fn protocol_err_with_debug(reason: Reason, msg: &str, data: &[u8]) ->
 /// - `GoAway(_, reason, initiator)` is a *connection-level* error -> the driver
 ///   sends GOAWAY and tears down.
 /// - `Io` is a transport error, NOT a protocol violation, so it surfaces as a
-///   `ConnectionClosedError` (transport-closed) rather than a PROTOCOL_ERROR
+///   `TransportError` rather than a PROTOCOL_ERROR
 ///   GOAWAY. It is still unreachable at the state-machine call sites wired
 ///   today (they only return `library_go_away`/stored `Reset`), but a future
 ///   call site that can produce `Io` now maps correctly.
@@ -145,18 +161,19 @@ pub(crate) fn map_proto_err(e: &Error) -> PyErr {
             H2StreamError::new_err((u32::from(*id), u32::from(*r), initiator_str(*initiator)))
         }
         Error::GoAway(data, r, _) => protocol_err_with_debug(*r, &e.to_string(), data.as_ref()),
-        Error::Io(..) => ConnectionClosedError::new_err((e.to_string(),)),
+        Error::Io(..) => TransportError::new_err((format!("connection error: {e}"),)),
     }
 }
 
 /// The RST_STREAM code for a stream whose body failed with `exc` — hyper error.rs:339-359
 /// (`find_source` + `h2_reason`): the reason of the first HTTP/2 error on the cause
 /// chain (Rust's `source()`, Python's `__cause__`), else INTERNAL_ERROR, also when that
-/// error carries none (h2 `Error::reason` is `None` for a user error).
+/// error carries none (h2 `Error::reason` is `None` for a user error). An h2 user error
+/// is an `h2::Error` too, so `H2UserError` ends the walk as `H2Error` does.
 pub(crate) fn h2_reason(exc: &Bound<'_, PyAny>) -> u32 {
     let mut cause = Some(exc.clone());
     while let Some(e) = cause {
-        if e.is_instance_of::<H2Error>() {
+        if e.is_instance_of::<H2Error>() || e.is_instance_of::<H2UserError>() {
             return reason_of(&e).unwrap_or(u32::from(Reason::INTERNAL_ERROR));
         }
         cause = e

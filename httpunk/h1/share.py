@@ -147,10 +147,15 @@ class H1ResponseBody:
                     continue
                 if self._decoder.is_complete:
                     break
-                data = await self._driver.read_body_more()
+                try:
+                    data = await self._driver.read_body_more()
+                except Exception as exc:
+                    self._driver._raise_read_failed(exc)
                 if data:
                     self._decoder.feed(data)
                 else:
+                    if self._driver.closed_locally:  # the local close ended the read, not the peer
+                        self._driver._raise_read_failed(None)
                     self._decoder.mark_eof()  # transport closed; decoder ends or errors
         except BaseException:
             await self._release(keep_alive=False)  # broken body -> connection unusable

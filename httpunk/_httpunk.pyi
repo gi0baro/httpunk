@@ -24,15 +24,46 @@ HeaderNameLike = str | bytes
 HeaderValueLike = str | bytes
 
 # ===========================================================================
-# Errors  (protocol-neutral root + ConnectionClosedError in src/errors.rs; the H1*
-# errors in src/h1/errors.rs; the H2* protocol errors in src/h2/errors.rs)
+# Errors  (the protocol-neutral classes in src/errors.rs; the H1* errors in
+# src/h1/errors.rs; the H2* errors in src/h2/errors.rs)
 # ===========================================================================
 
 class HTTPunkError(Exception):
     """Base class for every httpunk error (HTTP/1 and HTTP/2)."""
 
+class HTTPConnectionError(HTTPunkError):
+    """The connection reported a failure: its transport, a body read or write, a
+    request it did not send, or its own closure. Protocol-neutral."""
+
+    errno: int | None
+    """The number of the OS error behind the failure; None when there is none."""
+
+class TransportError(HTTPConnectionError):
+    """The connection's transport failed or ended with work in flight (hyper
+    `Kind::Io`, h2 `Error::Io`). args = (message: str,)."""
+
+class BodyError(HTTPConnectionError):
+    """A body could not be read from the connection (hyper `Kind::Body`)."""
+
+class BodyWriteError(HTTPConnectionError):
+    """A message head or body could not be written to the connection (hyper
+    `Kind::BodyWrite`). args = (message: str,)."""
+
+class RequestNotSentError(HTTPConnectionError):
+    """The connection could not take the request: nothing of it reached the wire, so
+    it is safe to retry on another connection, whatever its body (hyper
+    `Kind::Canceled` with the request given back). args = (message: str,)."""
+
+class ConnectionClosedError(HTTPConnectionError):
+    """The connection is closed: closed locally (`close()`, `abort()`, a cancelled
+    call), or asked for after it ended (hyper `Kind::ChannelClosed`).
+    args = (message: str,)."""
+
+class UserError(HTTPunkError):
+    """Local misuse the protocol stack detects (hyper `Kind::User`, h2 `UserError`)."""
+
 class H2Error(HTTPunkError):
-    """Base class for every httpunk HTTP/2 protocol error."""
+    """Base class for the HTTP/2 errors HTTP/1 has no counterpart for."""
 
 class H2ProtocolError(H2Error):
     """Connection-level protocol violation (-> GOAWAY). args = (reason: int | None, message: str)."""
@@ -41,25 +72,22 @@ class H2StreamError(H2Error):
     """Stream-level protocol violation (-> RST_STREAM; the connection survives).
     args = (stream_id: int, reason: int, initiator: str)."""
 
-class H2UserError(H2Error):
+class H2UserError(UserError):
     """Local API misuse from the h2 state machine. args = (kind: str, message: str)."""
+
+class H2BodyError(BodyError):
+    """An HTTP/2 body read stopped before its end (hyper `Kind::Body` over the h2
+    error): its cause is what stopped it. args = (message: str,)."""
 
 class H2FlowControlError(H2Error):
     """Flow-control window over/underflow. args = (reason: int,)."""
 
-class H2KeepAliveTimeoutError(H2Error):
+class H2KeepAliveTimeoutError(HTTPConnectionError, H2Error):
     """The keep-alive PING was not answered in time (hyper `KeepAliveTimedOut`)."""
 
-class ConnectionClosedError(HTTPunkError):
-    """The transport failed (reset / IO error) with work still in flight — hyper's
-    `Kind::Io`, h2's `Error::Io`: a transport failure, not a protocol violation (so
-    no GOAWAY) and not the HTTP state noticing an EOF (HTTP/1: `H1IncompleteMessageError`,
-    `H1BodyError`). Protocol-neutral: raised on both HTTP/1 and HTTP/2, hence it sits
-    under HTTPunkError."""
-
 class H1Error(HTTPunkError):
-    """Base class for every httpunk HTTP/1 error — one subclass per public hyper
-    `Error` kind the h1 codec can produce. Messages are hyper's `Display` text."""
+    """Base class for the HTTP/1 errors HTTP/2 has no counterpart for. Messages are
+    hyper's `Display` text."""
 
 class H1ParseError(H1Error):
     """A malformed HTTP/1 message head (hyper `Kind::Parse`). args = (kind: str, message: str);
@@ -68,26 +96,31 @@ class H1ParseError(H1Error):
     `header_transfer_encoding_invalid`, `header_transfer_encoding_unexpected`,
     `too_large`, `status`, `internal`."""
 
-class H1BodyError(H1Error):
-    """A body that could not be decoded (hyper `Kind::Body`): a framing error, or the
-    transport closing mid-body. args = (io_kind: str, message: str); `io_kind` is the
-    io kind of hyper's cause: `unexpected_eof` = truncated; `invalid_input` /
-    `invalid_data` = malformed chunk framing."""
+class H1BodyError(BodyError):
+    """An HTTP/1 body that could not be read (hyper `Kind::Body`): a framing error, or
+    the transport closing or failing mid-body. args = (io_kind: str, message: str);
+    `io_kind` is the io kind of hyper's cause: `unexpected_eof` = truncated;
+    `invalid_input` / `invalid_data` = malformed chunk framing; for a transport
+    failure the kind Rust derives from its errno, `other` without one."""
 
-class H1IncompleteMessageError(H1Error):
+class H1IncompleteMessageError(HTTPConnectionError, H1Error):
     """The connection closed while a message was still expected (hyper
     `Kind::IncompleteMessage`): EOF before the response head, or the client closing
     its side while the server's response is in flight. args = (message: str,)."""
 
 class H1UnexpectedMessageError(H1Error):
     """Bytes on an idle client connection (hyper `Kind::UnexpectedMessage`): the
-    connection is poisoned; the next `request()` raises it with `request_unsent = True`.
+    connection is poisoned; the next `request()` raises `RequestNotSentError` from it.
     args = (message: str,)."""
 
-class H1UserError(H1Error):
+class H1UserError(UserError):
     """Local misuse hyper reports on the wire path (hyper `Kind::User`), closing the
     connection. args = (kind: str, message: str); `kind`: `body_write_aborted`,
     `unexpected_header`, `unsupported_status_code`."""
+
+def h1_io_kind(errno: int | None = None) -> str:
+    """`H1BodyError.io_kind` for a transport failure: the `std::io::ErrorKind` Rust
+    derives from `errno`, snake_case; `other` without one."""
 
 # ===========================================================================
 # HeaderMap  (src/py/http/mod.rs)
@@ -726,6 +759,10 @@ class H1ServerState:
     @property
     def closed(self) -> bool: ...
     @property
+    def closed_locally(self) -> bool:
+        """Closed by `close()`, `abort()` or a cancelled response."""
+
+    @property
     def reusable(self) -> bool: ...
     @property
     def upgraded(self) -> bool: ...
@@ -778,10 +815,14 @@ class H1ServerState:
     def fail_read(self) -> object | None:
         """A head parse failure / broken transport at the head: closed; the transport to close."""
 
+    def close_locally(self) -> object | None:
+        """`abort()`: closed locally; the transport to close."""
+
     def stop_serving(self) -> None: ...
     def mark_closed(self) -> tuple[object | None, object | None, bool]:
-        """`close()`: `(transport to close, the watcher's done event to await, ended)`;
-        `ended` = the connection had already ended cleanly (hyper's orderly shutdown)."""
+        """`close()`: closed locally; `(transport to close, the watcher's done event to
+        await, ended)`; `ended` = the connection had already ended cleanly (hyper's
+        orderly shutdown)."""
 
     def mark_unusable(self) -> None: ...
     def request_shutdown(self) -> object | None:
@@ -795,6 +836,10 @@ class H1ServerState:
         """The flag when the window is over (or the request stale); None = still open."""
 
     def peer_closed_flag(self, seq: int) -> bool: ...
+    def peer_error(self, seq: int) -> BaseException | None:
+        """The `TransportError` the watcher kept when it marked the request peer-closed;
+        None for a clean EOF."""
+
     def arm_watcher(self, seq: int, done: object, *, want: bool = ..., head_negotiated: bool = ...) -> bool:
         """The whole arm decision; True = spawn the watcher, then `store_watcher_handle`."""
 
@@ -830,7 +875,10 @@ class H1ServerState:
     def finish_response(self, seq: int) -> tuple[bool, bool, object | None, bytes | None]:
         """`(switch, close, transport, tunnel leftover)`."""
 
-    def fail_response(self, seq: int) -> object | None: ...
+    def fail_response(self, seq: int, local: bool = ...) -> object | None:
+        """A failed response: closed (`local`: a cancelled one, closed locally); the
+        transport to close."""
+
     def detach(self, seq: int) -> tuple[int, object | None, bytes | None]:
         """`(H1_REQ_* code, transport, leftover)`."""
 
@@ -844,8 +892,8 @@ H1_WATCH_IGNORED: int  # a racing close already committed the flags
 class H1ClientState:
     """The connection state of one HTTP/1 client connection, `frozen` +
     subclassable: the transport, the single in-flight slot (hyper `Conn::is_busy`),
-    the error slot (first writer wins), the idle watcher's hand-off, the background
-    writer's scope, the peer's version; holds the connection's `H1Codec` (one per
+    the error slot (stored by the failure that closes it), the idle watcher's
+    hand-off, the background writer's scope, the peer's version; holds the connection's `H1Codec` (one per
     connection, hyper's `Conn`), reset at each exchange's claim."""
 
     def __init__(self, codec: H1Codec, transport: object) -> None: ...
@@ -854,7 +902,7 @@ class H1ClientState:
     def transport_ref(self) -> object | None: ...
     def begin_send(self) -> tuple[object | None, object | None]:
         """The claimed exchange's send-time facts, one step: `(transport, watcher done
-        event)`; transport None = dead (the caller raises with `request_unsent`)."""
+        event)`; transport None = dead (the caller raises `RequestNotSentError`)."""
 
     def finish_exchange(self, resp_keep_alive: bool) -> tuple[bool, bool, object | None]:
         """`release_slot`'s verdict, one step: `(reuse, fully_sent, transport to close)` —
@@ -865,6 +913,10 @@ class H1ClientState:
         the slot cleared."""
     @property
     def closed(self) -> bool: ...
+    @property
+    def closed_locally(self) -> bool:
+        """Closed by `close()`, `abort()` or a cancelled request."""
+
     @property
     def busy(self) -> bool: ...
     @property
@@ -888,12 +940,17 @@ class H1ClientState:
     def exchange_started(self) -> None: ...
 
     # ----- failure / close -----
-    def fail(self, exc: BaseException | None = ...) -> object | None:
-        """Store `exc` (a traceback-free copy) if none is stored, close; the transport to close."""
+    def fail(self, exc: BaseException) -> object | None:
+        """Store `exc` (a traceback-free copy) if the connection is still open, close;
+        the transport to close."""
 
     def close_now(self) -> object | None: ...
+    def close_locally(self) -> object | None:
+        """`abort()`, a cancelled request: closed locally; the transport to close."""
+
     def mark_closed(self) -> tuple[object | None, object | None, object | None, bool]:
-        """`(transport, watcher done event, writer scope, idle)`; `idle` = no exchange held the slot."""
+        """`close()`: closed locally; `(transport, watcher done event, writer scope,
+        idle)`; `idle` = no exchange held the slot."""
 
     def upgrade(self) -> object | None:
         """Hand the transport off (101 / CONNECT), in one step."""
@@ -1071,6 +1128,11 @@ class H2Streams:
         it out; returns the `(handle, stop)` pairs to notify."""
 
     def conn_error(self) -> BaseException | None: ...
+    def mark_closed_locally(self) -> None:
+        """`close()` / `abort()` began: recorded before the transport is touched."""
+
+    @property
+    def closed_locally(self) -> bool: ...
     def goaway_info(self) -> tuple[int, int, bytes] | None:
         """The peer's GOAWAY as `(last_stream_id, error_code, debug_data)`."""
 

@@ -15,6 +15,7 @@ from tonio.colored.time import timeout
 from httpunk import (
     ConnectionClosedError,
     GoAwayError,
+    H2BodyError,
     H2Connection,
     H2Error,
     H2FlowControlError,
@@ -22,7 +23,9 @@ from httpunk import (
     H2Reason,
     H2UserError,
     HTTPunkError,
+    RequestNotSentError,
     StreamResetError,
+    TransportError,
 )
 from httpunk._backend.tonio import TonioBackend
 from httpunk._httpunk import (
@@ -141,7 +144,7 @@ async def test_pending_open_fails_with_connection_error_on_close():
         conn._conn._slot_evt = SlotWaitProbe(conn._conn._slot_evt)
         s.spawn(first(conn))
         await first_open.wait()
-        with pytest.raises(ConnectionClosedError) as exc:
+        with pytest.raises(RequestNotSentError) as exc:
             await conn.request("GET", "/")
 
     assert not isinstance(exc.value, H2UserError)
@@ -370,7 +373,7 @@ async def test_stream_flow_violation_resets_only_that_stream():
         # The RST may surface at get() or at read() depending on whether the
         # pump has processed the overrun DATA by the time the caller resumes;
         # both are correct, so accept either.
-        with pytest.raises(H2Error):  # stream reset (flow control)
+        with pytest.raises((H2Error, H2BodyError)):  # stream reset (flow control)
             resp1 = await conn.request("GET", "/a")
             await resp1.read()
         resp2 = await conn.request("GET", "/b")  # connection survived
@@ -826,7 +829,7 @@ async def test_received_go_away_does_not_hide_io_error_on_active_stream():
         _reset(peer)
 
     async with h2_client_against(server) as conn:
-        with pytest.raises(ConnectionClosedError) as exc:
+        with pytest.raises(TransportError) as exc:
             await conn.request("GET", "https://http2.akamai.com/")
 
     assert "Connection reset" in str(exc.value)  # the transport error, not an EOF

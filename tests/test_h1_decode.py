@@ -176,13 +176,13 @@ def test_chunked_body_truncated_at_eof_is_body_error_unexpected_eof():
 
 
 def test_body_error_is_httpunk_error_and_copies_with_io_kind():
-    """`H1BodyError` sits under `H1Error` / `HTTPunkError`, and `fresh_exc`'s `copy.copy`
+    """`H1BodyError` sits under `BodyError` / `HTTPunkError`, and `fresh_exc`'s `copy.copy`
     (used to store/re-raise connection errors) keeps `io_kind`."""
     import copy
 
-    from httpunk.exceptions import H1Error, HTTPunkError
+    from httpunk.exceptions import BodyError, HTTPunkError
 
     exc = H1BodyError("unexpected_eof", "msg")
-    assert isinstance(exc, H1Error) and isinstance(exc, HTTPunkError)
+    assert isinstance(exc, BodyError) and isinstance(exc, HTTPunkError)
     dup = copy.copy(exc)
     assert type(dup) is H1BodyError and dup.args == ("unexpected_eof", "msg")
